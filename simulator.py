@@ -58,7 +58,7 @@ class WarehouseState:
         
         # --- NEW: TEXT ANNOTATIONS ---
         # Annotate the Pallets with their SKUs
-        for (y, x), sku in self.pallets.items():
+        for (x, y), sku in self.pallets.items():
             # Highlight our high-runners (SKUs 1-4)
             if sku in [1, 2, 3, 4]:
                 color = 'red'
