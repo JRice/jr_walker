@@ -50,8 +50,8 @@ class WarehouseState:
             skus = list(map(int, lines.pop(0).split()))
             self.orders.append(collections.Counter(skus))
 
-    def visualize(self, path=None):
-        """Renders the current tensor state with an optional path overlay."""
+    def visualize(self, path=None, output_path=None):
+        """Renders the current tensor state with an optional path overlay and saves it."""
         # 0: White (Empty), 1: Light Green (Fulfillment), 2: Orange (Pallets), 3: Blue (Robots)
         cmap = ListedColormap(['#FFFFFF', '#D4EDDA', '#FD7E14', '#0D6EFD'])
         fig, ax = plt.subplots(figsize=(15, 10))
@@ -80,4 +80,9 @@ class WarehouseState:
         plt.legend()
         plt.title("Warehouse Global Tensor State - Path Test")
         plt.tight_layout()
-        plt.show()
+        if output_path is None:
+            output_path = Path("media") / "warehouse_path.png"
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=160)
+        plt.close(fig)
