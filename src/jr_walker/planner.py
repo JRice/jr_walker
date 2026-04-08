@@ -53,9 +53,27 @@ class ReservationPlanner:
         robot = self._to_robot(robot_state)
         reserve_path(robot, list(path), self.reservation_table)
 
+    def can_occupy(self, robot_state: RobotState, timestep: int, x: int, y: int) -> bool:
+        if not (0 <= timestep < self.max_time):
+            return False
+
+        robot = self._to_robot(robot_state)
+        for fx, fy in robot.get_footprint(x, y):
+            if not (0 <= fx < self.width and 0 <= fy < self.height):
+                return False
+            # > 1 means static pallet or reserved dynamic occupancy
+            if self.reservation_table[timestep, fy, fx] > 1:
+                return False
+        return True
+
     def reserve_footprint(self, robot_state: RobotState, timestep: int, x: int, y: int) -> None:
         if not (0 <= timestep < self.max_time):
             raise ValueError(f"Timestep {timestep} is outside reservation horizon {self.max_time}")
+
+        if not self.can_occupy(robot_state, timestep, x, y):
+            raise ValueError(
+                f"Cannot reserve footprint for robot={robot_state.id} at t={timestep}, x={x}, y={y}"
+            )
 
         robot = self._to_robot(robot_state)
         for fx, fy in robot.get_footprint(x, y):

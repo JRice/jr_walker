@@ -52,6 +52,7 @@ class WarehouseSolver:
                 )
 
         sorted_actions = self.actions.sorted_actions()
+        sorted_actions = self._repair_idle_wait_conflicts(sorted_actions)
         output_path = write_actions(sorted_actions, self.config.output_path)
         return output_path, sorted_actions
 
@@ -87,6 +88,8 @@ class WarehouseSolver:
             self._commit_moves(robot, path)
 
             pick_t = robot.last_t + 1
+            if not self.planner.can_occupy(robot, pick_t, robot.x, robot.y):
+                return False
             pallet_x, pallet_y = pallet_xy
             self.actions.add(pick_t, robot.id, "pick", pallet_x, pallet_y)
             self.planner.reserve_footprint(robot, pick_t, robot.x, robot.y)
@@ -104,6 +107,8 @@ class WarehouseSolver:
 
         self._commit_moves(robot, fulfill_path)
         fulfill_t = robot.last_t + 1
+        if not self.planner.can_occupy(robot, fulfill_t, robot.x, robot.y):
+            return False
         self.actions.add(fulfill_t, robot.id, "fulfill", fulfill_x, fulfill_y)
         self.planner.reserve_footprint(robot, fulfill_t, robot.x, robot.y)
         robot.last_t = fulfill_t
@@ -127,3 +132,91 @@ class WarehouseSolver:
         robot.last_t = path[-1][0]
         robot.x = path[-1][1]
         robot.y = path[-1][2]
+
+    def _repair_idle_wait_conflicts(
+        self, actions: List[Tuple[int, int, str, int, int]]
+    ) -> List[Tuple[int, int, str, int, int]]:
+        """
+        Repair a specific invalid pattern:
+        A robot moves into a cell occupied by another robot that is implicitly waiting
+        there forever (no action at this timestep and no future actions).
+        """
+        repaired = list(actions)
+        static_blocked = (self.state.grid == 2)
+        max_repairs = 20
+
+        for _ in range(max_repairs):
+            repaired.sort(key=lambda row: (row[0], row[1]))
+            by_t = collections.defaultdict(dict)
+            robot_times = collections.defaultdict(list)
+            for t, rid, action, x, y in repaired:
+                by_t[t][rid] = (action, x, y)
+                robot_times[rid].append(t)
+
+            positions = {rid: (x, y) for rid, (x, y) in enumerate(self.state.robots)}
+            conflict = None
+
+            max_t = max(by_t) if by_t else -1
+            for t in range(max_t + 1):
+                acts = by_t.get(t, {})
+                occ_start = {pos: rid for rid, pos in positions.items()}
+                move_targets = {
+                    (x, y) for rid, (action, x, y) in acts.items() if action == "move"
+                }
+
+                for rid, (action, x, y) in acts.items():
+                    if action != "move":
+                        continue
+                    dest = (x, y)
+                    blocker = occ_start.get(dest)
+                    if blocker is None or blocker == rid:
+                        continue
+
+                    blocker_action = acts.get(blocker)
+                    blocker_moves = blocker_action is not None and blocker_action[0] == "move"
+                    if blocker_moves:
+                        continue
+
+                    blocker_has_action_now = blocker_action is not None
+                    blocker_has_future = any(tt > t for tt in robot_times.get(blocker, []))
+                    if blocker_has_action_now or blocker_has_future:
+                        continue
+
+                    bx, by = positions[blocker]
+                    candidates = [(bx - 1, by), (bx + 1, by), (bx, by - 1), (bx, by + 1)]
+                    chosen = None
+                    for nx, ny in candidates:
+                        if not (0 <= nx < self.state.width and 0 <= ny < self.state.height):
+                            continue
+                        if static_blocked[ny, nx]:
+                            continue
+                        occ = occ_start.get((nx, ny))
+                        if occ is not None and occ != blocker:
+                            continue
+                        if (nx, ny) in move_targets:
+                            continue
+                        chosen = (nx, ny)
+                        break
+
+                    if chosen is None:
+                        continue
+
+                    conflict = (t, blocker, chosen[0], chosen[1])
+                    break
+
+                for rid, (action, x, y) in acts.items():
+                    if action == "move":
+                        positions[rid] = (x, y)
+
+                if conflict is not None:
+                    break
+
+            if conflict is None:
+                repaired.sort(key=lambda row: (row[0], row[1]))
+                return repaired
+
+            t, blocker, nx, ny = conflict
+            repaired.append((t, blocker, "move", nx, ny))
+
+        repaired.sort(key=lambda row: (row[0], row[1]))
+        return repaired

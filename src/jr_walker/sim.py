@@ -30,3 +30,6 @@ class ActionLog:
 
     def sorted_actions(self) -> List[Action]:
         return sorted(self._actions, key=lambda a: (a[0], a[1]))
+
+    def has_action(self, timestep: int, robot_id: int) -> bool:
+        return (timestep, robot_id) in self._seen
