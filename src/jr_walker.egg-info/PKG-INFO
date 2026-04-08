@@ -1,0 +1,11 @@
+Metadata-Version: 2.1
+Name: jr-walker
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.14
+Description-Content-Type: text/markdown
+Requires-Dist: matplotlib>=3.10.8
+Requires-Dist: numpy>=2.4.4
+Requires-Dist: requests>=2.33.1
+Requires-Dist: torch>=2.11.0
+Requires-Dist: tqdm>=4.67.3
