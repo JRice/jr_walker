@@ -115,8 +115,13 @@ class WarehouseSolver:
         if not path:
             return
 
+        prev_x, prev_y = robot.x, robot.y
         for t, x, y in path:
-            self.actions.add(t, robot.id, "move", x, y)
+            # Space-time A* can emit WAIT steps (same x/y). In the submission format,
+            # waiting is represented by omitting an action for that robot/timestep.
+            if x != prev_x or y != prev_y:
+                self.actions.add(t, robot.id, "move", x, y)
+            prev_x, prev_y = x, y
 
         self.planner.reserve_path(robot, path)
         robot.last_t = path[-1][0]
