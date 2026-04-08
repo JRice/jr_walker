@@ -8,7 +8,7 @@ import numpy as np
 def main():
     # 1. Initialize State & Visualizer
     # This also parses BIG_ORDER.txt internally
-    state = WarehouseState("BIG_ORDER.txt")
+    state = WarehouseState("data/BIG_ORDER.txt")
     
     # 2. Analyze and Sort Orders
     optimizer = OrderOptimizer(state.pallets)

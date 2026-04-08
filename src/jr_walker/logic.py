@@ -5,13 +5,13 @@ def manhattan_distance(p1: Tuple[int, int], p2: Tuple[int, int]) -> int:
     return abs(p1[0] - p2[0]) + abs(p1[1] - p2[1])
 
 class OrderOptimizer:
-    def __init__(self, pallets_dict: Dict[Tuple[int, int], int]):
+    def __init__(self, pallets: Dict[Tuple[int, int], int]):
         """
-        pallets_dict: The {(x,y): sku} dictionary from our WarehouseState
+        pallets: The {(x,y): sku} dictionary from our WarehouseState
         """
         # We need a reverse lookup: {sku: [(x1,y1), (x2,y2)...]}
         self.sku_locations = collections.defaultdict(list)
-        for (x, y), sku in pallets_dict.items():
+        for (x, y), sku in pallets.items():
             self.sku_locations[sku].append((x, y))
 
     def find_tightest_cluster(self, order_skus: List[int]) -> Tuple[Dict[int, Tuple[int, int]], int]:
@@ -75,100 +75,50 @@ class OrderOptimizer:
         scored_orders.sort(key=lambda x: x["cluster_score"])
         return scored_orders
 
-if __name__ == "__main__":
-    from pathlib import Path
-    
-    # 1. Parse the file specifically for pallets and orders
-    filepath = "data/BIG_ORDER.txt"
-    if not Path(filepath).exists():
-        print(f"Error: Could not find {filepath}")
-        exit(1)
+    def analyze_big_order(pallets, orders):
+        print(f"Initialized Optimizer with {len(pallets)} pallets and {len(orders)} orders...\n")
         
-    with open(filepath, "r") as f:
-        lines = [l.strip() for l in f.readlines() if l.strip() and not l.startswith('#')]
-    
-    # Skip Robots
-    num_robots = int(lines.pop(0))
-    for _ in range(num_robots): 
-        lines.pop(0)
-    
-    # Parse Pallets
-    num_pallets = int(lines.pop(0))
-    pallets_dict = {}
-    for _ in range(num_pallets):
-        x, y, sku = map(int, lines.pop(0).split())
-        pallets_dict[(x, y)] = sku
+        # 2. Run the Optimization
+        optimizer = OrderOptimizer(pallets)
+        scored_orders = optimizer.sort_orders_by_cluster_efficiency(orders)
         
-    # Parse Orders
-    num_orders = int(lines.pop(0))
-    orders = []
-    for _ in range(num_orders):
-        skus = list(map(int, lines.pop(0).split()))
-        orders.append(collections.Counter(skus))
+        # 3. Print the Results
+        print("## TOP 5 EASIEST ORDERS (Tightest Clusters - Do these first!)")
+        print("-" * 75)
+        for i in range(5):
+            o = scored_orders[i]
+            score = o['cluster_score']
+            print(f"Rank {i+1:03} | Order ID: {o['order_idx']:>4} | Perimeter Score: {score:>3} | SKUs: {dict(o['order'])}")
+            
+        print("\n## BOTTOM 5 HARDEST ORDERS (Widest Clusters - Dock candidates!)")
+        print("-" * 75)
+        for i in range(1, 6):
+            o = scored_orders[-i]
+            score = o['cluster_score']
+            print(f"Rank {1000-i+1:03} | Order ID: {o['order_idx']:>4} | Perimeter Score: {score:>3} | SKUs: {dict(o['order'])}")
 
-    print(f"Initialized Optimizer with {len(pallets_dict)} pallets and {len(orders)} orders...\n")
-    
-    # 2. Run the Optimization
-    optimizer = OrderOptimizer(pallets_dict)
-    scored_orders = optimizer.sort_orders_by_cluster_efficiency(orders)
-    
-    # 3. Print the Results
-    print("🏆 TOP 5 EASIEST ORDERS (Tightest Clusters - Do these first!)")
-    print("-" * 75)
-    for i in range(5):
-        o = scored_orders[i]
-        score = o['cluster_score']
-        print(f"Rank {i+1:03} | Order ID: {o['order_idx']:>4} | Perimeter Score: {score:>3} | SKUs: {dict(o['order'])}")
+    def print_distribution_report(orders):
+        """Takes the parsed orders list from WarehouseState and prints the SKU distribution."""
         
-    print("\n💀 BOTTOM 5 HARDEST ORDERS (Widest Clusters - Dock candidates!)")
-    print("-" * 75)
-    for i in range(1, 6):
-        o = scored_orders[-i]
-        score = o['cluster_score']
-        print(f"Rank {1000-i+1:03} | Order ID: {o['order_idx']:>4} | Perimeter Score: {score:>3} | SKUs: {dict(o['order'])}")
+        all_skus = []
+        for order in orders:
+            # order is a collections.Counter, elements() unpacks it back to a flat list
+            all_skus.extend(list(order.elements()))
 
-def analyze_big_order(file_path="data/BIG_ORDER.txt"):
-    if not Path(file_path).exists():
-        print(f"Error: {file_path} not found. Make sure it's in the root of jr_walker.")
-        return
-
-    with open(file_path, "r") as f:
-        content = f.read().splitlines()
-
-    # Skip robots
-    num_robots = int(content[0])
-    cursor = num_robots + 1
-    
-    # Skip pallets
-    num_pallets = int(content[cursor])
-    cursor += num_pallets + 1
-    
-    # Analyze Orders
-    num_orders = int(content[cursor])
-    cursor += 1
-    
-    order_data = content[cursor : cursor + num_orders]
-    all_skus = []
-    for line in order_data:
-        all_skus.extend(map(int, line.split()))
-
-    counter = collections.Counter(all_skus)
-    total_picks = len(all_skus)
-    
-    print("-" * 30)
-    print(f"DISTRIBUTION ANALYSIS")
-    print(f"Total Orders: {num_orders}")
-    print(f"Total Individual Picks: {total_picks}")
-    print(f"Unique SKUs: {len(counter)}")
-    print("-" * 30)
-    print("TOP 10 HIGH-RUNNERS (The 'Bucket Brigade' Candidates):")
-    
-    running_total = 0
-    for i, (sku, count) in enumerate(counter.most_common(10), 1):
-        percentage = (count / total_picks) * 100
-        running_total += percentage
-        print(f"{i}. SKU {sku: >3}: {count: >5} picks ({percentage:.1f}%)")
-    
-    print("-" * 30)
-    print(f"The Top 10 SKUs account for {running_total:.1f}% of all warehouse movement.")
-    print("-" * 30)
+        counter = collections.Counter(all_skus)
+        total_picks = len(all_skus)
+        
+        print("-" * 30)
+        print("DISTRIBUTION ANALYSIS")
+        print(f"Total Orders: {len(orders)}")
+        print(f"Total Individual Picks: {total_picks}")
+        print(f"Unique SKUs: {len(counter)}")
+        print("-" * 30)
+        
+        running_total = 0
+        for i, (sku, count) in enumerate(counter.most_common(10), 1):
+            percentage = (count / total_picks) * 100
+            running_total += percentage
+            print(f"{i}. SKU {sku: >3}: {count: >5} picks ({percentage:.1f}%)")
+            
+        print("-" * 30)

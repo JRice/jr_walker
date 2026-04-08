@@ -1,5 +1,4 @@
-from importlib.resources import path
-
+import collections
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
@@ -10,91 +9,75 @@ class WarehouseState:
         self.width = width
         self.height = height
         
-        # Initialize the Tensor (y, x) format is standard for numpy matrices
         self.grid = np.zeros((self.height, self.width), dtype=int)
         
-        # 1. Paint the Fulfillment Zone (Perimeter = 1)
-        self.grid[0, :] = 1   # Top edge
-        self.grid[-1, :] = 1  # Bottom edge
-        self.grid[:, 0] = 1   # Left edge
-        self.grid[:, -1] = 1  # Right edge
+        # Paint the Fulfillment Zone (Perimeter = 1)
+        self.grid[0, :] = 1
+        self.grid[-1, :] = 1
+        self.grid[:, 0] = 1
+        self.grid[:, -1] = 1
         
         self.robots = []
         self.pallets = {}
+        self.orders = [] # <-- NEW: Orders are now natively part of the State
         
         self._parse_file(filepath)
 
     def _parse_file(self, filepath):
         if not Path(filepath).exists():
-            print(f"Error: {filepath} not found.")
-            return
+            raise FileNotFoundError(f"Error: {filepath} not found.")
 
         with open(filepath, "r") as f:
             lines = [l.strip() for l in f.readlines() if l.strip() and not l.startswith('#')]
             
-        # Parse Robots
+        # 1. Parse Robots
         num_robots = int(lines.pop(0))
-        for i in range(num_robots):
+        for _ in range(num_robots):
             x, y = map(int, lines.pop(0).split())
             self.robots.append((x, y))
-            self.grid[y, x] = 3 # Mark robot on tensor (Note: numpy is row, col -> y, x)
+            self.grid[y, x] = 3 
             
-        # Parse Pallets
+        # 2. Parse Pallets
         num_pallets = int(lines.pop(0))
         for _ in range(num_pallets):
             x, y, sku = map(int, lines.pop(0).split())
             self.pallets[(x, y)] = sku
-            self.grid[y, x] = 2 # Mark pallet on tensor
+            self.grid[y, x] = 2 
+            
+        # 3. Parse Orders
+        num_orders = int(lines.pop(0))
+        for _ in range(num_orders):
+            skus = list(map(int, lines.pop(0).split()))
+            self.orders.append(collections.Counter(skus))
 
     def visualize(self, path=None):
-        """Renders the current tensor state using matplotlib, with SKU X-Ray"""
+        """Renders the current tensor state with an optional path overlay."""
+        # 0: White (Empty), 1: Light Green (Fulfillment), 2: Orange (Pallets), 3: Blue (Robots)
         cmap = ListedColormap(['#FFFFFF', '#D4EDDA', '#FD7E14', '#0D6EFD'])
-        fig, ax = plt.subplots(figsize=(18, 12)) # Slightly larger for text rendering
+        fig, ax = plt.subplots(figsize=(15, 10))
         
-        cax = ax.imshow(self.grid, cmap=cmap, origin='upper')
+        ax.imshow(self.grid, cmap=cmap, origin='upper')
         
+        # Grid lines and labels
         ax.set_xticks(np.arange(-0.5, self.width, 1), minor=True)
         ax.set_yticks(np.arange(-0.5, self.height, 1), minor=True)
         ax.grid(which='minor', color='black', linestyle='-', linewidth=0.5, alpha=0.2)
         ax.tick_params(which='major', bottom=False, left=False, labelbottom=False, labelleft=False)
-        
-        # --- NEW: TEXT ANNOTATIONS ---
-        # Annotate the Pallets with their SKUs
-        for (x, y), sku in self.pallets.items():
-            # Highlight our high-runners (SKUs 1-4)
-            if sku in [1, 2, 3, 4]:
-                color = 'red'
-                weight = 'bold'
-                fontsize = 10
-            else:
-                color = 'black'
-                weight = 'normal'
-                fontsize = 6
-                
-            ax.text(x, y, str(sku), ha='center', va='center', 
-                    color=color, fontweight=weight, fontsize=fontsize)
-                    
-        # Annotate the Robots with their IDs
-        for i, (x, y) in enumerate(self.robots):
-            ax.text(x, y, f"R{i}", ha='center', va='center', 
-                    color='white', fontweight='bold', fontsize=9)
 
+        # Path Overlay Logic
         if path:
-            # path is a list of (t, x, y) or just (x, y)
-            # We'll extract just the x and y for the 2D plot
+            # Extract x and y, handling both (x, y) and (t, x, y) formats
             path_x = [p[1] if len(p)==3 else p[0] for p in path]
             path_y = [p[2] if len(p)==3 else p[1] for p in path]
             
-            # Draw the line
+            # Draw the path line
             ax.plot(path_x, path_y, color='red', linewidth=3, alpha=0.6, label='Planned Path')
-            # Mark the start and end
-            ax.scatter(path_x[0], path_y[0], color='blue', s=100, zorder=5)
-            ax.scatter(path_x[-1], path_y[-1], color='red', s=100, marker='X', zorder=5)
+            
+            # Mark the start and end points
+            ax.scatter(path_x[0], path_y[0], color='blue', s=100, zorder=5, label='Start')
+            ax.scatter(path_x[-1], path_y[-1], color='red', s=100, marker='X', zorder=5, label='Target')
 
-        ax.set_title("Warehouse Global Tensor State (SKU X-Ray)", fontsize=16, fontweight='bold', pad=20)
+        plt.legend()
+        plt.title("Warehouse Global Tensor State - Path Test")
         plt.tight_layout()
         plt.show()
-
-if __name__ == "__main__":
-    state = WarehouseState("data/BIG_ORDER.txt")
-    state.visualize()
