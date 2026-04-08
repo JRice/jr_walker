@@ -1,3 +1,9 @@
+import collections
+from typing import Dict, List, Tuple
+
+import numpy as np
+
+
 class Robot:
     def __init__(self, r_id: int, x: int, y: int):
         self.id = r_id
