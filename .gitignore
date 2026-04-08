@@ -1,0 +1,15 @@
+
+__pycache__/
+.vscode/
+.ipynb_checkpoints/
+*env/
+.venv/
+pytorch_env/
+data/
+models/
+*.pyc
+*~
+*.gguf
+*.bin
+*.onnx
+.env
