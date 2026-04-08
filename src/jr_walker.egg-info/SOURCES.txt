@@ -1,5 +1,6 @@
 README.md
 pyproject.toml
+src/jr_walker/__init__.py
 src/jr_walker/entities.py
 src/jr_walker/logic.py
 src/jr_walker/routing.py
