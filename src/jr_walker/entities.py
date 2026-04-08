@@ -43,12 +43,3 @@ class Robot:
                 return False 
                 
         return True
-    
-    def reserve_path(robot, path: List[Tuple[int, int, int]], reservation_table: np.ndarray):
-        """Burns the robot's dynamic footprint into the 3D time-tensor."""
-        for (t, x, y) in path:
-            # Get the full shape of the robot + attached pallets
-            footprint = robot.get_footprint(x, y) 
-            for (fx, fy) in footprint:
-                # 3 = Robot/Reserved
-                reservation_table[t, fy, fx] = 3

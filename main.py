@@ -16,8 +16,7 @@ def main():
     scored_orders = optimizer.sort_orders_by_cluster_efficiency(state.orders)
     
     # 3. Initialize the 3D Reservation Table
-    # (Time, Y, X) - Start with 5000 timesteps
-    max_time = 5000
+    max_time = 500
     reservation_table = np.zeros((max_time, state.height, state.width))
     
     # Pre-fill the table with static obstacles (Pallets)
@@ -32,10 +31,13 @@ def main():
     
     print(f"Routing Robot 0 to fulfill Order {first_order['order_idx']}...")
     
-    # (This is where your logic loop would continue)
-    # path = find_path(robot_0, 0, robot_0.x, robot_0.y, target_x, target_y, reservation_table)
-    # if path:
-    #     reserve_path(robot_0, path, reservation_table)
+    path = find_path(r0, 0, start_x, start_y, target_x - 1, target_y, reservation_table)
+
+    if path:
+        print(f"✅ Path found! {len(path)} steps.")
+        state.visualize(path=path)
+    else:
+        print("No path found. Check if the target is blocked!")
 
 if __name__ == "__main__":
     main()

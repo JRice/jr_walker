@@ -5,6 +5,16 @@ import numpy as np
 def manhattan(p1: Tuple[int, int], p2: Tuple[int, int]) -> int:
     return abs(p1[0] - p2[0]) + abs(p1[1] - p2[1])
 
+
+def reserve_path(robot, path: List[Tuple[int, int, int]], reservation_table: np.ndarray):
+    """Burns the robot's dynamic footprint into the 3D time-tensor."""
+    for (t, x, y) in path:
+        # Get the full shape of the robot + attached pallets
+        footprint = robot.get_footprint(x, y) 
+        for (fx, fy) in footprint:
+            # 3 = Robot/Reserved
+            reservation_table[t, fy, fx] = 3
+
 def find_path(robot, start_t: int, start_x: int, start_y: int, target_x: int, target_y: int, reservation_table: np.ndarray) -> List[Tuple[int, int, int]]:
     """
     Space-Time A* Pathfinding. Returns a list of (timestep, x, y) tuples.

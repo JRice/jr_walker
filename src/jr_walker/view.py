@@ -1,3 +1,5 @@
+from importlib.resources import path
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
@@ -44,7 +46,7 @@ class WarehouseState:
             self.pallets[(x, y)] = sku
             self.grid[y, x] = 2 # Mark pallet on tensor
 
-    def visualize(self):
+    def visualize(self, path=None):
         """Renders the current tensor state using matplotlib, with SKU X-Ray"""
         cmap = ListedColormap(['#FFFFFF', '#D4EDDA', '#FD7E14', '#0D6EFD'])
         fig, ax = plt.subplots(figsize=(18, 12)) # Slightly larger for text rendering
@@ -76,6 +78,18 @@ class WarehouseState:
         for i, (x, y) in enumerate(self.robots):
             ax.text(x, y, f"R{i}", ha='center', va='center', 
                     color='white', fontweight='bold', fontsize=9)
+
+        if path:
+            # path is a list of (t, x, y) or just (x, y)
+            # We'll extract just the x and y for the 2D plot
+            path_x = [p[1] if len(p)==3 else p[0] for p in path]
+            path_y = [p[2] if len(p)==3 else p[1] for p in path]
+            
+            # Draw the line
+            ax.plot(path_x, path_y, color='red', linewidth=3, alpha=0.6, label='Planned Path')
+            # Mark the start and end
+            ax.scatter(path_x[0], path_y[0], color='blue', s=100, zorder=5)
+            ax.scatter(path_x[-1], path_y[-1], color='red', s=100, marker='X', zorder=5)
 
         ax.set_title("Warehouse Global Tensor State (SKU X-Ray)", fontsize=16, fontweight='bold', pad=20)
         plt.tight_layout()
