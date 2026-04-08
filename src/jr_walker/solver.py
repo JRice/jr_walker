@@ -68,16 +68,20 @@ class WarehouseSolver:
     def _plan_order_for_robot(
         self, order_idx: int, order: collections.Counter, robot: RobotState
     ) -> bool:
+        temp_robot = self._clone_robot_state(robot)
         remaining = collections.Counter(order)
+        pending_actions: List[Tuple[int, int, str, int, int]] = []
+        pending_paths: List[List[Tuple[int, int, int]]] = []
+        pending_footprints: List[Tuple[int, int, int]] = []
 
         while sum(remaining.values()) > 0:
-            options = self.scheduler.candidate_pick_options(remaining, (robot.x, robot.y))
+            options = self.scheduler.candidate_pick_options(remaining, (temp_robot.x, temp_robot.y))
             selected = None
             for _, sku, pallet_xy, pick_cell_xy in options:
                 target_x, target_y = pick_cell_xy
-                path = self.planner.plan_path(robot, target_x, target_y)
+                path = self.planner.plan_path(temp_robot, target_x, target_y)
 
-                if path or (robot.x == target_x and robot.y == target_y):
+                if path or (temp_robot.x == target_x and temp_robot.y == target_y):
                     selected = (sku, pallet_xy, pick_cell_xy, path)
                     break
 
@@ -85,53 +89,86 @@ class WarehouseSolver:
                 return False
 
             sku, pallet_xy, pick_cell_xy, path = selected
-            self._commit_moves(robot, path)
+            pending_actions.extend(self._apply_moves_to_robot(temp_robot, path))
+            if path:
+                pending_paths.append(path)
 
-            pick_t = robot.last_t + 1
-            if not self.planner.can_occupy(robot, pick_t, robot.x, robot.y):
+            pick_t = temp_robot.last_t + 1
+            if not self.planner.can_occupy(temp_robot, pick_t, temp_robot.x, temp_robot.y):
                 return False
             pallet_x, pallet_y = pallet_xy
-            self.actions.add(pick_t, robot.id, "pick", pallet_x, pallet_y)
-            self.planner.reserve_footprint(robot, pick_t, robot.x, robot.y)
-            robot.last_t = pick_t
-            robot.storage[sku] += 1
+            pending_actions.append((pick_t, temp_robot.id, "pick", pallet_x, pallet_y))
+            pending_footprints.append((pick_t, temp_robot.x, temp_robot.y))
+            temp_robot.last_t = pick_t
+            temp_robot.storage[sku] += 1
 
             remaining[sku] -= 1
             if remaining[sku] <= 0:
                 del remaining[sku]
 
-        fulfill_x, fulfill_y = self.scheduler.best_fulfill_cell(robot.x, robot.y)
-        fulfill_path = self.planner.plan_path(robot, fulfill_x, fulfill_y)
-        if not fulfill_path and (robot.x != fulfill_x or robot.y != fulfill_y):
+        fulfill_x, fulfill_y = self.scheduler.best_fulfill_cell(temp_robot.x, temp_robot.y)
+        fulfill_path = self.planner.plan_path(temp_robot, fulfill_x, fulfill_y)
+        if not fulfill_path and (temp_robot.x != fulfill_x or temp_robot.y != fulfill_y):
             return False
 
-        self._commit_moves(robot, fulfill_path)
-        fulfill_t = robot.last_t + 1
-        if not self.planner.can_occupy(robot, fulfill_t, robot.x, robot.y):
+        pending_actions.extend(self._apply_moves_to_robot(temp_robot, fulfill_path))
+        if fulfill_path:
+            pending_paths.append(fulfill_path)
+
+        fulfill_t = temp_robot.last_t + 1
+        if not self.planner.can_occupy(temp_robot, fulfill_t, temp_robot.x, temp_robot.y):
             return False
-        self.actions.add(fulfill_t, robot.id, "fulfill", fulfill_x, fulfill_y)
-        self.planner.reserve_footprint(robot, fulfill_t, robot.x, robot.y)
-        robot.last_t = fulfill_t
-        robot.storage.clear()
+        pending_actions.append((fulfill_t, temp_robot.id, "fulfill", fulfill_x, fulfill_y))
+        pending_footprints.append((fulfill_t, temp_robot.x, temp_robot.y))
+        temp_robot.last_t = fulfill_t
+        temp_robot.storage.clear()
+
+        for t, rid, action, x, y in pending_actions:
+            self.actions.add(t, rid, action, x, y)
+
+        for path in pending_paths:
+            self.planner.reserve_path(temp_robot, path)
+
+        for t, x, y in pending_footprints:
+            self.planner.reserve_footprint(temp_robot, t, x, y)
+
+        robot.x = temp_robot.x
+        robot.y = temp_robot.y
+        robot.last_t = temp_robot.last_t
+        robot.storage = collections.Counter(temp_robot.storage)
+        robot.docks = dict(temp_robot.docks)
 
         return True
 
-    def _commit_moves(self, robot: RobotState, path: List[Tuple[int, int, int]]) -> None:
+    def _apply_moves_to_robot(
+        self, robot: RobotState, path: List[Tuple[int, int, int]]
+    ) -> List[Tuple[int, int, str, int, int]]:
+        emitted: List[Tuple[int, int, str, int, int]] = []
         if not path:
-            return
+            return emitted
 
         prev_x, prev_y = robot.x, robot.y
         for t, x, y in path:
             # Space-time A* can emit WAIT steps (same x/y). In the submission format,
             # waiting is represented by omitting an action for that robot/timestep.
             if x != prev_x or y != prev_y:
-                self.actions.add(t, robot.id, "move", x, y)
+                emitted.append((t, robot.id, "move", x, y))
             prev_x, prev_y = x, y
 
-        self.planner.reserve_path(robot, path)
         robot.last_t = path[-1][0]
         robot.x = path[-1][1]
         robot.y = path[-1][2]
+        return emitted
+
+    def _clone_robot_state(self, robot: RobotState) -> RobotState:
+        return RobotState(
+            id=robot.id,
+            x=robot.x,
+            y=robot.y,
+            last_t=robot.last_t,
+            storage=collections.Counter(robot.storage),
+            docks=dict(robot.docks),
+        )
 
     def _repair_idle_wait_conflicts(
         self, actions: List[Tuple[int, int, str, int, int]]
