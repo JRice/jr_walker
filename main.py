@@ -41,7 +41,7 @@ def main():
     parser.add_argument(
         "--output",
         default=None,
-        help="Optional explicit output path. If omitted, uses solution_<move_count>.txt.",
+        help="Optional explicit output path. If omitted, uses solution_<makespan>.txt.",
     )
     parser.add_argument(
         "--max-time",
@@ -89,7 +89,7 @@ def main():
         final_output_path = Path(args.output)
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
-        final_output_path = make_unique_path(output_dir / f"solution_{move_count}.txt")
+        final_output_path = make_unique_path(output_dir / f"solution_{makespan}.txt")
 
     write_actions(actions, final_output_path)
     if not args.output and temp_output_path.exists():
