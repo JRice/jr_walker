@@ -65,7 +65,7 @@ def analysis_output_path_for_solution(solution_path: Path, output_dir: Path = Pa
 
 def solution_analysis(
     solution_path: Path,
-    worklist_path: Path = Path("data/BIG_ORDER.txt"),
+    worklist_path: Path = Path("docs/BIG_ORDER.txt"),
     output_path: Path | None = None,
 ) -> Path:
     solution_path = Path(solution_path)

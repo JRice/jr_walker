@@ -66,7 +66,7 @@ def append_leaderboard_entry(
 
 def main():
     parser = argparse.ArgumentParser(description="Build a warehouse action plan.")
-    parser.add_argument("--input", default="data/BIG_ORDER.txt", help="Path to BIG_ORDER-style input file.")
+    parser.add_argument("--input", default="docs/BIG_ORDER.txt", help="Path to BIG_ORDER-style input file.")
     parser.add_argument(
         "--analyze-only",
         default=None,

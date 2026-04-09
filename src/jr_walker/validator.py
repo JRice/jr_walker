@@ -755,7 +755,7 @@ class SubmissionValidator:
 
 
 def validate_solution_file(
-    solution_path: str | Path, *, worklist_path: str | Path = "data/BIG_ORDER.txt"
+    solution_path: str | Path, *, worklist_path: str | Path = "docs/BIG_ORDER.txt"
 ) -> ValidatorState:
     """
     Convenience one-shot validator.
