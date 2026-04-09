@@ -1,12 +1,59 @@
 import collections
-from dataclasses import dataclass
+import random
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import Deque, Dict, List, Tuple
 
+from jr_walker.logic import EdgeAwareOrderScorer, OrderOptimizer
+from jr_walker.planner import adjacent_cells
 from jr_walker.planner import ReservationPlanner
 from jr_walker.scheduler import GreedyScheduler
 from jr_walker.sim import ActionLog, RobotState
 from jr_walker.writer import write_actions
+
+ROLE_DELIVER = "deliver"
+ROLE_RELOCATE_PALLET = "relocate_pallet"
+
+# Planned delivery hotspot anchors.
+FULFILL_HOT_SPOTS: List[Tuple[int, int]] = [
+    (20, 0),
+    (40, 0),
+    (20, 39),
+    (40, 39),
+    (0, 20),
+    (59, 20),
+]
+
+KNIGHT_OFFSETS: List[Tuple[int, int]] = [
+    (-2, -1),
+    (-2, 1),
+    (-1, -2),
+    (-1, 2),
+    (1, -2),
+    (1, 2),
+    (2, -1),
+    (2, 1),
+]
+
+BUCKET_TO_HOTSPOT: Dict[str, Tuple[int, int]] = {
+    "left_edge": (0, 20),
+    "right_edge": (59, 20),
+    "top_x0_29": (20, 0),
+    "top_x30_59": (40, 0),
+    "bottom_x0_29": (20, 39),
+    "bottom_x30_59": (40, 39),
+}
+
+
+@dataclass
+class RelocationJob:
+    sku: int
+    bucket: str
+    hotspot: Tuple[int, int]
+    score: float
+    attempts: int = 0
+    metadata: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -14,12 +61,27 @@ class SolverConfig:
     max_time: int = 50000
     progress_every: int = 50
     output_path: Path = Path("output/solution.txt")
+    initial_relocate_dispatches: int = 8
+    relocate_pallet_probability: float = 0.0
+    random_seed: int = 7
+    max_delivery_order_attempts: int = 40
+    delivery_candidate_window: int = 160
+    path_step_limit: int = 350
+    relocate_stand_candidate_limit: int = 6
+    relocate_target_candidate_limit: int = 8
+    relocation_analysis_path: Path | None = None
+    relocation_top_skus: int = 8
+    relocation_min_lift: float = 0.08
+    relocation_max_attempts_per_sku: int = 5
+    log_path: Path | None = None
+    dispatch_log_every: int = 1
 
 
 class WarehouseSolver:
     def __init__(self, warehouse_state, config: SolverConfig | None = None):
         self.state = warehouse_state
         self.config = config or SolverConfig()
+        self.rng = random.Random(self.config.random_seed)
 
         self.robots: List[RobotState] = [
             RobotState(id=rid, x=x, y=y) for rid, (x, y) in enumerate(self.state.robots)
@@ -35,34 +97,327 @@ class WarehouseSolver:
             width=self.state.width,
             height=self.state.height,
             pallets=self.state.pallets,
-            static_grid=self.state.grid,
+        )
+        self.edge_scorer = EdgeAwareOrderScorer(
+            scheduler=self.scheduler,
+            width=self.state.width,
+            height=self.state.height,
+            hot_spots=FULFILL_HOT_SPOTS,
         )
 
+        # Stable pallet IDs so we can track moved pallets by SKU.
+        self.pallet_by_id: Dict[int, Dict[str, int]] = {}
+        self.pallet_id_by_coord: Dict[Tuple[int, int], int] = {}
+        for pallet_id, ((px, py), sku) in enumerate(self.state.pallets.items()):
+            self.pallet_by_id[pallet_id] = {"sku": sku, "x": px, "y": py}
+            self.pallet_id_by_coord[(px, py)] = pallet_id
+
+        self.relocated_skus: set[int] = set()
+        sku_counter: collections.Counter = collections.Counter()
+        for order in self.state.orders:
+            sku_counter.update(order)
+        self.skus_by_demand: List[int] = [sku for sku, _ in sku_counter.most_common()]
+        self.relocation_plan: Deque[RelocationJob] = self._build_relocation_plan()
+
+        self.role_handlers = {
+            ROLE_DELIVER: self._role_deliver,
+            ROLE_RELOCATE_PALLET: self._role_relocate_pallet,
+        }
+        self._initial_relocate_assigned = 0
+        self._log_handle = None
+
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
-        for order_idx, order in enumerate(self.state.orders):
-            ok = self._plan_order(order_idx, order)
-            if not ok:
-                raise RuntimeError(f"Could not build a feasible plan for order {order_idx}")
+        self._open_log()
+        remaining_orders = self._build_ranked_order_queue()
+        total_orders = len(remaining_orders)
+        completed = 0
+        dispatch_count = 0
+        self._log(f"solve_start total_orders={total_orders}")
+        if self.relocation_plan:
+            summary = ", ".join(
+                f"SKU{job.sku}->{job.bucket}(score={job.score:.2f})"
+                for job in list(self.relocation_plan)[:6]
+            )
+            self._log(f"relocation_plan count={len(self.relocation_plan)} top=[{summary}]")
+        else:
+            self._log("relocation_plan count=0")
 
-            if (order_idx + 1) % self.config.progress_every == 0:
-                current_makespan = max(robot.last_t for robot in self.robots)
-                print(
-                    f"[solver] planned {order_idx + 1}/{len(self.state.orders)} orders, "
-                    f"current makespan={current_makespan}"
+        try:
+            while remaining_orders:
+                robot = self._next_available_robot()
+                role = self._dispatch_role(robot)
+                dnum = dispatch_count + 1
+                if dnum % self.config.dispatch_log_every == 0:
+                    self._log(
+                        f"dispatch_start n={dnum} robot={robot.id} role={role} "
+                        f"robot_t={robot.last_t} completed={completed}/{total_orders} "
+                        f"remaining={len(remaining_orders)}"
+                    )
+
+                t0 = time.perf_counter()
+                handled = self.role_handlers[role](robot, remaining_orders)
+                if not handled and role != ROLE_DELIVER:
+                    handled = self.role_handlers[ROLE_DELIVER](robot, remaining_orders)
+
+                if not handled:
+                    handled = self._fallback_deliver_any_robot(remaining_orders)
+
+                elapsed = time.perf_counter() - t0
+                if dnum % self.config.dispatch_log_every == 0:
+                    self._log(
+                        f"dispatch_end n={dnum} robot={robot.id} role={role} success={handled} "
+                        f"elapsed_s={elapsed:.2f} completed={total_orders - len(remaining_orders)}/{total_orders} "
+                        f"remaining={len(remaining_orders)}"
+                    )
+
+                if not handled:
+                    raise RuntimeError("Dispatcher could not assign a feasible next task.")
+
+                new_completed = total_orders - len(remaining_orders)
+                if new_completed != completed:
+                    completed = new_completed
+                    if completed % self.config.progress_every == 0:
+                        current_makespan = max(r.last_t for r in self.robots)
+                        print(
+                            f"[solver] planned {completed}/{total_orders} orders, "
+                            f"current makespan={current_makespan}, dispatches={dispatch_count + 1}"
+                        )
+                        self._log(
+                            f"progress completed={completed}/{total_orders} "
+                            f"makespan={current_makespan} dispatches={dispatch_count + 1}"
+                        )
+
+                dispatch_count += 1
+
+            sorted_actions = self.actions.sorted_actions()
+            sorted_actions = self._repair_idle_wait_conflicts(sorted_actions)
+            output_path = write_actions(sorted_actions, self.config.output_path)
+            makespan = max((t for t, _, _, _, _ in sorted_actions), default=-1)
+            self._log(
+                f"solve_end actions={len(sorted_actions)} makespan={makespan} output={output_path}"
+            )
+            return output_path, sorted_actions
+        finally:
+            self._close_log()
+
+    def _build_ranked_order_queue(self) -> Deque[int]:
+        optimizer = OrderOptimizer(self.state.pallets)
+        scored = optimizer.sort_orders_by_cluster_efficiency(self.state.orders)
+        return collections.deque(item["order_idx"] for item in scored)
+
+    def _build_relocation_plan(self) -> Deque[RelocationJob]:
+        analysis_path = self.config.relocation_analysis_path
+        if analysis_path is None:
+            analysis_path = self._find_default_analysis_path()
+        if analysis_path is None:
+            return collections.deque()
+        analysis_path = Path(analysis_path)
+        if not analysis_path.exists():
+            return collections.deque()
+
+        bucket_items, bucket_sku_counts = self._parse_analysis_file(analysis_path)
+        tracked_buckets = [b for b in BUCKET_TO_HOTSPOT.keys() if b in bucket_items]
+        total_items = sum(bucket_items.get(b, 0) for b in tracked_buckets)
+        if total_items <= 0:
+            return collections.deque()
+
+        sku_totals: collections.Counter = collections.Counter()
+        for bucket in tracked_buckets:
+            sku_totals.update(bucket_sku_counts.get(bucket, collections.Counter()))
+
+        jobs: List[RelocationJob] = []
+        for sku, sku_total in sku_totals.items():
+            if sku_total <= 0:
+                continue
+            if not self.scheduler.has_sku(sku):
+                continue
+
+            best = None
+            for bucket in tracked_buckets:
+                bucket_sku = bucket_sku_counts.get(bucket, collections.Counter())
+                count = bucket_sku.get(sku, 0)
+                if count <= 0:
+                    continue
+
+                sku_share = count / sku_total
+                bucket_share = bucket_items[bucket] / total_items
+                lift = sku_share - bucket_share
+                if lift < self.config.relocation_min_lift:
+                    continue
+
+                score = lift * sku_total
+                candidate = (score, lift, bucket, count)
+                if best is None or candidate > best:
+                    best = candidate
+
+            if best is None:
+                continue
+
+            score, lift, bucket, count = best
+            jobs.append(
+                RelocationJob(
+                    sku=sku,
+                    bucket=bucket,
+                    hotspot=BUCKET_TO_HOTSPOT[bucket],
+                    score=float(score),
+                    metadata={
+                        "lift": float(lift),
+                        "sku_total": float(sku_total),
+                        "bucket_count": float(count),
+                    },
                 )
+            )
 
-        sorted_actions = self.actions.sorted_actions()
-        sorted_actions = self._repair_idle_wait_conflicts(sorted_actions)
-        output_path = write_actions(sorted_actions, self.config.output_path)
-        return output_path, sorted_actions
+        jobs.sort(key=lambda j: (-j.score, j.sku))
+        jobs = jobs[: self.config.relocation_top_skus]
+        return collections.deque(jobs)
 
-    def _plan_order(self, order_idx: int, order: collections.Counter) -> bool:
-        ranked_robot_ids = self.scheduler.rank_robots_for_order(order, self.robots)
-        for robot_id in ranked_robot_ids:
-            robot = self.robots[robot_id]
-            ok = self._plan_order_for_robot(order_idx, order, robot)
-            if ok:
+    def _find_default_analysis_path(self) -> Path | None:
+        output_dir = Path("output")
+        if not output_dir.exists():
+            return None
+        candidates = sorted(output_dir.glob("solution_*_analysis.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not candidates:
+            return None
+        return candidates[0]
+
+    def _parse_analysis_file(
+        self, analysis_path: Path
+    ) -> Tuple[Dict[str, int], Dict[str, collections.Counter]]:
+        bucket_items: Dict[str, int] = {}
+        bucket_sku_counts: Dict[str, collections.Counter] = {}
+        current_bucket = None
+
+        for raw_line in analysis_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if line.startswith("[") and line.endswith("]"):
+                current_bucket = line[1:-1]
+                if current_bucket not in bucket_sku_counts:
+                    bucket_sku_counts[current_bucket] = collections.Counter()
+                continue
+
+            if current_bucket is None:
+                continue
+
+            if line.startswith("items:"):
+                try:
+                    bucket_items[current_bucket] = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    bucket_items[current_bucket] = 0
+                continue
+
+            if line.startswith("sku_counts:"):
+                value = line.split(":", 1)[1].strip()
+                if value == "(none)":
+                    continue
+                parts = [p.strip() for p in value.split(",") if p.strip()]
+                for part in parts:
+                    if not part.startswith("SKU") or ":" not in part:
+                        continue
+                    sku_part, count_part = part.split(":", 1)
+                    try:
+                        sku = int(sku_part[3:])
+                        count = int(count_part)
+                    except ValueError:
+                        continue
+                    bucket_sku_counts[current_bucket][sku] = count
+
+        return bucket_items, bucket_sku_counts
+
+    def _next_available_robot(self) -> RobotState:
+        return min(self.robots, key=lambda r: (r.last_t, r.id))
+
+    def _dispatch_role(self, robot: RobotState) -> str:
+        if (
+            self._initial_relocate_assigned < self.config.initial_relocate_dispatches
+            and self._has_relocation_candidate()
+        ):
+            self._initial_relocate_assigned += 1
+            return ROLE_RELOCATE_PALLET
+
+        if self._has_relocation_candidate():
+            if self.rng.random() < self.config.relocate_pallet_probability:
+                return ROLE_RELOCATE_PALLET
+
+        return ROLE_DELIVER
+
+    def _has_relocation_candidate(self) -> bool:
+        while self.relocation_plan:
+            head = self.relocation_plan[0]
+            if head.sku in self.relocated_skus:
+                self.relocation_plan.popleft()
+                continue
+            if not self.scheduler.has_sku(head.sku):
+                self.relocation_plan.popleft()
+                continue
+            return True
+        return False
+
+    def _role_deliver(self, robot: RobotState, remaining_orders: Deque[int]) -> bool:
+        if not remaining_orders:
+            return False
+
+        candidate_window = min(len(remaining_orders), self.config.delivery_candidate_window)
+        candidate_order_ids = list(remaining_orders)[:candidate_window]
+        ranked_order_ids = self.edge_scorer.rank_orders_for_robot(
+            robot=robot,
+            order_ids=candidate_order_ids,
+            orders=self.state.orders,
+            top_k=self.config.max_delivery_order_attempts,
+        )
+
+        for order_idx in ranked_order_ids:
+            order = self.state.orders[order_idx]
+            if self._plan_order_for_robot(order_idx, order, robot):
+                try:
+                    remaining_orders.remove(order_idx)
+                except ValueError:
+                    pass
                 return True
+        return False
+
+    def _fallback_deliver_any_robot(self, remaining_orders: Deque[int]) -> bool:
+        for robot in sorted(self.robots, key=lambda r: (r.last_t, r.id)):
+            if self._role_deliver(robot, remaining_orders):
+                return True
+        return False
+
+    def _role_relocate_pallet(self, robot: RobotState, _: Deque[int]) -> bool:
+        if not self._has_relocation_candidate():
+            return False
+
+        attempts = min(3, len(self.relocation_plan))
+        for _ in range(attempts):
+            if not self.relocation_plan:
+                return False
+            job = self.relocation_plan[0]
+            if job.sku in self.relocated_skus:
+                self.relocation_plan.popleft()
+                continue
+
+            ok = self._plan_relocate_pallet_for_robot(
+                robot=robot,
+                sku=job.sku,
+                hotspot=job.hotspot,
+            )
+            if ok:
+                self.relocated_skus.add(job.sku)
+                self.relocation_plan.popleft()
+                self._log(
+                    f"relocation_done sku={job.sku} bucket={job.bucket} hotspot={job.hotspot} score={job.score:.3f}"
+                )
+                return True
+
+            job.attempts += 1
+            self.relocation_plan.rotate(-1)
+            if job.attempts >= self.config.relocation_max_attempts_per_sku:
+                try:
+                    self.relocation_plan.remove(job)
+                except ValueError:
+                    pass
         return False
 
     def _plan_order_for_robot(
@@ -71,34 +426,37 @@ class WarehouseSolver:
         temp_robot = self._clone_robot_state(robot)
         remaining = collections.Counter(order)
         pending_actions: List[Tuple[int, int, str, int, int]] = []
-        pending_paths: List[List[Tuple[int, int, int]]] = []
-        pending_footprints: List[Tuple[int, int, int]] = []
+        pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+        pending_footprints: List[Tuple[RobotState, int, int, int]] = []
 
         while sum(remaining.values()) > 0:
             options = self.scheduler.candidate_pick_options(remaining, (temp_robot.x, temp_robot.y))
             selected = None
-            for _, sku, pallet_xy, pick_cell_xy in options:
-                target_x, target_y = pick_cell_xy
-                path = self.planner.plan_path(temp_robot, target_x, target_y)
+            for _, sku, pallet_xy, _pick_cell_xy in options:
+                pick_cells = self.scheduler.pick_cells_for_pallet(pallet_xy)
+                if not pick_cells:
+                    continue
+                target_x, target_y = pick_cells[0]
+                path = self._safe_plan_path(temp_robot, target_x, target_y)
 
                 if path or (temp_robot.x == target_x and temp_robot.y == target_y):
-                    selected = (sku, pallet_xy, pick_cell_xy, path)
+                    selected = (sku, pallet_xy, path)
                     break
 
             if selected is None:
                 return False
 
-            sku, pallet_xy, pick_cell_xy, path = selected
-            pending_actions.extend(self._apply_moves_to_robot(temp_robot, path))
+            sku, pallet_xy, path = selected
             if path:
-                pending_paths.append(path)
+                pending_paths.append((self._clone_robot_state(temp_robot), path))
+            pending_actions.extend(self._apply_moves_to_robot(temp_robot, path))
 
             pick_t = temp_robot.last_t + 1
             if not self.planner.can_occupy(temp_robot, pick_t, temp_robot.x, temp_robot.y):
                 return False
             pallet_x, pallet_y = pallet_xy
             pending_actions.append((pick_t, temp_robot.id, "pick", pallet_x, pallet_y))
-            pending_footprints.append((pick_t, temp_robot.x, temp_robot.y))
+            pending_footprints.append((self._clone_robot_state(temp_robot), pick_t, temp_robot.x, temp_robot.y))
             temp_robot.last_t = pick_t
             temp_robot.storage[sku] += 1
 
@@ -107,38 +465,189 @@ class WarehouseSolver:
                 del remaining[sku]
 
         fulfill_x, fulfill_y = self.scheduler.best_fulfill_cell(temp_robot.x, temp_robot.y)
-        fulfill_path = self.planner.plan_path(temp_robot, fulfill_x, fulfill_y)
+        fulfill_path = self._safe_plan_path(temp_robot, fulfill_x, fulfill_y)
         if not fulfill_path and (temp_robot.x != fulfill_x or temp_robot.y != fulfill_y):
             return False
 
-        pending_actions.extend(self._apply_moves_to_robot(temp_robot, fulfill_path))
         if fulfill_path:
-            pending_paths.append(fulfill_path)
+            pending_paths.append((self._clone_robot_state(temp_robot), fulfill_path))
+        pending_actions.extend(self._apply_moves_to_robot(temp_robot, fulfill_path))
 
         fulfill_t = temp_robot.last_t + 1
         if not self.planner.can_occupy(temp_robot, fulfill_t, temp_robot.x, temp_robot.y):
             return False
         pending_actions.append((fulfill_t, temp_robot.id, "fulfill", fulfill_x, fulfill_y))
-        pending_footprints.append((fulfill_t, temp_robot.x, temp_robot.y))
+        pending_footprints.append((self._clone_robot_state(temp_robot), fulfill_t, temp_robot.x, temp_robot.y))
         temp_robot.last_t = fulfill_t
         temp_robot.storage.clear()
 
+        self._commit_plan(
+            robot=robot,
+            temp_robot=temp_robot,
+            pending_actions=pending_actions,
+            pending_paths=pending_paths,
+            pending_footprints=pending_footprints,
+        )
+        return True
+
+    def _plan_relocate_pallet_for_robot(
+        self, robot: RobotState, sku: int, hotspot: Tuple[int, int]
+    ) -> bool:
+        pallet_cells = self.scheduler.pallet_cells_for_sku(sku)
+        if not pallet_cells:
+            return False
+
+        rx, ry = robot.x, robot.y
+        pallet_xy = min(pallet_cells, key=lambda p: abs(p[0] - rx) + abs(p[1] - ry))
+        pallet_id = self.pallet_id_by_coord.get(pallet_xy)
+        if pallet_id is None:
+            return False
+
+        stand_cells = self.scheduler.pick_cells_for_pallet(pallet_xy)
+        if not stand_cells:
+            return False
+        stand_cells.sort(key=lambda p: abs(p[0] - rx) + abs(p[1] - ry))
+        stand_cells = stand_cells[: self.config.relocate_stand_candidate_limit]
+
+        target_pallet_cells = self._knight_cells_around(hotspot)
+        target_pallet_cells.sort(key=lambda p: abs(p[0] - pallet_xy[0]) + abs(p[1] - pallet_xy[1]))
+        target_pallet_cells = target_pallet_cells[: self.config.relocate_target_candidate_limit]
+
+        for stand_x, stand_y in stand_cells:
+            temp_robot = self._clone_robot_state(robot)
+            pending_actions: List[Tuple[int, int, str, int, int]] = []
+            pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+            pending_footprints: List[Tuple[RobotState, int, int, int]] = []
+            pending_static_additions: List[Tuple[int, int, int]] = []
+
+            path_to_stand = self._safe_plan_path(temp_robot, stand_x, stand_y)
+            if not path_to_stand and (temp_robot.x != stand_x or temp_robot.y != stand_y):
+                continue
+            if path_to_stand:
+                pending_paths.append((self._clone_robot_state(temp_robot), path_to_stand))
+            pending_actions.extend(self._apply_moves_to_robot(temp_robot, path_to_stand))
+
+            dx = pallet_xy[0] - temp_robot.x
+            dy = pallet_xy[1] - temp_robot.y
+            if abs(dx) + abs(dy) != 1:
+                continue
+
+            dock_t = temp_robot.last_t + 1
+            if not self.planner.can_occupy(temp_robot, dock_t, temp_robot.x, temp_robot.y):
+                continue
+            pending_actions.append((dock_t, temp_robot.id, "dock", pallet_xy[0], pallet_xy[1]))
+            pending_footprints.append((self._clone_robot_state(temp_robot), dock_t, temp_robot.x, temp_robot.y))
+            temp_robot.last_t = dock_t
+            temp_robot.docks[(dx, dy)] = pallet_id
+
+            chosen = None
+            for tx, ty in target_pallet_cells:
+                if (tx, ty) in self.scheduler.pallets and (tx, ty) != pallet_xy:
+                    continue
+
+                target_robot_x = tx - dx
+                target_robot_y = ty - dy
+                if not (0 <= target_robot_x < self.state.width and 0 <= target_robot_y < self.state.height):
+                    continue
+                if (target_robot_x, target_robot_y) in self.scheduler.pallets and (
+                    target_robot_x, target_robot_y
+                ) != pallet_xy:
+                    continue
+
+                carry_path = self._safe_plan_path(temp_robot, target_robot_x, target_robot_y)
+                if not carry_path and (temp_robot.x != target_robot_x or temp_robot.y != target_robot_y):
+                    continue
+
+                chosen = (tx, ty, carry_path)
+                break
+
+            if chosen is None:
+                continue
+
+            target_pallet_x, target_pallet_y, carry_path = chosen
+            if carry_path:
+                pending_paths.append((self._clone_robot_state(temp_robot), carry_path))
+            pending_actions.extend(self._apply_moves_to_robot(temp_robot, carry_path))
+
+            undock_t = temp_robot.last_t + 1
+            if not self.planner.can_occupy(temp_robot, undock_t, temp_robot.x, temp_robot.y):
+                continue
+            pending_actions.append((undock_t, temp_robot.id, "undock", target_pallet_x, target_pallet_y))
+            pending_footprints.append((self._clone_robot_state(temp_robot), undock_t, temp_robot.x, temp_robot.y))
+            temp_robot.last_t = undock_t
+            del temp_robot.docks[(dx, dy)]
+
+            # The undocked pallet becomes static from the next timestep onward.
+            pending_static_additions.append((undock_t + 1, target_pallet_x, target_pallet_y))
+
+            self._commit_plan(
+                robot=robot,
+                temp_robot=temp_robot,
+                pending_actions=pending_actions,
+                pending_paths=pending_paths,
+                pending_footprints=pending_footprints,
+                pending_static_additions=pending_static_additions,
+            )
+
+            old_xy = pallet_xy
+            new_xy = (target_pallet_x, target_pallet_y)
+            if new_xy != old_xy:
+                self.scheduler.move_pallet(old_xy, new_xy)
+                self.pallet_id_by_coord.pop(old_xy, None)
+                self.pallet_id_by_coord[new_xy] = pallet_id
+                self.pallet_by_id[pallet_id]["x"] = new_xy[0]
+                self.pallet_by_id[pallet_id]["y"] = new_xy[1]
+
+            return True
+
+        return False
+
+    def _knight_cells_around(self, origin: Tuple[int, int]) -> List[Tuple[int, int]]:
+        ox, oy = origin
+        out = []
+        for dx, dy in KNIGHT_OFFSETS:
+            tx, ty = ox + dx, oy + dy
+            if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
+                out.append((tx, ty))
+        return out
+
+    def _safe_plan_path(
+        self, robot: RobotState, target_x: int, target_y: int
+    ) -> List[Tuple[int, int, int]]:
+        return self.planner.plan_path(
+            robot,
+            target_x,
+            target_y,
+            max_path_steps=self.config.path_step_limit,
+        )
+
+    def _commit_plan(
+        self,
+        robot: RobotState,
+        temp_robot: RobotState,
+        pending_actions: List[Tuple[int, int, str, int, int]],
+        pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]],
+        pending_footprints: List[Tuple[RobotState, int, int, int]],
+        pending_static_additions: List[Tuple[int, int, int]] | None = None,
+    ) -> None:
         for t, rid, action, x, y in pending_actions:
             self.actions.add(t, rid, action, x, y)
 
-        for path in pending_paths:
-            self.planner.reserve_path(temp_robot, path)
+        for path_robot, path in pending_paths:
+            self.planner.reserve_path(path_robot, path)
 
-        for t, x, y in pending_footprints:
-            self.planner.reserve_footprint(temp_robot, t, x, y)
+        for foot_robot, t, x, y in pending_footprints:
+            self.planner.reserve_footprint(foot_robot, t, x, y)
+
+        if pending_static_additions:
+            for t, x, y in pending_static_additions:
+                self.planner.add_static_obstacle_from(t, x, y)
 
         robot.x = temp_robot.x
         robot.y = temp_robot.y
         robot.last_t = temp_robot.last_t
         robot.storage = collections.Counter(temp_robot.storage)
         robot.docks = dict(temp_robot.docks)
-
-        return True
 
     def _apply_moves_to_robot(
         self, robot: RobotState, path: List[Tuple[int, int, int]]
@@ -169,6 +678,24 @@ class WarehouseSolver:
             storage=collections.Counter(robot.storage),
             docks=dict(robot.docks),
         )
+
+    def _open_log(self) -> None:
+        if self.config.log_path is None:
+            return
+        log_path = Path(self.config.log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_handle = log_path.open("w", encoding="utf-8", buffering=1)
+
+    def _close_log(self) -> None:
+        if self._log_handle is not None:
+            self._log_handle.close()
+            self._log_handle = None
+
+    def _log(self, message: str) -> None:
+        if self._log_handle is None:
+            return
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._log_handle.write(f"[{ts}] {message}\n")
 
     def _repair_idle_wait_conflicts(
         self, actions: List[Tuple[int, int, str, int, int]]

@@ -11,6 +11,7 @@ if str(SRC) not in sys.path:
 from jr_walker.solver import SolverConfig, WarehouseSolver
 from jr_walker.view import WarehouseState
 from jr_walker.writer import write_actions
+from jr_walker.analysis import analysis_output_path_for_solution, solution_analysis
 
 
 def make_unique_path(path: Path) -> Path:
@@ -31,6 +32,11 @@ def make_unique_path(path: Path) -> Path:
 def main():
     parser = argparse.ArgumentParser(description="Build a warehouse action plan.")
     parser.add_argument("--input", default="data/BIG_ORDER.txt", help="Path to BIG_ORDER-style input file.")
+    parser.add_argument(
+        "--analyze-only",
+        default=None,
+        help="Analyze an existing solution file and exit.",
+    )
     parser.add_argument("--output-dir", default="output", help="Directory to write solution files.")
     parser.add_argument(
         "--output",
@@ -40,10 +46,27 @@ def main():
     parser.add_argument(
         "--max-time",
         type=int,
-        default=50000,
+        default=13000,
         help="Reservation horizon in timesteps.",
     )
+    parser.add_argument(
+        "--log-path",
+        default="output/run.log",
+        help="Path for live runtime log output.",
+    )
     args = parser.parse_args()
+
+    if args.analyze_only:
+        analysis_path = analysis_output_path_for_solution(
+            Path(args.analyze_only), output_dir=Path(args.output_dir)
+        )
+        written = solution_analysis(
+            solution_path=Path(args.analyze_only),
+            worklist_path=Path(args.input),
+            output_path=analysis_path,
+        )
+        print(f"Wrote analysis to {written}")
+        return
 
     state = WarehouseState(args.input)
     output_dir = Path(args.output_dir)
@@ -54,6 +77,7 @@ def main():
             max_time=args.max_time,
             output_path=Path(args.output) if args.output else temp_output_path,
             progress_every=50,
+            log_path=Path(args.log_path),
         ),
     )
     _, actions = solver.solve()
@@ -71,9 +95,17 @@ def main():
     if not args.output and temp_output_path.exists():
         temp_output_path.unlink()
 
+    analysis_path = analysis_output_path_for_solution(final_output_path, output_dir=output_dir)
+    written_analysis_path = solution_analysis(
+        solution_path=final_output_path,
+        worklist_path=Path(args.input),
+        output_path=analysis_path,
+    )
+
     print(f"Wrote {len(actions)} actions to {final_output_path}")
     print(f"Move count: {move_count}")
     print(f"Plan makespan: {makespan} timesteps")
+    print(f"Wrote analysis to {written_analysis_path}")
 
 
 if __name__ == "__main__":

@@ -10,23 +10,45 @@ def manhattan(p1: Tuple[int, int], p2: Tuple[int, int]) -> int:
 
 
 class GreedyScheduler:
-    def __init__(self, width: int, height: int, pallets: Dict[Tuple[int, int], int], static_grid):
+    def __init__(self, width: int, height: int, pallets: Dict[Tuple[int, int], int]):
         self.width = width
         self.height = height
-        self.pallets = pallets
-        self.static_grid = static_grid
+        self.pallets: Dict[Tuple[int, int], int] = dict(pallets)
         self.sku_to_pallets: Dict[int, List[Tuple[int, int]]] = collections.defaultdict(list)
         self.pick_cells_by_pallet: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+        self._rebuild_indexes()
 
-        for (px, py), sku in pallets.items():
+    def _rebuild_indexes(self) -> None:
+        self.sku_to_pallets = collections.defaultdict(list)
+        self.pick_cells_by_pallet = {}
+
+        for (px, py), sku in self.pallets.items():
             self.sku_to_pallets[sku].append((px, py))
             valid_cells = []
-            for cx, cy in adjacent_cells(width, height, px, py):
+            for cx, cy in adjacent_cells(self.width, self.height, px, py):
                 # Pick cells must not be occupied by static pallets.
-                if int(static_grid[cy, cx]) == 2:
+                if (cx, cy) in self.pallets:
                     continue
                 valid_cells.append((cx, cy))
             self.pick_cells_by_pallet[(px, py)] = valid_cells
+
+    def has_sku(self, sku: int) -> bool:
+        return len(self.sku_to_pallets.get(sku, [])) > 0
+
+    def pallet_cells_for_sku(self, sku: int) -> List[Tuple[int, int]]:
+        return list(self.sku_to_pallets.get(sku, []))
+
+    def pick_cells_for_pallet(self, pallet_xy: Tuple[int, int]) -> List[Tuple[int, int]]:
+        return list(self.pick_cells_by_pallet.get(pallet_xy, []))
+
+    def move_pallet(self, from_xy: Tuple[int, int], to_xy: Tuple[int, int]) -> None:
+        if from_xy not in self.pallets:
+            raise ValueError(f"Cannot move pallet from {from_xy}: missing source.")
+        if to_xy in self.pallets:
+            raise ValueError(f"Cannot move pallet to {to_xy}: destination occupied.")
+        sku = self.pallets.pop(from_xy)
+        self.pallets[to_xy] = sku
+        self._rebuild_indexes()
 
     def rank_robots_for_order(self, order: collections.Counter, robots: Iterable[RobotState]) -> List[int]:
         unique_skus = list(order.keys())
@@ -54,8 +76,8 @@ class GreedyScheduler:
         for sku, qty in remaining.items():
             if qty <= 0:
                 continue
-            for pallet_xy in self.sku_to_pallets[sku]:
-                for pick_cell_xy in self.pick_cells_by_pallet[pallet_xy]:
+            for pallet_xy in self.sku_to_pallets.get(sku, []):
+                for pick_cell_xy in self.pick_cells_by_pallet.get(pallet_xy, []):
                     dist = manhattan(current_xy, pick_cell_xy)
                     options.append((dist, sku, pallet_xy, pick_cell_xy))
 
@@ -68,8 +90,8 @@ class GreedyScheduler:
     def _nearest_pick_distance(self, current_xy: Tuple[int, int], skus: Iterable[int]) -> int:
         best = float("inf")
         for sku in skus:
-            for pallet_xy in self.sku_to_pallets[sku]:
-                for pick_cell_xy in self.pick_cells_by_pallet[pallet_xy]:
+            for pallet_xy in self.sku_to_pallets.get(sku, []):
+                for pick_cell_xy in self.pick_cells_by_pallet.get(pallet_xy, []):
                     best = min(best, manhattan(current_xy, pick_cell_xy))
         if best == float("inf"):
             return 10**9

@@ -1,8 +1,125 @@
 import collections
-from typing import List, Dict, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 def manhattan_distance(p1: Tuple[int, int], p2: Tuple[int, int]) -> int:
     return abs(p1[0] - p2[0]) + abs(p1[1] - p2[1])
+
+
+class EdgeAwareOrderScorer:
+    """
+    Estimates order effort using marginal detour to a fulfill edge:
+    picks that sit near the current route to edge are scored as low cost.
+    """
+
+    def __init__(
+        self,
+        scheduler,
+        width: int,
+        height: int,
+        hot_spots: List[Tuple[int, int]] | None = None,
+    ):
+        self.scheduler = scheduler
+        self.width = width
+        self.height = height
+        self.hot_spots = [p for p in (hot_spots or []) if self._in_bounds(*p)]
+
+    def rank_orders_for_robot(
+        self,
+        robot,
+        order_ids: Iterable[int],
+        orders: List[collections.Counter],
+        top_k: int | None = None,
+    ) -> List[int]:
+        scored = []
+        for order_idx in order_ids:
+            score = self.estimate_order_cost(robot, orders[order_idx])
+            scored.append((score, order_idx))
+
+        scored.sort(key=lambda t: (t[0], t[1]))
+        if top_k is not None:
+            scored = scored[:top_k]
+        return [order_idx for _, order_idx in scored]
+
+    def estimate_order_cost(self, robot, order: collections.Counter) -> float:
+        start_xy = (robot.x, robot.y)
+        edge_candidates = self._edge_candidates(start_xy)
+        best = float("inf")
+        for edge_xy in edge_candidates:
+            est = self._estimate_with_edge(start_xy, edge_xy, order)
+            if est < best:
+                best = est
+        if best == float("inf"):
+            return best
+        return (robot.last_t + 1) + best
+
+    def _estimate_with_edge(
+        self,
+        start_xy: Tuple[int, int],
+        edge_xy: Tuple[int, int],
+        order: collections.Counter,
+    ) -> float:
+        remaining = set(order.keys())
+        current_xy = start_xy
+        total = 0.0
+
+        while remaining:
+            choice = None
+            for sku in remaining:
+                qty = order[sku]
+                best_pick = self._best_pick_for_sku(current_xy, edge_xy, sku)
+                if best_pick is None:
+                    continue
+                detour, travel, pick_xy = best_pick
+                candidate = (detour, travel, -qty, sku, pick_xy)
+                if choice is None or candidate < choice:
+                    choice = candidate
+
+            if choice is None:
+                return float("inf")
+
+            _, travel, neg_qty, sku, pick_xy = choice
+            qty = -neg_qty
+            total += travel
+            total += qty  # pick actions at the same stand cell
+            current_xy = pick_xy
+            remaining.remove(sku)
+
+        total += manhattan_distance(current_xy, edge_xy)
+        total += 1  # fulfill action
+        return total
+
+    def _best_pick_for_sku(
+        self,
+        current_xy: Tuple[int, int],
+        edge_xy: Tuple[int, int],
+        sku: int,
+    ) -> Tuple[int, int, Tuple[int, int]] | None:
+        if not self.scheduler.has_sku(sku):
+            return None
+
+        base_to_edge = manhattan_distance(current_xy, edge_xy)
+        best = None
+        for pallet_xy in self.scheduler.pallet_cells_for_sku(sku):
+            for pick_xy in self.scheduler.pick_cells_for_pallet(pallet_xy):
+                travel = manhattan_distance(current_xy, pick_xy)
+                tail = manhattan_distance(pick_xy, edge_xy)
+                detour = travel + tail - base_to_edge
+                candidate = (detour, travel, pick_xy)
+                if best is None or candidate < best:
+                    best = candidate
+        return best
+
+    def _edge_candidates(self, start_xy: Tuple[int, int]) -> List[Tuple[int, int]]:
+        x, y = start_xy
+        candidates = set(self.hot_spots)
+        candidates.add((x, 0))
+        candidates.add((x, self.height - 1))
+        candidates.add((0, y))
+        candidates.add((self.width - 1, y))
+        return [p for p in candidates if self._in_bounds(*p)]
+
+    def _in_bounds(self, x: int, y: int) -> bool:
+        return 0 <= x < self.width and 0 <= y < self.height
 
 class OrderOptimizer:
     def __init__(self, pallets: Dict[Tuple[int, int], int]):

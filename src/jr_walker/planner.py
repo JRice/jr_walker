@@ -37,17 +37,44 @@ class ReservationPlanner:
         robot.docks = dict(robot_state.docks)
         return robot
 
-    def plan_path(self, robot_state: RobotState, target_x: int, target_y: int) -> List[Tuple[int, int, int]]:
+    def plan_path(
+        self,
+        robot_state: RobotState,
+        target_x: int,
+        target_y: int,
+        max_path_steps: int | None = None,
+    ) -> List[Tuple[int, int, int]]:
         robot = self._to_robot(robot_state)
-        return find_path(
+
+        if max_path_steps is None:
+            return find_path(
+                robot,
+                robot_state.last_t,
+                robot_state.x,
+                robot_state.y,
+                target_x,
+                target_y,
+                self.reservation_table,
+            )
+
+        start_t = max(robot_state.last_t, 0)
+        end_t = min(start_t + max_path_steps + 1, self.max_time)
+        if end_t - start_t < 2:
+            return []
+
+        sliced_table = self.reservation_table[start_t:end_t]
+        path = find_path(
             robot,
-            robot_state.last_t,
+            0,
             robot_state.x,
             robot_state.y,
             target_x,
             target_y,
-            self.reservation_table,
+            sliced_table,
         )
+        if not path:
+            return []
+        return [(t + start_t, x, y) for (t, x, y) in path]
 
     def reserve_path(self, robot_state: RobotState, path: Iterable[Tuple[int, int, int]]) -> None:
         robot = self._to_robot(robot_state)
@@ -79,3 +106,14 @@ class ReservationPlanner:
         for fx, fy in robot.get_footprint(x, y):
             if 0 <= fx < self.width and 0 <= fy < self.height:
                 self.reservation_table[timestep, fy, fx] = 3
+
+    def add_static_obstacle_from(self, timestep: int, x: int, y: int) -> None:
+        """Marks a cell as static-blocked (value 2) from timestep onward."""
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            return
+        if timestep < 0:
+            timestep = 0
+        if timestep >= self.max_time:
+            return
+        cell_slice = self.reservation_table[timestep:, y, x]
+        cell_slice[cell_slice < 2] = 2
