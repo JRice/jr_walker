@@ -1,0 +1,41 @@
+Solution Analysis: output\solution_46368.txt
+Worklist: data\BIG_ORDER.txt
+
+Total fulfills: 1000
+Total items delivered: 9653
+Unknown pick coordinates: 267
+
+[left_edge]
+  fulfills: 10
+  items: 95
+  sku_counts: SKU1:34, SKU2:14, SKU3:12, SKU4:3, SKU5:6, SKU6:5, SKU7:4, SKU8:1, SKU11:1, SKU13:1, SKU14:1, SKU15:3, SKU16:3, SKU17:1, SKU18:5, SKU20:1
+
+[right_edge]
+  fulfills: 6
+  items: 70
+  sku_counts: SKU1:17, SKU2:13, SKU3:5, SKU4:1, SKU5:5, SKU6:2, SKU7:3, SKU8:2, SKU9:6, SKU11:4, SKU12:1, SKU13:4, SKU14:2, SKU15:1, SKU16:2, SKU18:1, SKU19:1
+
+[top_x0_29]
+  fulfills: 204
+  items: 1901
+  sku_counts: SKU1:734, SKU2:286, SKU3:57, SKU4:132, SKU5:102, SKU6:102, SKU7:84, SKU8:58, SKU9:43, SKU10:23, SKU11:24, SKU12:40, SKU13:33, SKU14:28, SKU15:27, SKU16:30, SKU17:22, SKU18:26, SKU19:26, SKU20:24
+
+[top_x30_59]
+  fulfills: 465
+  items: 4412
+  sku_counts: SKU1:1557, SKU2:728, SKU3:475, SKU4:323, SKU5:223, SKU6:106, SKU7:70, SKU8:149, SKU9:127, SKU10:106, SKU11:25, SKU12:12, SKU13:83, SKU14:83, SKU15:81, SKU16:51, SKU17:63, SKU18:56, SKU19:51, SKU20:43
+
+[bottom_x0_29]
+  fulfills: 243
+  items: 2357
+  sku_counts: SKU1:835, SKU2:357, SKU3:269, SKU4:194, SKU5:123, SKU6:129, SKU7:124, SKU8:49, SKU9:6, SKU10:3, SKU11:30, SKU12:55, SKU13:41, SKU14:14, SKU15:12, SKU16:30, SKU17:24, SKU18:14, SKU19:19, SKU20:29
+
+[bottom_x30_59]
+  fulfills: 72
+  items: 818
+  sku_counts: SKU1:267, SKU2:138, SKU3:84, SKU4:34, SKU5:42, SKU6:36, SKU7:31, SKU8:26, SKU9:17, SKU10:17, SKU11:17, SKU12:13, SKU13:31, SKU14:7, SKU15:16, SKU16:17, SKU17:4, SKU18:2, SKU19:9, SKU20:10
+
+[non_edge]
+  fulfills: 0
+  items: 0
+  sku_counts: (none)

@@ -13,3 +13,4 @@ models/
 *.bin
 *.onnx
 .env
+output/*.log

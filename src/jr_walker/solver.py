@@ -57,6 +57,14 @@ class RelocationJob:
 
 
 @dataclass
+class PalletMove:
+    old_xy: Tuple[int, int]
+    new_xy: Tuple[int, int]
+    dock_t: int
+    undock_t: int
+
+
+@dataclass
 class SolverConfig:
     max_time: int = 50000
     progress_every: int = 50
@@ -108,9 +116,12 @@ class WarehouseSolver:
         # Stable pallet IDs so we can track moved pallets by SKU.
         self.pallet_by_id: Dict[int, Dict[str, int]] = {}
         self.pallet_id_by_coord: Dict[Tuple[int, int], int] = {}
+        self.pallet_initial_xy: Dict[int, Tuple[int, int]] = {}
+        self.pallet_moves: Dict[int, List[PalletMove]] = collections.defaultdict(list)
         for pallet_id, ((px, py), sku) in enumerate(self.state.pallets.items()):
             self.pallet_by_id[pallet_id] = {"sku": sku, "x": px, "y": py}
             self.pallet_id_by_coord[(px, py)] = pallet_id
+            self.pallet_initial_xy[pallet_id] = (px, py)
 
         self.relocated_skus: set[int] = set()
         sku_counter: collections.Counter = collections.Counter()
@@ -124,6 +135,8 @@ class WarehouseSolver:
             ROLE_RELOCATE_PALLET: self._role_relocate_pallet,
         }
         self._initial_relocate_assigned = 0
+        self._dispatch_floor_t = -1
+        self._warmup_barrier_applied = False
         self._log_handle = None
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
@@ -146,6 +159,11 @@ class WarehouseSolver:
             while remaining_orders:
                 robot = self._next_available_robot()
                 role = self._dispatch_role(robot)
+                if role == ROLE_DELIVER:
+                    self._ensure_warmup_barrier()
+
+                if robot.last_t < self._dispatch_floor_t:
+                    robot.last_t = self._dispatch_floor_t
                 dnum = dispatch_count + 1
                 if dnum % self.config.dispatch_log_every == 0:
                     self._log(
@@ -157,6 +175,7 @@ class WarehouseSolver:
                 t0 = time.perf_counter()
                 handled = self.role_handlers[role](robot, remaining_orders)
                 if not handled and role != ROLE_DELIVER:
+                    self._ensure_warmup_barrier()
                     handled = self.role_handlers[ROLE_DELIVER](robot, remaining_orders)
 
                 if not handled:
@@ -330,6 +349,19 @@ class WarehouseSolver:
     def _next_available_robot(self) -> RobotState:
         return min(self.robots, key=lambda r: (r.last_t, r.id))
 
+    def _ensure_warmup_barrier(self) -> None:
+        if self._warmup_barrier_applied:
+            return
+        if self._initial_relocate_assigned <= 0:
+            return
+        if not self.robots:
+            return
+        floor_t = max(r.last_t for r in self.robots)
+        if floor_t > self._dispatch_floor_t:
+            self._dispatch_floor_t = floor_t
+        self._warmup_barrier_applied = True
+        self._log(f"warmup_barrier floor_t={self._dispatch_floor_t}")
+
     def _dispatch_role(self, robot: RobotState) -> str:
         if (
             self._initial_relocate_assigned < self.config.initial_relocate_dispatches
@@ -432,26 +464,25 @@ class WarehouseSolver:
         while sum(remaining.values()) > 0:
             options = self.scheduler.candidate_pick_options(remaining, (temp_robot.x, temp_robot.y))
             selected = None
-            for _, sku, pallet_xy, _pick_cell_xy in options:
-                pick_cells = self.scheduler.pick_cells_for_pallet(pallet_xy)
-                if not pick_cells:
-                    continue
-                target_x, target_y = pick_cells[0]
+            for _, sku, pallet_xy, pick_cell_xy in options:
+                target_x, target_y = pick_cell_xy
                 path = self._safe_plan_path(temp_robot, target_x, target_y)
 
                 if path or (temp_robot.x == target_x and temp_robot.y == target_y):
-                    selected = (sku, pallet_xy, path)
+                    pick_t = (path[-1][0] + 1) if path else (temp_robot.last_t + 1)
+                    if not self._is_pick_target_static_at_time(pallet_xy, pick_t):
+                        continue
+                    selected = (sku, pallet_xy, path, pick_t)
                     break
 
             if selected is None:
                 return False
 
-            sku, pallet_xy, path = selected
+            sku, pallet_xy, path, pick_t = selected
             if path:
                 pending_paths.append((self._clone_robot_state(temp_robot), path))
             pending_actions.extend(self._apply_moves_to_robot(temp_robot, path))
 
-            pick_t = temp_robot.last_t + 1
             if not self.planner.can_occupy(temp_robot, pick_t, temp_robot.x, temp_robot.y):
                 return False
             pallet_x, pallet_y = pallet_xy
@@ -592,6 +623,13 @@ class WarehouseSolver:
             old_xy = pallet_xy
             new_xy = (target_pallet_x, target_pallet_y)
             if new_xy != old_xy:
+                self._record_pallet_move(
+                    pallet_id=pallet_id,
+                    old_xy=old_xy,
+                    new_xy=new_xy,
+                    dock_t=dock_t,
+                    undock_t=undock_t,
+                )
                 self.scheduler.move_pallet(old_xy, new_xy)
                 self.pallet_id_by_coord.pop(old_xy, None)
                 self.pallet_id_by_coord[new_xy] = pallet_id
@@ -610,6 +648,36 @@ class WarehouseSolver:
             if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
                 out.append((tx, ty))
         return out
+
+    def _record_pallet_move(
+        self,
+        pallet_id: int,
+        old_xy: Tuple[int, int],
+        new_xy: Tuple[int, int],
+        dock_t: int,
+        undock_t: int,
+    ) -> None:
+        self.pallet_moves[pallet_id].append(
+            PalletMove(old_xy=old_xy, new_xy=new_xy, dock_t=dock_t, undock_t=undock_t)
+        )
+        self.pallet_moves[pallet_id].sort(key=lambda m: m.dock_t)
+
+    def _pallet_static_xy_at(self, pallet_id: int, timestep: int) -> Tuple[int, int] | None:
+        current_xy = self.pallet_initial_xy[pallet_id]
+        for move in self.pallet_moves.get(pallet_id, []):
+            if timestep < move.dock_t:
+                return current_xy
+            if move.dock_t <= timestep <= move.undock_t:
+                return None
+            current_xy = move.new_xy
+        return current_xy
+
+    def _is_pick_target_static_at_time(self, pallet_xy: Tuple[int, int], pick_t: int) -> bool:
+        pallet_id = self.pallet_id_by_coord.get(pallet_xy)
+        if pallet_id is None:
+            return False
+        static_xy = self._pallet_static_xy_at(pallet_id, pick_t)
+        return static_xy == pallet_xy
 
     def _safe_plan_path(
         self, robot: RobotState, target_x: int, target_y: int
