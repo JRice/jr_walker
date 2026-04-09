@@ -145,7 +145,8 @@ def main():
         state.orders = state.orders[::10]
 
     output_dir = Path(args.output_dir)
-    temp_output_path = output_dir / "solution_latest.txt"
+    output_prefix = "test_" if args.test else ""
+    temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
     solver = WarehouseSolver(
         state,
         SolverConfig(
@@ -164,7 +165,7 @@ def main():
         final_output_path = Path(args.output)
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
-        final_output_path = make_unique_path(output_dir / f"solution_{makespan}.txt")
+        final_output_path = make_unique_path(output_dir / f"{output_prefix}solution_{makespan}.txt")
 
     write_actions(actions, final_output_path)
     if not args.output and temp_output_path.exists():
