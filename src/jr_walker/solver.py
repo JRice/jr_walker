@@ -52,6 +52,8 @@ class RelocationJob:
     bucket: str
     hotspot: Tuple[int, int]
     score: float
+    placement_offset: Tuple[int, int] = (0, 0)
+    preferred_target_xy: Tuple[int, int] | None = None
     attempts: int = 0
     metadata: Dict[str, float] = field(default_factory=dict)
 
@@ -148,7 +150,7 @@ class WarehouseSolver:
         self._log(f"solve_start total_orders={total_orders}")
         if self.relocation_plan:
             summary = ", ".join(
-                f"SKU{job.sku}->{job.bucket}(score={job.score:.2f})"
+                f"SKU{job.sku}->{job.bucket}@{job.placement_offset}(score={job.score:.2f})"
                 for job in list(self.relocation_plan)[:6]
             )
             self._log(f"relocation_plan count={len(self.relocation_plan)} top=[{summary}]")
@@ -289,6 +291,18 @@ class WarehouseSolver:
 
         jobs.sort(key=lambda j: (-j.score, j.sku))
         jobs = jobs[: self.config.relocation_top_skus]
+        planned_targets: set[Tuple[int, int]] = set()
+        for job in jobs:
+            offset = self._choose_unique_relocation_offset(
+                bucket=job.bucket,
+                hotspot=job.hotspot,
+                reserved_targets=planned_targets,
+            )
+            job.placement_offset = offset
+            tx, ty = job.hotspot[0] + offset[0], job.hotspot[1] + offset[1]
+            if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
+                job.preferred_target_xy = (tx, ty)
+                planned_targets.add((tx, ty))
         return collections.deque(jobs)
 
     def _find_default_analysis_path(self) -> Path | None:
@@ -432,14 +446,15 @@ class WarehouseSolver:
 
             ok = self._plan_relocate_pallet_for_robot(
                 robot=robot,
-                sku=job.sku,
-                hotspot=job.hotspot,
+                job=job,
             )
             if ok:
                 self.relocated_skus.add(job.sku)
                 self.relocation_plan.popleft()
                 self._log(
-                    f"relocation_done sku={job.sku} bucket={job.bucket} hotspot={job.hotspot} score={job.score:.3f}"
+                    f"relocation_done sku={job.sku} bucket={job.bucket} "
+                    f"hotspot={job.hotspot} offset={job.placement_offset} "
+                    f"target={job.preferred_target_xy} score={job.score:.3f}"
                 )
                 return True
 
@@ -521,9 +536,8 @@ class WarehouseSolver:
         )
         return True
 
-    def _plan_relocate_pallet_for_robot(
-        self, robot: RobotState, sku: int, hotspot: Tuple[int, int]
-    ) -> bool:
+    def _plan_relocate_pallet_for_robot(self, robot: RobotState, job: RelocationJob) -> bool:
+        sku = job.sku
         pallet_cells = self.scheduler.pallet_cells_for_sku(sku)
         if not pallet_cells:
             return False
@@ -540,8 +554,13 @@ class WarehouseSolver:
         stand_cells.sort(key=lambda p: abs(p[0] - rx) + abs(p[1] - ry))
         stand_cells = stand_cells[: self.config.relocate_stand_candidate_limit]
 
-        target_pallet_cells = self._knight_cells_around(hotspot)
-        target_pallet_cells.sort(key=lambda p: abs(p[0] - pallet_xy[0]) + abs(p[1] - pallet_xy[1]))
+        target_pallet_cells = self._candidate_relocation_targets(job)
+        target_pallet_cells.sort(
+            key=lambda p: (
+                0 if p == job.preferred_target_xy else 1,
+                abs(p[0] - pallet_xy[0]) + abs(p[1] - pallet_xy[1]),
+            )
+        )
         target_pallet_cells = target_pallet_cells[: self.config.relocate_target_candidate_limit]
 
         for stand_x, stand_y in stand_cells:
@@ -647,6 +666,82 @@ class WarehouseSolver:
             tx, ty = ox + dx, oy + dy
             if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
                 out.append((tx, ty))
+        return out
+
+    def _edge_offset_candidates(
+        self, bucket: str, max_depth: int = 6, max_span: int = 10
+    ) -> List[Tuple[int, int]]:
+        if bucket.startswith("top_"):
+            inward = (0, 1)
+        elif bucket.startswith("bottom_"):
+            inward = (0, -1)
+        elif bucket == "left_edge":
+            inward = (1, 0)
+        elif bucket == "right_edge":
+            inward = (-1, 0)
+        else:
+            return list(KNIGHT_OFFSETS)
+
+        lateral_spans = [0]
+        for span in range(1, max_span + 1):
+            lateral_spans.extend([span, -span])
+
+        offsets: List[Tuple[int, int]] = []
+        for depth in range(1, max_depth + 1):
+            for span in lateral_spans:
+                if inward[0] == 0:
+                    offsets.append((span, depth * inward[1]))
+                else:
+                    offsets.append((depth * inward[0], span))
+        return offsets
+
+    def _choose_unique_relocation_offset(
+        self,
+        bucket: str,
+        hotspot: Tuple[int, int],
+        reserved_targets: set[Tuple[int, int]],
+    ) -> Tuple[int, int]:
+        candidates = self._edge_offset_candidates(bucket, max_depth=8, max_span=12)
+        fallback = (0, 0)
+        for dx, dy in candidates:
+            tx, ty = hotspot[0] + dx, hotspot[1] + dy
+            if not (0 <= tx < self.state.width and 0 <= ty < self.state.height):
+                continue
+            if (tx, ty) in self.scheduler.pallets:
+                continue
+            if (tx, ty) in reserved_targets:
+                continue
+            return (dx, dy)
+
+        for dx, dy in candidates:
+            tx, ty = hotspot[0] + dx, hotspot[1] + dy
+            if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
+                fallback = (dx, dy)
+                break
+        return fallback
+
+    def _candidate_relocation_targets(self, job: RelocationJob) -> List[Tuple[int, int]]:
+        out: List[Tuple[int, int]] = []
+        seen: set[Tuple[int, int]] = set()
+
+        def push(cell: Tuple[int, int]) -> None:
+            if cell in seen:
+                return
+            cx, cy = cell
+            if not (0 <= cx < self.state.width and 0 <= cy < self.state.height):
+                return
+            seen.add(cell)
+            out.append(cell)
+
+        if job.preferred_target_xy is not None:
+            push(job.preferred_target_xy)
+
+        for dx, dy in self._edge_offset_candidates(job.bucket, max_depth=8, max_span=14):
+            push((job.hotspot[0] + dx, job.hotspot[1] + dy))
+
+        for cell in self._knight_cells_around(job.hotspot):
+            push(cell)
+
         return out
 
     def _record_pallet_move(
@@ -777,6 +872,12 @@ class WarehouseSolver:
         static_blocked = (self.state.grid == 2)
         max_repairs = 20
 
+        def footprint_at(x: int, y: int, dock_offsets: set[Tuple[int, int]]) -> set[Tuple[int, int]]:
+            fp = {(x, y)}
+            for dx, dy in dock_offsets:
+                fp.add((x + dx, y + dy))
+            return fp
+
         for _ in range(max_repairs):
             repaired.sort(key=lambda row: (row[0], row[1]))
             by_t = collections.defaultdict(dict)
@@ -786,59 +887,103 @@ class WarehouseSolver:
                 robot_times[rid].append(t)
 
             positions = {rid: (x, y) for rid, (x, y) in enumerate(self.state.robots)}
+            docks: Dict[int, set[Tuple[int, int]]] = {
+                rid: set() for rid in range(len(self.state.robots))
+            }
             conflict = None
 
             max_t = max(by_t) if by_t else -1
             for t in range(max_t + 1):
                 acts = by_t.get(t, {})
-                occ_start = {pos: rid for rid, pos in positions.items()}
-                move_targets = {
-                    (x, y) for rid, (action, x, y) in acts.items() if action == "move"
+                start_positions = dict(positions)
+                start_docks = {rid: set(offsets) for rid, offsets in docks.items()}
+                start_footprints = {
+                    rid: footprint_at(pos[0], pos[1], start_docks.get(rid, set()))
+                    for rid, pos in start_positions.items()
                 }
+                move_target_footprints = {
+                    rid: footprint_at(x, y, start_docks.get(rid, set()))
+                    for rid, (action, x, y) in acts.items()
+                    if action == "move"
+                }
+                occupied_start = set()
+                for rid, fp in start_footprints.items():
+                    occupied_start.update(fp)
 
                 for rid, (action, x, y) in acts.items():
                     if action != "move":
                         continue
-                    dest = (x, y)
-                    blocker = occ_start.get(dest)
-                    if blocker is None or blocker == rid:
+                    mover_target = move_target_footprints.get(rid, set())
+                    overlapping_blockers = [
+                        blocker
+                        for blocker, blocker_fp in start_footprints.items()
+                        if blocker != rid and mover_target.intersection(blocker_fp)
+                    ]
+                    if not overlapping_blockers:
                         continue
 
-                    blocker_action = acts.get(blocker)
-                    blocker_moves = blocker_action is not None and blocker_action[0] == "move"
-                    if blocker_moves:
-                        continue
+                    for blocker in overlapping_blockers:
+                        blocker_action = acts.get(blocker)
+                        blocker_moves = blocker_action is not None and blocker_action[0] == "move"
+                        if blocker_moves:
+                            continue
 
-                    blocker_has_action_now = blocker_action is not None
-                    blocker_has_future = any(tt > t for tt in robot_times.get(blocker, []))
-                    if blocker_has_action_now or blocker_has_future:
-                        continue
+                        blocker_has_action_now = blocker_action is not None
+                        blocker_has_future = any(tt > t for tt in robot_times.get(blocker, []))
+                        if blocker_has_action_now or blocker_has_future:
+                            continue
 
-                    bx, by = positions[blocker]
-                    candidates = [(bx - 1, by), (bx + 1, by), (bx, by - 1), (bx, by + 1)]
-                    chosen = None
-                    for nx, ny in candidates:
-                        if not (0 <= nx < self.state.width and 0 <= ny < self.state.height):
+                        bx, by = start_positions[blocker]
+                        blocker_docks = start_docks.get(blocker, set())
+                        candidates = [(bx - 1, by), (bx + 1, by), (bx, by - 1), (bx, by + 1)]
+                        chosen = None
+                        for nx, ny in candidates:
+                            candidate_fp = footprint_at(nx, ny, blocker_docks)
+                            in_bounds = all(
+                                0 <= fx < self.state.width and 0 <= fy < self.state.height
+                                for fx, fy in candidate_fp
+                            )
+                            if not in_bounds:
+                                continue
+                            if any(static_blocked[fy, fx] for fx, fy in candidate_fp):
+                                continue
+
+                            occupied_without_blocker = occupied_start - start_footprints[blocker]
+                            if candidate_fp.intersection(occupied_without_blocker):
+                                continue
+
+                            overlaps_move_target = False
+                            for target_rid, target_fp in move_target_footprints.items():
+                                if target_rid == blocker:
+                                    continue
+                                if candidate_fp.intersection(target_fp):
+                                    overlaps_move_target = True
+                                    break
+                            if overlaps_move_target:
+                                continue
+
+                            chosen = (nx, ny)
+                            break
+
+                        if chosen is None:
                             continue
-                        if static_blocked[ny, nx]:
-                            continue
-                        occ = occ_start.get((nx, ny))
-                        if occ is not None and occ != blocker:
-                            continue
-                        if (nx, ny) in move_targets:
-                            continue
-                        chosen = (nx, ny)
+
+                        conflict = (t, blocker, chosen[0], chosen[1])
                         break
 
-                    if chosen is None:
-                        continue
-
-                    conflict = (t, blocker, chosen[0], chosen[1])
-                    break
+                    if conflict is not None:
+                        break
 
                 for rid, (action, x, y) in acts.items():
                     if action == "move":
                         positions[rid] = (x, y)
+                for rid, (action, x, y) in acts.items():
+                    if action == "dock":
+                        rx, ry = positions[rid]
+                        docks[rid].add((x - rx, y - ry))
+                    elif action == "undock":
+                        rx, ry = positions[rid]
+                        docks[rid].discard((x - rx, y - ry))
 
                 if conflict is not None:
                     break
