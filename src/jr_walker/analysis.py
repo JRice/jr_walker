@@ -276,13 +276,13 @@ def solution_analysis(
 
     lines_out.append("[robot_metrics]")
     for rid in range(num_robots):
-        top4 = robot_pick_counts[rid].most_common(4)
-        if top4:
-            top4_text = ", ".join([f"SKU{sku}:{cnt}" for sku, cnt in top4])
+        top_picks = robot_pick_counts[rid].most_common(10)
+        if top_picks:
+            top_picks_text = ", ".join([f"SKU{sku}:{cnt}" for sku, cnt in top_picks])
         else:
-            top4_text = "(none)"
+            top_picks_text = "(none)"
         lines_out.append(f"  robot_{rid}:")
-        lines_out.append(f"    top4_picked_skus: {top4_text}")
+        lines_out.append(f"    top_picked_skus: {top_picks_text}")
         lines_out.append(f"    skipped_ticks: {robot_skip_counts[rid]}")
         lines_out.append(f"    distance_traveled: {robot_distance[rid]}")
         lines_out.append(f"    docked_ticks: {robot_docked_ticks[rid]}")
@@ -294,13 +294,13 @@ def solution_analysis(
     most_time = sorted(
         order_fulfill_records,
         key=lambda r: (-r["duration"], -r["fulfill_t"], r["order_id"]),
-    )[:10]
+    )[:100]
     least_time = sorted(
         order_fulfill_records,
         key=lambda r: (r["duration"], r["fulfill_t"], r["order_id"]),
-    )[:10]
+    )[:100]
 
-    lines_out.append("  top_10_longest:")
+    lines_out.append("  Longest:")
     if not most_time:
         lines_out.append("    (none)")
     else:
@@ -312,7 +312,7 @@ def solution_analysis(
                 f"robot={rec['robot_id']}, items={rec['items']}"
             )
 
-    lines_out.append("  top_10_shortest:")
+    lines_out.append("  Shortest:")
     if not least_time:
         lines_out.append("    (none)")
     else:
