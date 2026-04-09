@@ -964,3 +964,39 @@
 [2026-04-08 21:12:48] dispatch_start n=475 robot=2 role=deliver robot_t=4487 completed=470/1000 remaining=530
 [2026-04-08 21:12:48] dispatch_end n=475 robot=2 role=deliver success=True elapsed_s=0.22 completed=471/1000 remaining=529
 [2026-04-08 21:12:48] dispatch_start n=476 robot=3 role=deliver robot_t=4489 completed=471/1000 remaining=529
+[2026-04-08 21:12:48] dispatch_end n=476 robot=3 role=deliver success=True elapsed_s=0.22 completed=472/1000 remaining=528
+[2026-04-08 21:12:48] dispatch_start n=477 robot=0 role=deliver robot_t=4503 completed=472/1000 remaining=528
+[2026-04-08 21:12:48] dispatch_end n=477 robot=0 role=deliver success=True elapsed_s=0.22 completed=473/1000 remaining=527
+[2026-04-08 21:12:48] dispatch_start n=478 robot=4 role=deliver robot_t=4509 completed=473/1000 remaining=527
+[2026-04-08 21:12:48] dispatch_end n=478 robot=4 role=deliver success=True elapsed_s=0.24 completed=474/1000 remaining=526
+[2026-04-08 21:12:48] dispatch_start n=479 robot=1 role=deliver robot_t=4520 completed=474/1000 remaining=526
+[2026-04-08 21:12:49] dispatch_end n=479 robot=1 role=deliver success=True elapsed_s=0.21 completed=475/1000 remaining=525
+[2026-04-08 21:12:49] dispatch_start n=480 robot=2 role=deliver robot_t=4545 completed=475/1000 remaining=525
+[2026-04-08 21:12:49] dispatch_end n=480 robot=2 role=deliver success=True elapsed_s=0.23 completed=476/1000 remaining=524
+[2026-04-08 21:12:49] dispatch_start n=481 robot=4 role=deliver robot_t=4555 completed=476/1000 remaining=524
+[2026-04-08 21:12:49] dispatch_end n=481 robot=4 role=deliver success=True elapsed_s=0.21 completed=477/1000 remaining=523
+[2026-04-08 21:12:49] dispatch_start n=482 robot=3 role=deliver robot_t=4556 completed=477/1000 remaining=523
+[2026-04-08 21:12:49] dispatch_end n=482 robot=3 role=deliver success=True elapsed_s=0.21 completed=478/1000 remaining=522
+[2026-04-08 21:12:49] dispatch_start n=483 robot=0 role=deliver robot_t=4557 completed=478/1000 remaining=522
+[2026-04-08 21:12:50] dispatch_end n=483 robot=0 role=deliver success=True elapsed_s=0.22 completed=479/1000 remaining=521
+[2026-04-08 21:12:50] dispatch_start n=484 robot=1 role=deliver robot_t=4580 completed=479/1000 remaining=521
+[2026-04-08 21:12:50] dispatch_end n=484 robot=1 role=deliver success=True elapsed_s=0.22 completed=480/1000 remaining=520
+[2026-04-08 21:12:50] dispatch_start n=485 robot=3 role=deliver robot_t=4599 completed=480/1000 remaining=520
+[2026-04-08 21:12:50] dispatch_end n=485 robot=3 role=deliver success=True elapsed_s=0.22 completed=481/1000 remaining=519
+[2026-04-08 21:12:50] dispatch_start n=486 robot=2 role=deliver robot_t=4615 completed=481/1000 remaining=519
+[2026-04-08 21:12:50] dispatch_end n=486 robot=2 role=deliver success=True elapsed_s=0.22 completed=482/1000 remaining=518
+[2026-04-08 21:12:50] dispatch_start n=487 robot=0 role=deliver robot_t=4618 completed=482/1000 remaining=518
+[2026-04-08 21:12:50] dispatch_end n=487 robot=0 role=deliver success=True elapsed_s=0.21 completed=483/1000 remaining=517
+[2026-04-08 21:12:50] dispatch_start n=488 robot=4 role=deliver robot_t=4618 completed=483/1000 remaining=517
+[2026-04-08 21:12:51] dispatch_end n=488 robot=4 role=deliver success=True elapsed_s=0.21 completed=484/1000 remaining=516
+[2026-04-08 21:12:51] dispatch_start n=489 robot=1 role=deliver robot_t=4626 completed=484/1000 remaining=516
+[2026-04-08 21:12:51] dispatch_end n=489 robot=1 role=deliver success=True elapsed_s=0.24 completed=485/1000 remaining=515
+[2026-04-08 21:12:51] dispatch_start n=490 robot=4 role=deliver robot_t=4672 completed=485/1000 remaining=515
+[2026-04-08 21:12:51] dispatch_end n=490 robot=4 role=deliver success=True elapsed_s=0.22 completed=486/1000 remaining=514
+[2026-04-08 21:12:51] dispatch_start n=491 robot=1 role=deliver robot_t=4677 completed=486/1000 remaining=514
+[2026-04-08 21:12:51] dispatch_end n=491 robot=1 role=deliver success=True elapsed_s=0.21 completed=487/1000 remaining=513
+[2026-04-08 21:12:51] dispatch_start n=492 robot=2 role=deliver robot_t=4682 completed=487/1000 remaining=513
+[2026-04-08 21:12:51] dispatch_end n=492 robot=2 role=deliver success=True elapsed_s=0.22 completed=488/1000 remaining=512
+[2026-04-08 21:12:51] dispatch_start n=493 robot=3 role=deliver robot_t=4684 completed=488/1000 remaining=512
+[2026-04-08 21:12:52] dispatch_end n=493 robot=3 role=deliver success=True elapsed_s=0.21 completed=489/1000 remaining=511
+[2026-04-08 21:12:52] dispatch_start n=494 robot=0 role=deliver robot_t=4686 completed=489/1000 remaining=511
