@@ -12,5 +12,6 @@ models/
 *.gguf
 *.bin
 *.onnx
+*log
 .env
 output/*.log
