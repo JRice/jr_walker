@@ -1,6 +1,0 @@
-[robots]
-robot_0 = ["relocate_pallet", "relocate_pallet", "loop", "deliver_easy"]
-robot_1 = ["relocate_pallet", "relocate_pallet", "loop", "deliver_easy"]
-robot_2 = ["relocate_pallet", "relocate_pallet", "loop", "deliver_easy"]
-robot_3 = ["relocate_pallet", "relocate_pallet", "loop", "deliver_easy"]
-robot_4 = ["relocate_pallet", "relocate_pallet", "loop", "deliver_easy"]

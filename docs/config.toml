@@ -1,0 +1,9 @@
+[relocation]
+lane_width = 3
+
+[robots]
+robot_0 = ["relocate_pallet", "loop", "deliver_easy", "deliver_hard"]
+robot_1 = ["relocate_pallet", "loop", "deliver_hard", "deliver_easy"]
+robot_2 = ["relocate_pallet", "loop", "deliver_easy", "deliver_hard"]
+robot_3 = ["relocate_pallet", "loop", "deliver_hard", "deliver_easy"]
+robot_4 = ["relocate_pallet", "loop", "deliver_easy", "deliver_hard"]

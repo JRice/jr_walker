@@ -74,7 +74,7 @@ def _parse_robot_key(raw_key: str) -> int:
     return int(key)
 
 
-def load_dispatch_role_plans(config_path: Path, robot_count: int) -> dict[int, list[str]]:
+def load_run_config(config_path: Path, robot_count: int) -> tuple[dict[int, list[str]], int]:
     with config_path.open("rb") as handle:
         data = tomllib.load(handle)
 
@@ -102,7 +102,17 @@ def load_dispatch_role_plans(config_path: Path, robot_count: int) -> dict[int, l
     if missing:
         raise ValueError(f"Dispatch config is missing role plans for robots: {missing}")
 
-    return plans
+    relocation_section = data.get("relocation", {})
+    if relocation_section is None:
+        relocation_section = {}
+    if not isinstance(relocation_section, dict):
+        raise ValueError('If present, [relocation] must be a table.')
+
+    lane_width = relocation_section.get("lane_width", 3)
+    if not isinstance(lane_width, int) or lane_width < 0:
+        raise ValueError("relocation.lane_width must be a non-negative integer.")
+
+    return plans, lane_width
 
 
 def main():
@@ -146,9 +156,9 @@ def main():
         help="Optional note describing the latest algorithm change for leaderboard.md.",
     )
     parser.add_argument(
-        "--dispatch-config",
-        default=None,
-        help='Optional TOML file with per-robot role plans, e.g. [robots] robot_0=["relocate_pallet","loop","deliver_easy","deliver_hard"].',
+        "--config",
+        default="docs/config.toml",
+        help='TOML run config with per-robot role plans and relocation params. Default: docs/config.toml',
     )
     args = parser.parse_args()
 
@@ -191,20 +201,23 @@ def main():
         state.orders = state.orders[::10]
 
     role_plans_by_robot = None
-    if args.dispatch_config:
-        config_path = Path(args.dispatch_config)
-        if not config_path.exists():
-            print(f"Dispatch config not found: {config_path}")
-            raise SystemExit(1)
+    lane_width = 3
+    config_path = Path(args.config)
+    if config_path.exists():
         try:
-            role_plans_by_robot = load_dispatch_role_plans(
+            role_plans_by_robot, lane_width = load_run_config(
                 config_path=config_path,
                 robot_count=len(state.robots),
             )
         except Exception as exc:
-            print(f"Failed to parse dispatch config {config_path}: {exc}")
+            print(f"Failed to parse config {config_path}: {exc}")
             raise SystemExit(1)
-        print(f"Loaded dispatch role plans from {config_path} for {len(role_plans_by_robot)} robots.")
+        print(
+            f"Loaded config from {config_path} for {len(role_plans_by_robot)} robots "
+            f"(lane_width={lane_width})."
+        )
+    else:
+        print(f"Config file not found at {config_path}; using solver defaults.")
 
     output_dir = Path(args.output_dir)
     output_prefix = "test_" if args.test else ""
@@ -217,6 +230,7 @@ def main():
             progress_every=50,
             log_path=Path(args.log_path),
             role_plans_by_robot=role_plans_by_robot,
+            lane_width=lane_width,
         ),
     )
     solve_error: Exception | None = None

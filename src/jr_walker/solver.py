@@ -106,6 +106,7 @@ class SolverConfig:
     relocation_top_skus: int = 8
     relocation_min_lift: float = 0.08
     relocation_max_attempts_per_sku: int = 5
+    lane_width: int = 3
     log_path: Path | None = None
     dispatch_log_every: int = 1
     role_plans_by_robot: Dict[int, List[str]] | None = None
@@ -142,6 +143,9 @@ class WarehouseSolver:
             height=self.state.height,
             hot_spots=FULFILL_HOT_SPOTS,
         )
+        self.travel_lane_cells: set[Tuple[int, int]] = self._build_travel_lane_cells(
+            lane_width=self.config.lane_width
+        )
 
         # Stable pallet IDs so we can track moved pallets by SKU.
         self.pallet_by_id: Dict[int, Dict[str, int]] = {}
@@ -154,6 +158,7 @@ class WarehouseSolver:
             self.pallet_initial_xy[pallet_id] = (px, py)
 
         self.relocated_skus: set[int] = set()
+        self.relocated_pallet_targets: set[Tuple[int, int]] = set()
         sku_counter: collections.Counter = collections.Counter()
         for order in self.orders:
             sku_counter.update(order.items)
@@ -701,6 +706,11 @@ class WarehouseSolver:
         target_pallet_cells = self._candidate_relocation_targets(job)
         target_pallet_cells.sort(
             key=lambda p: (
+                -self._score_relocation_target(
+                    old_xy=pallet_xy,
+                    target_xy=p,
+                    hotspot=job.hotspot,
+                ),
                 0 if p == job.preferred_target_xy else 1,
                 abs(p[0] - pallet_xy[0]) + abs(p[1] - pallet_xy[1]),
             )
@@ -798,6 +808,7 @@ class WarehouseSolver:
                 self.pallet_id_by_coord[new_xy] = pallet_id
                 self.pallet_by_id[pallet_id]["x"] = new_xy[0]
                 self.pallet_by_id[pallet_id]["y"] = new_xy[1]
+                self.relocated_pallet_targets.add(new_xy)
 
             return True
 
@@ -853,6 +864,8 @@ class WarehouseSolver:
                 continue
             if (tx, ty) in self.scheduler.pallets:
                 continue
+            if (tx, ty) in self.travel_lane_cells:
+                continue
             if (tx, ty) in reserved_targets:
                 continue
             return (dx, dy)
@@ -860,9 +873,86 @@ class WarehouseSolver:
         for dx, dy in candidates:
             tx, ty = hotspot[0] + dx, hotspot[1] + dy
             if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
+                if (tx, ty) in self.travel_lane_cells:
+                    continue
                 fallback = (dx, dy)
                 break
         return fallback
+
+    def _build_travel_lane_cells(self, lane_width: int) -> set[Tuple[int, int]]:
+        lane_width = max(0, int(lane_width))
+        cells: set[Tuple[int, int]] = set()
+
+        for hx, hy in FULFILL_HOT_SPOTS:
+            if hy in (0, self.state.height - 1):
+                xmin = max(0, hx - lane_width)
+                xmax = min(self.state.width - 1, hx + lane_width)
+                for x in range(xmin, xmax + 1):
+                    for y in range(self.state.height):
+                        cells.add((x, y))
+            if hx in (0, self.state.width - 1):
+                ymin = max(0, hy - lane_width)
+                ymax = min(self.state.height - 1, hy + lane_width)
+                for y in range(ymin, ymax + 1):
+                    for x in range(self.state.width):
+                        cells.add((x, y))
+
+            for dx in range(-lane_width, lane_width + 1):
+                for dy in range(-lane_width, lane_width + 1):
+                    tx, ty = hx + dx, hy + dy
+                    if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
+                        cells.add((tx, ty))
+
+        return cells
+
+    def _score_relocation_target(
+        self,
+        old_xy: Tuple[int, int],
+        target_xy: Tuple[int, int],
+        hotspot: Tuple[int, int],
+    ) -> float:
+        if target_xy == old_xy:
+            return -10_000.0
+
+        old_dist = abs(old_xy[0] - hotspot[0]) + abs(old_xy[1] - hotspot[1])
+        new_dist = abs(target_xy[0] - hotspot[0]) + abs(target_xy[1] - hotspot[1])
+        demand_gain = float(old_dist - new_dist)
+
+        lane_penalty = 0.0
+        if target_xy in self.travel_lane_cells:
+            lane_penalty = 500.0
+
+        occupied_neighbors = 0
+        free_neighbors = 0
+        for nx, ny in adjacent_cells(self.state.width, self.state.height, target_xy[0], target_xy[1]):
+            occupied = (nx, ny) in self.scheduler.pallets and (nx, ny) != old_xy
+            if occupied:
+                occupied_neighbors += 1
+            else:
+                free_neighbors += 1
+
+        choke_penalty = float(occupied_neighbors * 30)
+        if free_neighbors < 2:
+            choke_penalty += 200.0
+
+        density_penalty = 0.0
+        for (px, py) in self.scheduler.pallets.keys():
+            if (px, py) == old_xy:
+                continue
+            if abs(px - target_xy[0]) + abs(py - target_xy[1]) <= 2:
+                density_penalty += 12.0
+
+        spacing_penalty = 0.0
+        if self.relocated_pallet_targets:
+            min_dist = min(
+                abs(rx - target_xy[0]) + abs(ry - target_xy[1])
+                for rx, ry in self.relocated_pallet_targets
+            )
+            if min_dist < 2:
+                spacing_penalty = 180.0
+
+        move_cost_penalty = float(abs(target_xy[0] - old_xy[0]) + abs(target_xy[1] - old_xy[1])) * 0.5
+        return (demand_gain * 20.0) - lane_penalty - choke_penalty - density_penalty - spacing_penalty - move_cost_penalty
 
     def _candidate_relocation_targets(self, job: RelocationJob) -> List[Tuple[int, int]]:
         out: List[Tuple[int, int]] = []
