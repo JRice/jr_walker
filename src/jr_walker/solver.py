@@ -14,6 +14,8 @@ from jr_walker.writer import write_actions
 
 ROLE_DELIVER = "deliver"
 ROLE_RELOCATE_PALLET = "relocate_pallet"
+DELIVER_EASY = "easy"
+DELIVER_HARD = "hard"
 
 # Planned delivery hotspot anchors.
 FULFILL_HOT_SPOTS: List[Tuple[int, int]] = [
@@ -67,6 +69,17 @@ class PalletMove:
 
 
 @dataclass
+class PlannedOrder:
+    order_idx: int
+    items: collections.Counter
+    estimated_cost: float = float("inf")
+
+    def estimate_cost(self, scorer: EdgeAwareOrderScorer) -> float:
+        self.estimated_cost = scorer.estimate_order_cost(self.items)
+        return self.estimated_cost
+
+
+@dataclass
 class SolverConfig:
     max_time: int = 50000
     progress_every: int = 50
@@ -95,6 +108,10 @@ class WarehouseSolver:
 
         self.robots: List[RobotState] = [
             RobotState(id=rid, x=x, y=y) for rid, (x, y) in enumerate(self.state.robots)
+        ]
+        self.orders: List[PlannedOrder] = [
+            PlannedOrder(order_idx=i, items=collections.Counter(order))
+            for i, order in enumerate(self.state.orders)
         ]
         self.actions = ActionLog()
         self.planner = ReservationPlanner(
@@ -127,14 +144,13 @@ class WarehouseSolver:
 
         self.relocated_skus: set[int] = set()
         sku_counter: collections.Counter = collections.Counter()
-        for order in self.state.orders:
-            sku_counter.update(order)
+        for order in self.orders:
+            sku_counter.update(order.items)
         self.skus_by_demand: List[int] = [sku for sku, _ in sku_counter.most_common()]
         self.relocation_plan: Deque[RelocationJob] = self._build_relocation_plan()
 
-        self.role_handlers = {
-            ROLE_DELIVER: self._role_deliver,
-            ROLE_RELOCATE_PALLET: self._role_relocate_pallet,
+        self._next_delivery_strategy_by_robot: Dict[int, str] = {
+            robot.id: DELIVER_EASY for robot in self.robots
         }
         self._initial_relocate_assigned = 0
         self._dispatch_floor_t = -1
@@ -144,6 +160,7 @@ class WarehouseSolver:
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
         self._open_log()
         remaining_orders = self._build_ranked_order_queue()
+        self._recalculate_order_costs(remaining_orders)
         total_orders = len(remaining_orders)
         completed = 0
         dispatch_count = 0
@@ -161,6 +178,7 @@ class WarehouseSolver:
             while remaining_orders:
                 robot = self._next_available_robot()
                 role = self._dispatch_role(robot)
+                strategy = self._next_delivery_strategy_by_robot.get(robot.id, DELIVER_EASY)
                 if role == ROLE_DELIVER:
                     self._ensure_warmup_barrier()
 
@@ -168,17 +186,25 @@ class WarehouseSolver:
                     robot.last_t = self._dispatch_floor_t
                 dnum = dispatch_count + 1
                 if dnum % self.config.dispatch_log_every == 0:
+                    role_label = role
+                    if role == ROLE_DELIVER:
+                        role_label = f"{ROLE_DELIVER}_{strategy}"
                     self._log(
-                        f"dispatch_start n={dnum} robot={robot.id} role={role} "
+                        f"dispatch_start n={dnum} robot={robot.id} role={role_label} "
                         f"robot_t={robot.last_t} completed={completed}/{total_orders} "
                         f"remaining={len(remaining_orders)}"
                     )
 
                 t0 = time.perf_counter()
-                handled = self.role_handlers[role](robot, remaining_orders)
+                if role == ROLE_DELIVER:
+                    handled = self._role_deliver(robot, remaining_orders, strategy=strategy)
+                    if handled:
+                        self._toggle_delivery_strategy(robot.id)
+                else:
+                    handled = self._role_relocate_pallet(robot, remaining_orders)
                 if not handled and role != ROLE_DELIVER:
                     self._ensure_warmup_barrier()
-                    handled = self.role_handlers[ROLE_DELIVER](robot, remaining_orders)
+                    handled = self._deliver_with_robot_strategy(robot, remaining_orders)
 
                 if not handled:
                     handled = self._fallback_deliver_any_robot(remaining_orders)
@@ -223,8 +249,29 @@ class WarehouseSolver:
 
     def _build_ranked_order_queue(self) -> Deque[int]:
         optimizer = OrderOptimizer(self.state.pallets)
-        scored = optimizer.sort_orders_by_cluster_efficiency(self.state.orders)
+        scored = optimizer.sort_orders_by_cluster_efficiency([o.items for o in self.orders])
         return collections.deque(item["order_idx"] for item in scored)
+
+    def _recalculate_order_costs(self, order_ids: Deque[int] | List[int] | None = None) -> None:
+        if order_ids is None:
+            ids = range(len(self.orders))
+        else:
+            ids = list(order_ids)
+        for order_idx in ids:
+            self.orders[order_idx].estimate_cost(self.edge_scorer)
+
+    def _toggle_delivery_strategy(self, robot_id: int) -> None:
+        current = self._next_delivery_strategy_by_robot.get(robot_id, DELIVER_EASY)
+        self._next_delivery_strategy_by_robot[robot_id] = (
+            DELIVER_HARD if current == DELIVER_EASY else DELIVER_EASY
+        )
+
+    def _deliver_with_robot_strategy(self, robot: RobotState, remaining_orders: Deque[int]) -> bool:
+        strategy = self._next_delivery_strategy_by_robot.get(robot.id, DELIVER_EASY)
+        handled = self._role_deliver(robot, remaining_orders, strategy=strategy)
+        if handled:
+            self._toggle_delivery_strategy(robot.id)
+        return handled
 
     def _build_relocation_plan(self) -> Deque[RelocationJob]:
         analysis_path = self.config.relocation_analysis_path
@@ -402,21 +449,25 @@ class WarehouseSolver:
             return True
         return False
 
-    def _role_deliver(self, robot: RobotState, remaining_orders: Deque[int]) -> bool:
+    def _role_deliver(self, robot: RobotState, remaining_orders: Deque[int], strategy: str) -> bool:
         if not remaining_orders:
             return False
+        if strategy not in {DELIVER_EASY, DELIVER_HARD}:
+            raise ValueError(f"Unknown deliver strategy: {strategy}")
 
         candidate_window = min(len(remaining_orders), self.config.delivery_candidate_window)
         candidate_order_ids = list(remaining_orders)[:candidate_window]
-        ranked_order_ids = self.edge_scorer.rank_orders_for_robot(
-            robot=robot,
-            order_ids=candidate_order_ids,
-            orders=self.state.orders,
-            top_k=self.config.max_delivery_order_attempts,
+        ranked_order_ids = sorted(
+            candidate_order_ids,
+            key=lambda oid: (
+                self.orders[oid].estimated_cost if strategy == DELIVER_EASY else -self.orders[oid].estimated_cost,
+                oid,
+            ),
         )
+        ranked_order_ids = ranked_order_ids[: self.config.max_delivery_order_attempts]
 
         for order_idx in ranked_order_ids:
-            order = self.state.orders[order_idx]
+            order = self.orders[order_idx].items
             if self._plan_order_for_robot(order_idx, order, robot):
                 try:
                     remaining_orders.remove(order_idx)
@@ -427,11 +478,11 @@ class WarehouseSolver:
 
     def _fallback_deliver_any_robot(self, remaining_orders: Deque[int]) -> bool:
         for robot in sorted(self.robots, key=lambda r: (r.last_t, r.id)):
-            if self._role_deliver(robot, remaining_orders):
+            if self._deliver_with_robot_strategy(robot, remaining_orders):
                 return True
         return False
 
-    def _role_relocate_pallet(self, robot: RobotState, _: Deque[int]) -> bool:
+    def _role_relocate_pallet(self, robot: RobotState, remaining_orders: Deque[int]) -> bool:
         if not self._has_relocation_candidate():
             return False
 
@@ -449,6 +500,7 @@ class WarehouseSolver:
                 job=job,
             )
             if ok:
+                self._recalculate_order_costs(remaining_orders)
                 self.relocated_skus.add(job.sku)
                 self.relocation_plan.popleft()
                 self._log(

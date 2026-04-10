@@ -32,7 +32,7 @@ class EdgeAwareOrderScorer:
     ) -> List[int]:
         scored = []
         for order_idx in order_ids:
-            score = self.estimate_order_cost(robot, orders[order_idx])
+            score = self.estimate_order_cost_for_robot(robot, orders[order_idx])
             scored.append((score, order_idx))
 
         scored.sort(key=lambda t: (t[0], t[1]))
@@ -40,7 +40,7 @@ class EdgeAwareOrderScorer:
             scored = scored[:top_k]
         return [order_idx for _, order_idx in scored]
 
-    def estimate_order_cost(self, robot, order: collections.Counter) -> float:
+    def estimate_order_cost_for_robot(self, robot, order: collections.Counter) -> float:
         start_xy = (robot.x, robot.y)
         edge_candidates = self._edge_candidates(start_xy)
         best = float("inf")
@@ -51,6 +51,108 @@ class EdgeAwareOrderScorer:
         if best == float("inf"):
             return best
         return (robot.last_t + 1) + best
+
+    def estimate_order_cost(self, order: collections.Counter) -> float:
+        """
+        Intrinsic order cost estimate for dispatch strategy:
+        - Includes travel between picks
+        - Includes all pick actions
+        - Includes travel from last pick to nearest available edge
+        - Includes fulfill action
+        - Excludes robot travel to the first pick
+        """
+        if not order:
+            return 1.0
+
+        best_total = float("inf")
+        for sku in order.keys():
+            first_pick = self._best_pick_distance_for_sku((0, 0), sku, ignore_current=True)
+            if first_pick is None:
+                continue
+            _, first_xy = first_pick
+            total = self._estimate_from_first_pick(order, sku, first_xy)
+            if total < best_total:
+                best_total = total
+        return best_total
+
+    def _estimate_from_first_pick(
+        self,
+        order: collections.Counter,
+        first_sku: int,
+        first_pick_xy: Tuple[int, int],
+    ) -> float:
+        if first_sku not in order:
+            return float("inf")
+
+        remaining = set(order.keys())
+        total = float(order[first_sku])  # pick count at first stand cell
+        current_xy = first_pick_xy
+        remaining.remove(first_sku)
+
+        while remaining:
+            choice = None
+            for sku in remaining:
+                best_pick = self._best_pick_distance_for_sku(current_xy, sku)
+                if best_pick is None:
+                    continue
+                travel, pick_xy = best_pick
+                qty = order[sku]
+                candidate = (travel, -qty, sku, pick_xy)
+                if choice is None or candidate < choice:
+                    choice = candidate
+
+            if choice is None:
+                return float("inf")
+
+            travel, neg_qty, sku, pick_xy = choice
+            qty = -neg_qty
+            total += float(travel + qty)
+            current_xy = pick_xy
+            remaining.remove(sku)
+
+        to_edge = self._nearest_available_edge_distance(current_xy)
+        if to_edge == float("inf"):
+            return float("inf")
+        total += float(to_edge)
+        total += 1.0  # fulfill action
+        return total
+
+    def _best_pick_distance_for_sku(
+        self,
+        current_xy: Tuple[int, int],
+        sku: int,
+        ignore_current: bool = False,
+    ) -> Tuple[int, Tuple[int, int]] | None:
+        if not self.scheduler.has_sku(sku):
+            return None
+        best = None
+        for pallet_xy in self.scheduler.pallet_cells_for_sku(sku):
+            for pick_xy in self.scheduler.pick_cells_for_pallet(pallet_xy):
+                if ignore_current:
+                    travel = 0
+                else:
+                    travel = manhattan_distance(current_xy, pick_xy)
+                candidate = (travel, pick_xy)
+                if best is None or candidate < best:
+                    best = candidate
+        return best
+
+    def _nearest_available_edge_distance(self, current_xy: Tuple[int, int]) -> float:
+        cx, cy = current_xy
+        perimeter_cells = set()
+        for x in range(self.width):
+            perimeter_cells.add((x, 0))
+            perimeter_cells.add((x, self.height - 1))
+        for y in range(self.height):
+            perimeter_cells.add((0, y))
+            perimeter_cells.add((self.width - 1, y))
+
+        best = float("inf")
+        for ex, ey in perimeter_cells:
+            if (ex, ey) in self.scheduler.pallets:
+                continue
+            best = min(best, manhattan_distance((cx, cy), (ex, ey)))
+        return best
 
     def _estimate_with_edge(
         self,
