@@ -219,7 +219,19 @@ def main():
             role_plans_by_robot=role_plans_by_robot,
         ),
     )
-    _, actions = solver.solve()
+    solve_error: Exception | None = None
+    try:
+        _, actions = solver.solve()
+    except Exception as exc:
+        solve_error = exc
+        print(f"Solver failed: {exc}")
+        print("Writing partial output from actions planned so far...")
+        actions = solver.actions.sorted_actions()
+        try:
+            actions = solver._repair_idle_wait_conflicts(actions)
+        except Exception:
+            # Best-effort only; keep raw planned actions if repair fails.
+            pass
 
     makespan = max((t for t, _, _, _, _ in actions), default=-1)
     move_count = sum(1 for _, _, action, _, _ in actions if action == "move")
@@ -228,36 +240,49 @@ def main():
         final_output_path = Path(args.output)
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
-        final_output_path = make_unique_path(output_dir / f"{output_prefix}solution_{makespan}.txt")
+        name_prefix = f"{output_prefix}solution"
+        if solve_error is not None:
+            name_prefix = f"{output_prefix}partial_solution"
+        final_output_path = make_unique_path(output_dir / f"{name_prefix}_{makespan}.txt")
 
     write_actions(actions, final_output_path)
     if not args.output and temp_output_path.exists():
         temp_output_path.unlink()
 
-    analysis_path = analysis_output_path_for_solution(final_output_path, output_dir=output_dir)
-    written_analysis_path = solution_analysis(
-        solution_path=final_output_path,
-        worklist_path=Path(args.input),
-        output_path=analysis_path,
-    )
-    append_leaderboard_entry(
-        output_dir / "leaderboard.md",
-        run_mode="test-10x" if args.test else "full",
-        input_path=Path(args.input),
-        total_orders=len(state.orders),
-        makespan=makespan,
-        move_count=move_count,
-        solution_path=final_output_path,
-        analysis_path=written_analysis_path,
-        algorithm_update=args.run_note,
-    )
+    written_analysis_path = None
+    try:
+        analysis_path = analysis_output_path_for_solution(final_output_path, output_dir=output_dir)
+        written_analysis_path = solution_analysis(
+            solution_path=final_output_path,
+            worklist_path=Path(args.input),
+            output_path=analysis_path,
+        )
+    except Exception as analysis_exc:
+        print(f"Analysis failed: {analysis_exc}")
+
+    if solve_error is None and written_analysis_path is not None:
+        append_leaderboard_entry(
+            output_dir / "leaderboard.md",
+            run_mode="test-10x" if args.test else "full",
+            input_path=Path(args.input),
+            total_orders=len(state.orders),
+            makespan=makespan,
+            move_count=move_count,
+            solution_path=final_output_path,
+            analysis_path=written_analysis_path,
+            algorithm_update=args.run_note,
+        )
 
     print(f"Wrote {len(actions)} actions to {final_output_path}")
     print(f"Move count: {move_count}")
     print(f"Plan makespan: {makespan} timesteps")
     print(f"Orders used: {len(state.orders)}")
-    print(f"Wrote analysis to {written_analysis_path}")
-    print(f"Updated leaderboard: {output_dir / 'leaderboard.md'}")
+    if written_analysis_path is not None:
+        print(f"Wrote analysis to {written_analysis_path}")
+    if solve_error is None and written_analysis_path is not None:
+        print(f"Updated leaderboard: {output_dir / 'leaderboard.md'}")
+    if solve_error is not None:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
