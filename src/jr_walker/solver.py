@@ -16,6 +16,9 @@ ROLE_DELIVER = "deliver"
 ROLE_RELOCATE_PALLET = "relocate_pallet"
 DELIVER_EASY = "easy"
 DELIVER_HARD = "hard"
+ROLE_LOOP = "loop"
+ROLE_DELIVER_EASY = f"{ROLE_DELIVER}_{DELIVER_EASY}"
+ROLE_DELIVER_HARD = f"{ROLE_DELIVER}_{DELIVER_HARD}"
 
 # Planned delivery hotspot anchors.
 FULFILL_HOT_SPOTS: List[Tuple[int, int]] = [
@@ -80,6 +83,13 @@ class PlannedOrder:
 
 
 @dataclass
+class RobotRoleCursor:
+    roles: List[str]
+    next_index: int = 0
+    loop_index: int | None = None
+
+
+@dataclass
 class SolverConfig:
     max_time: int = 50000
     progress_every: int = 50
@@ -98,6 +108,7 @@ class SolverConfig:
     relocation_max_attempts_per_sku: int = 5
     log_path: Path | None = None
     dispatch_log_every: int = 1
+    role_plans_by_robot: Dict[int, List[str]] | None = None
 
 
 class WarehouseSolver:
@@ -149,6 +160,22 @@ class WarehouseSolver:
         self.skus_by_demand: List[int] = [sku for sku, _ in sku_counter.most_common()]
         self.relocation_plan: Deque[RelocationJob] = self._build_relocation_plan()
 
+        self.role_plans_by_robot = self._normalize_role_plans(
+            self.config.role_plans_by_robot or {}
+        )
+        self._role_cursors_by_robot: Dict[int, RobotRoleCursor] = {}
+        for robot_id, roles in self.role_plans_by_robot.items():
+            loop_index = None
+            for idx, role in enumerate(roles):
+                if role == ROLE_LOOP:
+                    loop_index = idx
+                    break
+            self._role_cursors_by_robot[robot_id] = RobotRoleCursor(
+                roles=list(roles),
+                next_index=0,
+                loop_index=loop_index,
+            )
+
         self._next_delivery_strategy_by_robot: Dict[int, str] = {
             robot.id: DELIVER_EASY for robot in self.robots
         }
@@ -177,8 +204,8 @@ class WarehouseSolver:
         try:
             while remaining_orders:
                 robot = self._next_available_robot()
-                role = self._dispatch_role(robot)
-                strategy = self._next_delivery_strategy_by_robot.get(robot.id, DELIVER_EASY)
+                role_token, from_plan = self._dispatch_role(robot)
+                role, strategy = self._decode_role_token(role_token, robot.id)
                 if role == ROLE_DELIVER:
                     self._ensure_warmup_barrier()
 
@@ -186,9 +213,7 @@ class WarehouseSolver:
                     robot.last_t = self._dispatch_floor_t
                 dnum = dispatch_count + 1
                 if dnum % self.config.dispatch_log_every == 0:
-                    role_label = role
-                    if role == ROLE_DELIVER:
-                        role_label = f"{ROLE_DELIVER}_{strategy}"
+                    role_label = role_token
                     self._log(
                         f"dispatch_start n={dnum} robot={robot.id} role={role_label} "
                         f"robot_t={robot.last_t} completed={completed}/{total_orders} "
@@ -198,7 +223,7 @@ class WarehouseSolver:
                 t0 = time.perf_counter()
                 if role == ROLE_DELIVER:
                     handled = self._role_deliver(robot, remaining_orders, strategy=strategy)
-                    if handled:
+                    if handled and not from_plan:
                         self._toggle_delivery_strategy(robot.id)
                 else:
                     handled = self._role_relocate_pallet(robot, remaining_orders)
@@ -272,6 +297,31 @@ class WarehouseSolver:
         if handled:
             self._toggle_delivery_strategy(robot.id)
         return handled
+
+    def _normalize_role_plans(
+        self, role_plans: Dict[int, List[str]]
+    ) -> Dict[int, List[str]]:
+        normalized: Dict[int, List[str]] = {}
+        allowed = {
+            ROLE_RELOCATE_PALLET,
+            ROLE_DELIVER,
+            ROLE_DELIVER_EASY,
+            ROLE_DELIVER_HARD,
+            ROLE_LOOP,
+        }
+        for robot_id, roles in role_plans.items():
+            rid = int(robot_id)
+            cleaned = [str(role).strip().lower() for role in roles if str(role).strip()]
+            if not cleaned:
+                continue
+            for role in cleaned:
+                if role not in allowed:
+                    raise ValueError(
+                        f"Unknown role '{role}' in plan for robot {rid}. "
+                        f"Allowed: {sorted(allowed)}"
+                    )
+            normalized[rid] = cleaned
+        return normalized
 
     def _build_relocation_plan(self) -> Deque[RelocationJob]:
         analysis_path = self.config.relocation_analysis_path
@@ -423,19 +473,61 @@ class WarehouseSolver:
         self._warmup_barrier_applied = True
         self._log(f"warmup_barrier floor_t={self._dispatch_floor_t}")
 
-    def _dispatch_role(self, robot: RobotState) -> str:
+    def _dispatch_role(self, robot: RobotState) -> Tuple[str, bool]:
+        planned = self._next_role_from_plan(robot.id)
+        if planned is not None:
+            return planned, True
+
         if (
             self._initial_relocate_assigned < self.config.initial_relocate_dispatches
             and self._has_relocation_candidate()
         ):
             self._initial_relocate_assigned += 1
-            return ROLE_RELOCATE_PALLET
+            return ROLE_RELOCATE_PALLET, False
 
         if self._has_relocation_candidate():
             if self.rng.random() < self.config.relocate_pallet_probability:
-                return ROLE_RELOCATE_PALLET
+                return ROLE_RELOCATE_PALLET, False
 
-        return ROLE_DELIVER
+        strategy = self._next_delivery_strategy_by_robot.get(robot.id, DELIVER_EASY)
+        if strategy == DELIVER_HARD:
+            return ROLE_DELIVER_HARD, False
+        return ROLE_DELIVER_EASY, False
+
+    def _next_role_from_plan(self, robot_id: int) -> str | None:
+        cursor = self._role_cursors_by_robot.get(robot_id)
+        if cursor is None or not cursor.roles:
+            return None
+
+        max_steps = len(cursor.roles) + 2
+        steps = 0
+        while steps < max_steps:
+            if cursor.next_index >= len(cursor.roles):
+                if cursor.loop_index is not None:
+                    cursor.next_index = cursor.loop_index
+                else:
+                    cursor.next_index = 0
+
+            token = cursor.roles[cursor.next_index]
+            cursor.next_index += 1
+            if token == ROLE_LOOP:
+                steps += 1
+                continue
+            return token
+
+        raise RuntimeError(f"Robot {robot_id} plan does not contain any dispatchable roles.")
+
+    def _decode_role_token(self, role_token: str, robot_id: int) -> Tuple[str, str]:
+        token = role_token.strip().lower()
+        if token == ROLE_RELOCATE_PALLET:
+            return ROLE_RELOCATE_PALLET, DELIVER_EASY
+        if token == ROLE_DELIVER:
+            return ROLE_DELIVER, DELIVER_EASY
+        if token == ROLE_DELIVER_EASY:
+            return ROLE_DELIVER, DELIVER_EASY
+        if token == ROLE_DELIVER_HARD:
+            return ROLE_DELIVER, DELIVER_HARD
+        raise ValueError(f"Unknown role token '{role_token}' for robot {robot_id}")
 
     def _has_relocation_candidate(self) -> bool:
         while self.relocation_plan:

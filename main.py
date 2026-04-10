@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 import argparse
 from datetime import datetime
+import tomllib
 
 # Allow `python main.py` from repo root without installing the package.
 ROOT = Path(__file__).resolve().parent
@@ -64,6 +65,46 @@ def append_leaderboard_entry(
         handle.write("\n".join(lines))
 
 
+def _parse_robot_key(raw_key: str) -> int:
+    key = raw_key.strip().lower()
+    if key.startswith("robot_"):
+        key = key[len("robot_") :]
+    if not key.isdigit():
+        raise ValueError(f'Invalid robot key "{raw_key}" (expected e.g. "robot_0").')
+    return int(key)
+
+
+def load_dispatch_role_plans(config_path: Path, robot_count: int) -> dict[int, list[str]]:
+    with config_path.open("rb") as handle:
+        data = tomllib.load(handle)
+
+    robots_section = data.get("robots")
+    if not isinstance(robots_section, dict):
+        raise ValueError('Dispatch config must contain a [robots] table.')
+
+    plans: dict[int, list[str]] = {}
+    for raw_key, raw_roles in robots_section.items():
+        robot_id = _parse_robot_key(str(raw_key))
+        if robot_id < 0 or robot_id >= robot_count:
+            raise ValueError(
+                f"Dispatch config references robot {robot_id}, but valid IDs are 0..{robot_count - 1}."
+            )
+        if not isinstance(raw_roles, list) or not all(isinstance(role, str) for role in raw_roles):
+            raise ValueError(
+                f'Roles for "{raw_key}" must be an array of strings.'
+            )
+        cleaned = [role.strip().lower() for role in raw_roles if role.strip()]
+        if not cleaned:
+            raise ValueError(f'Roles for "{raw_key}" cannot be empty.')
+        plans[robot_id] = cleaned
+
+    missing = [rid for rid in range(robot_count) if rid not in plans]
+    if missing:
+        raise ValueError(f"Dispatch config is missing role plans for robots: {missing}")
+
+    return plans
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build a warehouse action plan.")
     parser.add_argument("--input", default="docs/BIG_ORDER.txt", help="Path to BIG_ORDER-style input file.")
@@ -103,6 +144,11 @@ def main():
         "--run-note",
         default="",
         help="Optional note describing the latest algorithm change for leaderboard.md.",
+    )
+    parser.add_argument(
+        "--dispatch-config",
+        default=None,
+        help='Optional TOML file with per-robot role plans, e.g. [robots] robot_0=["relocate_pallet","loop","deliver_easy","deliver_hard"].',
     )
     args = parser.parse_args()
 
@@ -144,6 +190,22 @@ def main():
     if args.test:
         state.orders = state.orders[::10]
 
+    role_plans_by_robot = None
+    if args.dispatch_config:
+        config_path = Path(args.dispatch_config)
+        if not config_path.exists():
+            print(f"Dispatch config not found: {config_path}")
+            raise SystemExit(1)
+        try:
+            role_plans_by_robot = load_dispatch_role_plans(
+                config_path=config_path,
+                robot_count=len(state.robots),
+            )
+        except Exception as exc:
+            print(f"Failed to parse dispatch config {config_path}: {exc}")
+            raise SystemExit(1)
+        print(f"Loaded dispatch role plans from {config_path} for {len(role_plans_by_robot)} robots.")
+
     output_dir = Path(args.output_dir)
     output_prefix = "test_" if args.test else ""
     temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
@@ -154,6 +216,7 @@ def main():
             output_path=Path(args.output) if args.output else temp_output_path,
             progress_every=50,
             log_path=Path(args.log_path),
+            role_plans_by_robot=role_plans_by_robot,
         ),
     )
     _, actions = solver.solve()

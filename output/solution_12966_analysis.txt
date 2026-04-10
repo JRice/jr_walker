@@ -1,0 +1,274 @@
+Solution Analysis: output\solution_12966.txt
+Worklist: docs\BIG_ORDER.txt
+
+Total fulfills: 1000
+Total items delivered: 9920
+Unknown pick coordinates: 0
+Makespan (max timestep): 12966
+
+[left_edge]
+  fulfills: 16
+  items: 157
+  sku_counts: SKU1:52, SKU2:30, SKU3:18, SKU4:6, SKU5:6, SKU6:5, SKU7:8, SKU8:1, SKU11:3, SKU12:3, SKU13:4, SKU14:6, SKU15:3, SKU16:4, SKU17:4, SKU18:2, SKU19:1, SKU20:1
+
+[right_edge]
+  fulfills: 20
+  items: 202
+  sku_counts: SKU1:61, SKU2:33, SKU3:19, SKU4:6, SKU5:5, SKU6:9, SKU7:4, SKU8:5, SKU9:21, SKU10:4, SKU11:5, SKU12:6, SKU13:3, SKU14:2, SKU15:2, SKU16:7, SKU18:3, SKU19:3, SKU20:4
+
+[top_x0_29]
+  fulfills: 151
+  items: 1526
+  sku_counts: SKU1:512, SKU2:224, SKU3:110, SKU4:89, SKU5:76, SKU6:59, SKU7:47, SKU8:45, SKU9:79, SKU10:61, SKU11:27, SKU12:38, SKU13:37, SKU14:19, SKU15:16, SKU16:22, SKU17:17, SKU18:12, SKU19:18, SKU20:18
+
+[top_x30_59]
+  fulfills: 297
+  items: 2878
+  sku_counts: SKU1:990, SKU2:470, SKU3:258, SKU4:210, SKU5:158, SKU6:79, SKU7:79, SKU8:87, SKU9:120, SKU10:76, SKU11:62, SKU12:9, SKU13:35, SKU14:47, SKU15:44, SKU16:26, SKU17:35, SKU18:32, SKU19:22, SKU20:39
+
+[bottom_x0_29]
+  fulfills: 156
+  items: 1563
+  sku_counts: SKU1:545, SKU2:229, SKU3:169, SKU4:126, SKU5:77, SKU6:65, SKU7:51, SKU8:54, SKU9:18, SKU10:15, SKU11:21, SKU12:41, SKU13:23, SKU14:19, SKU15:14, SKU16:20, SKU17:17, SKU18:25, SKU19:24, SKU20:10
+
+[bottom_x30_59]
+  fulfills: 360
+  items: 3594
+  sku_counts: SKU1:1284, SKU2:550, SKU3:328, SKU4:250, SKU5:179, SKU6:163, SKU7:127, SKU8:93, SKU9:19, SKU10:68, SKU11:63, SKU12:78, SKU13:91, SKU14:42, SKU15:61, SKU16:54, SKU17:41, SKU18:30, SKU19:38, SKU20:35
+
+[non_edge]
+  fulfills: 0
+  items: 0
+  sku_counts: (none)
+
+[robot_metrics]
+  robot_0:
+    top_picked_skus: SKU1:681, SKU2:297, SKU3:200, SKU4:134, SKU5:124, SKU6:77, SKU7:64, SKU8:50, SKU10:48, SKU9:44
+    skipped_ticks: 121
+    distance_traveled: 10637
+    docked_ticks: 22
+  robot_1:
+    top_picked_skus: SKU1:716, SKU2:278, SKU3:174, SKU4:128, SKU5:81, SKU6:78, SKU7:67, SKU8:57, SKU9:55, SKU13:43
+    skipped_ticks: 133
+    distance_traveled: 10686
+    docked_ticks: 33
+  robot_2:
+    top_picked_skus: SKU1:701, SKU2:303, SKU3:164, SKU4:147, SKU5:103, SKU6:90, SKU8:65, SKU7:63, SKU10:53, SKU9:43
+    skipped_ticks: 66
+    distance_traveled: 10681
+    docked_ticks: 70
+  robot_3:
+    top_picked_skus: SKU1:673, SKU2:321, SKU3:168, SKU4:137, SKU5:92, SKU6:71, SKU7:61, SKU9:57, SKU8:49, SKU10:44
+    skipped_ticks: 48
+    distance_traveled: 10769
+    docked_ticks: 31
+  robot_4:
+    top_picked_skus: SKU1:673, SKU2:337, SKU3:196, SKU4:141, SKU5:101, SKU6:64, SKU8:64, SKU7:61, SKU9:58, SKU13:45
+    skipped_ticks: 109
+    distance_traveled: 10649
+    docked_ticks: 38
+
+[order_fulfillment_timing]
+  fulfilled_orders: 1000 / 1000
+  Longest:
+    order_833: duration=106 (start=10990, fulfill=11096), robot=2, items=14
+    order_493: duration=101 (start=11277, fulfill=11378), robot=1, items=14
+    order_561: duration=99 (start=10221, fulfill=10320), robot=0, items=15
+    order_193: duration=99 (start=10051, fulfill=10150), robot=4, items=14
+    order_637: duration=98 (start=4204, fulfill=4302), robot=1, items=12
+    order_803: duration=96 (start=10517, fulfill=10613), robot=2, items=13
+    order_422: duration=96 (start=3926, fulfill=4022), robot=3, items=14
+    order_413: duration=94 (start=11611, fulfill=11705), robot=0, items=13
+    order_218: duration=94 (start=10750, fulfill=10844), robot=3, items=13
+    order_815: duration=94 (start=6051, fulfill=6145), robot=0, items=15
+    order_308: duration=93 (start=9035, fulfill=9128), robot=1, items=14
+    order_17: duration=91 (start=9747, fulfill=9838), robot=4, items=14
+    order_790: duration=91 (start=2467, fulfill=2558), robot=0, items=14
+    order_552: duration=90 (start=12008, fulfill=12098), robot=1, items=14
+    order_764: duration=90 (start=11278, fulfill=11368), robot=4, items=14
+    order_292: duration=90 (start=10703, fulfill=10793), robot=2, items=14
+    order_440: duration=90 (start=5481, fulfill=5571), robot=4, items=12
+    order_154: duration=89 (start=12468, fulfill=12557), robot=0, items=13
+    order_710: duration=89 (start=10508, fulfill=10597), robot=3, items=14
+    order_676: duration=89 (start=9632, fulfill=9721), robot=3, items=9
+    order_158: duration=88 (start=9503, fulfill=9591), robot=1, items=12
+    order_150: duration=88 (start=8422, fulfill=8510), robot=2, items=12
+    order_582: duration=88 (start=7808, fulfill=7896), robot=1, items=12
+    order_967: duration=88 (start=1352, fulfill=1440), robot=3, items=11
+    order_712: duration=87 (start=12162, fulfill=12249), robot=3, items=14
+    order_190: duration=86 (start=11515, fulfill=11601), robot=0, items=11
+    order_949: duration=86 (start=11461, fulfill=11547), robot=3, items=14
+    order_318: duration=86 (start=10520, fulfill=10606), robot=4, items=15
+    order_994: duration=86 (start=8421, fulfill=8507), robot=3, items=9
+    order_406: duration=86 (start=6692, fulfill=6778), robot=3, items=11
+    order_31: duration=86 (start=4993, fulfill=5079), robot=2, items=13
+    order_324: duration=86 (start=3271, fulfill=3357), robot=4, items=14
+    order_473: duration=85 (start=11943, fulfill=12028), robot=0, items=9
+    order_91: duration=85 (start=10848, fulfill=10933), robot=3, items=11
+    order_800: duration=85 (start=8162, fulfill=8247), robot=2, items=11
+    order_789: duration=85 (start=8107, fulfill=8192), robot=1, items=11
+    order_86: duration=84 (start=8976, fulfill=9060), robot=3, items=11
+    order_602: duration=84 (start=8720, fulfill=8804), robot=2, items=13
+    order_642: duration=84 (start=7906, fulfill=7990), robot=3, items=9
+    order_435: duration=84 (start=6709, fulfill=6793), robot=2, items=11
+    order_811: duration=83 (start=11941, fulfill=12024), robot=3, items=11
+    order_498: duration=83 (start=11152, fulfill=11235), robot=3, items=10
+    order_936: duration=83 (start=9194, fulfill=9277), robot=3, items=15
+    order_901: duration=83 (start=8329, fulfill=8412), robot=3, items=15
+    order_757: duration=83 (start=5914, fulfill=5997), robot=0, items=12
+    order_217: duration=82 (start=10215, fulfill=10297), robot=3, items=14
+    order_279: duration=82 (start=10089, fulfill=10171), robot=1, items=11
+    order_176: duration=82 (start=9307, fulfill=9389), robot=0, items=14
+    order_655: duration=82 (start=8755, fulfill=8837), robot=0, items=15
+    order_861: duration=81 (start=12690, fulfill=12771), robot=1, items=11
+    order_737: duration=81 (start=10694, fulfill=10775), robot=4, items=15
+    order_404: duration=81 (start=10398, fulfill=10479), robot=1, items=12
+    order_920: duration=81 (start=10384, fulfill=10465), robot=0, items=15
+    order_809: duration=81 (start=9347, fulfill=9428), robot=1, items=12
+    order_311: duration=81 (start=4573, fulfill=4654), robot=3, items=12
+    order_842: duration=81 (start=4303, fulfill=4384), robot=4, items=12
+    order_450: duration=81 (start=3697, fulfill=3778), robot=1, items=11
+    order_215: duration=80 (start=11117, fulfill=11197), robot=0, items=11
+    order_620: duration=80 (start=10661, fulfill=10741), robot=3, items=15
+    order_187: duration=80 (start=9805, fulfill=9885), robot=1, items=15
+    order_39: duration=80 (start=9777, fulfill=9857), robot=0, items=12
+    order_974: duration=80 (start=9453, fulfill=9533), robot=4, items=14
+    order_699: duration=80 (start=6930, fulfill=7010), robot=1, items=10
+    order_695: duration=80 (start=3298, fulfill=3378), robot=0, items=14
+    order_334: duration=80 (start=3053, fulfill=3133), robot=1, items=12
+    order_338: duration=79 (start=10554, fulfill=10633), robot=1, items=12
+    order_24: duration=79 (start=9696, fulfill=9775), robot=0, items=14
+    order_707: duration=79 (start=7992, fulfill=8071), robot=4, items=10
+    order_866: duration=79 (start=7160, fulfill=7239), robot=3, items=11
+    order_134: duration=79 (start=6320, fulfill=6399), robot=0, items=11
+    order_975: duration=79 (start=3909, fulfill=3988), robot=4, items=11
+    order_357: duration=79 (start=3344, fulfill=3423), robot=3, items=11
+    order_909: duration=78 (start=12459, fulfill=12537), robot=1, items=15
+    order_746: duration=78 (start=12427, fulfill=12505), robot=4, items=11
+    order_271: duration=78 (start=10052, fulfill=10130), robot=0, items=15
+    order_184: duration=78 (start=9600, fulfill=9678), robot=4, items=10
+    order_665: duration=78 (start=8892, fulfill=8970), robot=1, items=13
+    order_444: duration=78 (start=7926, fulfill=8004), robot=2, items=11
+    order_989: duration=78 (start=4426, fulfill=4504), robot=3, items=13
+    order_538: duration=78 (start=3688, fulfill=3766), robot=0, items=9
+    order_539: duration=78 (start=895, fulfill=973), robot=2, items=6
+    order_385: duration=77 (start=12134, fulfill=12211), robot=2, items=14
+    order_223: duration=77 (start=10070, fulfill=10147), robot=3, items=13
+    order_165: duration=77 (start=9793, fulfill=9870), robot=3, items=10
+    order_314: duration=77 (start=9606, fulfill=9683), robot=0, items=12
+    order_2: duration=77 (start=9464, fulfill=9541), robot=0, items=14
+    order_939: duration=77 (start=8364, fulfill=8441), robot=1, items=14
+    order_333: duration=77 (start=7662, fulfill=7739), robot=1, items=10
+    order_738: duration=77 (start=6977, fulfill=7054), robot=4, items=13
+    order_253: duration=77 (start=6563, fulfill=6640), robot=0, items=9
+    order_345: duration=77 (start=5361, fulfill=5438), robot=3, items=11
+    order_569: duration=77 (start=4069, fulfill=4146), robot=1, items=12
+    order_427: duration=77 (start=3676, fulfill=3753), robot=4, items=12
+    order_78: duration=77 (start=1527, fulfill=1604), robot=1, items=12
+    order_161: duration=76 (start=11499, fulfill=11575), robot=4, items=13
+    order_709: duration=76 (start=11197, fulfill=11273), robot=1, items=12
+    order_21: duration=76 (start=10379, fulfill=10455), robot=2, items=11
+    order_570: duration=76 (start=10365, fulfill=10441), robot=4, items=12
+    order_420: duration=76 (start=10011, fulfill=10087), robot=2, items=12
+    order_297: duration=76 (start=9543, fulfill=9619), robot=2, items=14
+  Shortest:
+    order_396: duration=10 (start=102, fulfill=112), robot=0, items=5
+    order_711: duration=19 (start=105, fulfill=124), robot=3, items=5
+    order_741: duration=20 (start=291, fulfill=311), robot=0, items=6
+    order_823: duration=21 (start=100, fulfill=121), robot=2, items=5
+    order_354: duration=21 (start=285, fulfill=306), robot=1, items=7
+    order_248: duration=22 (start=196, fulfill=218), robot=0, items=6
+    order_897: duration=22 (start=206, fulfill=228), robot=2, items=9
+    order_585: duration=22 (start=391, fulfill=413), robot=2, items=5
+    order_54: duration=22 (start=793, fulfill=815), robot=1, items=7
+    order_130: duration=23 (start=104, fulfill=127), robot=1, items=6
+    order_782: duration=23 (start=302, fulfill=325), robot=2, items=5
+    order_33: duration=24 (start=192, fulfill=216), robot=1, items=5
+    order_708: duration=24 (start=809, fulfill=833), robot=3, items=5
+    order_438: duration=24 (start=982, fulfill=1006), robot=2, items=6
+    order_238: duration=24 (start=2741, fulfill=2765), robot=1, items=6
+    order_546: duration=24 (start=3236, fulfill=3260), robot=4, items=5
+    order_101: duration=25 (start=523, fulfill=548), robot=3, items=7
+    order_935: duration=25 (start=1289, fulfill=1314), robot=4, items=5
+    order_566: duration=26 (start=923, fulfill=949), robot=0, items=6
+    order_787: duration=26 (start=2391, fulfill=2417), robot=1, items=6
+    order_99: duration=26 (start=2689, fulfill=2715), robot=4, items=9
+    order_368: duration=26 (start=2955, fulfill=2981), robot=2, items=6
+    order_323: duration=26 (start=5322, fulfill=5348), robot=2, items=9
+    order_587: duration=27 (start=317, fulfill=344), robot=3, items=5
+    order_303: duration=27 (start=718, fulfill=745), robot=0, items=6
+    order_545: duration=27 (start=905, fulfill=932), robot=3, items=7
+    order_377: duration=27 (start=1098, fulfill=1125), robot=3, items=6
+    order_644: duration=27 (start=2268, fulfill=2295), robot=3, items=6
+    order_524: duration=27 (start=5713, fulfill=5740), robot=4, items=10
+    order_254: duration=28 (start=102, fulfill=130), robot=4, items=5
+    order_366: duration=28 (start=467, fulfill=495), robot=1, items=7
+    order_45: duration=29 (start=961, fulfill=990), robot=0, items=12
+    order_779: duration=29 (start=2454, fulfill=2483), robot=2, items=8
+    order_818: duration=29 (start=2469, fulfill=2498), robot=3, items=5
+    order_452: duration=29 (start=3054, fulfill=3083), robot=2, items=6
+    order_670: duration=29 (start=3269, fulfill=3298), robot=1, items=9
+    order_258: duration=29 (start=5225, fulfill=5254), robot=2, items=7
+    order_380: duration=29 (start=5429, fulfill=5458), robot=2, items=7
+    order_501: duration=29 (start=5644, fulfill=5673), robot=2, items=9
+    order_499: duration=29 (start=6942, fulfill=6971), robot=2, items=10
+    order_555: duration=29 (start=8033, fulfill=8062), robot=0, items=12
+    order_867: duration=30 (start=604, fulfill=634), robot=3, items=8
+    order_733: duration=30 (start=818, fulfill=848), robot=0, items=5
+    order_177: duration=30 (start=1055, fulfill=1085), robot=3, items=13
+    order_367: duration=30 (start=1234, fulfill=1264), robot=0, items=5
+    order_112: duration=30 (start=1382, fulfill=1412), robot=4, items=8
+    order_326: duration=30 (start=2036, fulfill=2066), robot=0, items=6
+    order_98: duration=30 (start=3994, fulfill=4024), robot=0, items=6
+    order_781: duration=31 (start=200, fulfill=231), robot=4, items=6
+    order_988: duration=31 (start=366, fulfill=397), robot=1, items=7
+    order_280: duration=31 (start=983, fulfill=1014), robot=4, items=6
+    order_812: duration=31 (start=1183, fulfill=1214), robot=4, items=5
+    order_236: duration=31 (start=1945, fulfill=1976), robot=1, items=6
+    order_894: duration=31 (start=2569, fulfill=2600), robot=0, items=7
+    order_927: duration=31 (start=2661, fulfill=2692), robot=0, items=5
+    order_401: duration=31 (start=3021, fulfill=3052), robot=0, items=5
+    order_517: duration=31 (start=5661, fulfill=5692), robot=1, items=7
+    order_900: duration=31 (start=7287, fulfill=7318), robot=2, items=5
+    order_962: duration=31 (start=10485, fulfill=10516), robot=0, items=8
+    order_454: duration=32 (start=557, fulfill=589), robot=3, items=9
+    order_259: duration=32 (start=887, fulfill=919), robot=1, items=6
+    order_583: duration=32 (start=994, fulfill=1026), robot=1, items=14
+    order_95: duration=32 (start=1026, fulfill=1058), robot=4, items=10
+    order_355: duration=32 (start=1443, fulfill=1475), robot=0, items=5
+    order_844: duration=32 (start=1713, fulfill=1745), robot=1, items=5
+    order_732: duration=32 (start=6009, fulfill=6041), robot=0, items=8
+    order_914: duration=32 (start=7266, fulfill=7298), robot=1, items=8
+    order_247: duration=32 (start=8599, fulfill=8631), robot=3, items=11
+    order_519: duration=33 (start=876, fulfill=909), robot=4, items=9
+    order_714: duration=33 (start=2348, fulfill=2381), robot=4, items=7
+    order_264: duration=33 (start=2777, fulfill=2810), robot=4, items=5
+    order_456: duration=33 (start=3135, fulfill=3168), robot=0, items=6
+    order_491: duration=33 (start=4159, fulfill=4192), robot=2, items=7
+    order_693: duration=33 (start=4386, fulfill=4419), robot=3, items=6
+    order_978: duration=33 (start=6381, fulfill=6414), robot=1, items=7
+    order_128: duration=33 (start=7526, fulfill=7559), robot=0, items=7
+    order_668: duration=33 (start=9117, fulfill=9150), robot=0, items=10
+    order_448: duration=34 (start=319, fulfill=353), robot=1, items=12
+    order_983: duration=34 (start=351, fulfill=385), robot=3, items=10
+    order_772: duration=34 (start=945, fulfill=979), robot=3, items=11
+    order_30: duration=34 (start=1423, fulfill=1457), robot=4, items=6
+    order_654: duration=34 (start=1611, fulfill=1645), robot=1, items=6
+    order_485: duration=34 (start=2049, fulfill=2083), robot=1, items=8
+    order_403: duration=34 (start=2113, fulfill=2147), robot=4, items=6
+    order_692: duration=34 (start=2281, fulfill=2315), robot=1, items=5
+    order_34: duration=34 (start=2565, fulfill=2599), robot=3, items=6
+    order_395: duration=34 (start=3006, fulfill=3040), robot=4, items=8
+    order_758: duration=34 (start=3426, fulfill=3460), robot=3, items=9
+    order_315: duration=34 (start=3883, fulfill=3917), robot=3, items=8
+    order_402: duration=34 (start=5541, fulfill=5575), robot=2, items=8
+    order_991: duration=34 (start=6411, fulfill=6445), robot=0, items=8
+    order_372: duration=34 (start=7775, fulfill=7809), robot=0, items=9
+    order_210: duration=35 (start=215, fulfill=250), robot=3, items=7
+    order_543: duration=35 (start=319, fulfill=354), robot=4, items=7
+    order_851: duration=35 (start=381, fulfill=416), robot=0, items=6
+    order_348: duration=35 (start=507, fulfill=542), robot=1, items=11
+    order_976: duration=35 (start=778, fulfill=813), robot=4, items=6
+    order_688: duration=35 (start=1183, fulfill=1218), robot=2, items=7
+    order_529: duration=35 (start=1541, fulfill=1576), robot=0, items=7
+    order_64: duration=35 (start=1831, fulfill=1866), robot=1, items=6
