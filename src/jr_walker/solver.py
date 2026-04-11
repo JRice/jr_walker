@@ -1,9 +1,12 @@
 import collections
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Deque, Dict, List, Tuple
+
+import numpy as np
 
 from jr_walker.logic import EdgeAwareOrderScorer, OrderOptimizer
 from jr_walker.planner import adjacent_cells
@@ -81,6 +84,14 @@ class PlannedOrder:
     def estimate_cost(self, scorer: EdgeAwareOrderScorer) -> float:
         self.estimated_cost = scorer.estimate_order_cost(self.items)
         return self.estimated_cost
+
+
+@dataclass
+class RobotFulfillEvent:
+    timestep: int
+    robot_id: int
+    order_id: int | None
+    skus: set[int]
 
 
 @dataclass
@@ -232,7 +243,8 @@ class WarehouseSolver:
     ) -> List[Tuple[int, int, str, int, int]]:
         self._open_log()
         try:
-            return self._optimize_actions_core(actions)
+            seeded = self._try_suffix_replan_for_hot_sku(list(actions))
+            return self._optimize_actions_core(seeded)
         finally:
             self._close_log()
 
@@ -290,6 +302,375 @@ class WarehouseSolver:
             f"optimize_end actions={len(improved)} makespan={makespan}"
         )
         return improved
+
+    def _try_suffix_replan_for_hot_sku(
+        self, actions: List[Tuple[int, int, str, int, int]]
+    ) -> List[Tuple[int, int, str, int, int]]:
+        threshold = max(2, int(self.config.min_jobs_for_dock))
+        candidate = self._find_hot_sku_streak_candidate(actions, threshold)
+        if candidate is None:
+            self._log("suffix_replan_skip reason=no_hot_sku_streak")
+            return actions
+
+        robot_id, sku, streak_len, streak_start_t = candidate
+        target_t = streak_start_t - 1
+        snapshot = self._latest_clean_snapshot_before(actions, target_t)
+        if snapshot is None:
+            self._log(
+                f"suffix_replan_skip reason=no_clean_cut robot={robot_id} sku={sku} target_t={target_t}"
+            )
+            return actions
+
+        cut_t, robot_positions, pallet_map, fulfilled_order_ids = snapshot
+        if cut_t < 0:
+            self._log(
+                f"suffix_replan_skip reason=clean_cut_before_start robot={robot_id} sku={sku}"
+            )
+            return actions
+        remaining_orders = [
+            collections.Counter(self.orders[oid].items)
+            for oid in range(len(self.orders))
+            if oid not in fulfilled_order_ids
+        ]
+        if not remaining_orders:
+            self._log("suffix_replan_skip reason=no_remaining_orders")
+            return actions
+
+        suffix_state = self._build_suffix_state(
+            robot_positions=robot_positions,
+            pallet_map=pallet_map,
+            remaining_orders=remaining_orders,
+        )
+        suffix_plans = self._build_suffix_role_plans(robot_id=robot_id, sku=sku)
+        suffix_config = replace(
+            self.config,
+            role_plans_by_robot=suffix_plans,
+            relocation_skus_to_relocate=[sku],
+            relocation_analysis_path=None,
+            lns_enabled=False,
+            log_path=None,
+        )
+        suffix_solver = WarehouseSolver(suffix_state, suffix_config)
+        try:
+            suffix_actions = suffix_solver.find_solution()
+        except Exception as exc:
+            self._log(
+                f"suffix_replan_skip reason=suffix_solve_failed robot={robot_id} sku={sku} error={exc}"
+            )
+            return actions
+
+        shifted_suffix = [(t + cut_t + 1, rid, act, x, y) for (t, rid, act, x, y) in suffix_actions]
+        prefix = [row for row in actions if row[0] <= cut_t]
+        merged = sorted(prefix + shifted_suffix, key=lambda row: (row[0], row[1]))
+        if not self._validate_candidate_actions(merged, log_on_error=True):
+            self._log("suffix_replan_skip reason=merged_validation_failed")
+            return actions
+
+        old_makespan = max((t for t, _, _, _, _ in actions), default=-1)
+        new_makespan = max((t for t, _, _, _, _ in merged), default=-1)
+        if new_makespan < old_makespan:
+            self._log(
+                f"suffix_replan_accept robot={robot_id} sku={sku} streak={streak_len} "
+                f"cut_t={cut_t} old={old_makespan} new={new_makespan}"
+            )
+            return merged
+
+        self._log(
+            f"suffix_replan_reject robot={robot_id} sku={sku} streak={streak_len} "
+            f"cut_t={cut_t} old={old_makespan} new={new_makespan}"
+        )
+        return actions
+
+    def _build_suffix_role_plans(self, robot_id: int, sku: int) -> Dict[int, List[str]]:
+        plans: Dict[int, List[str]] = {
+            rid: list(roles) for rid, roles in self.role_plans_by_robot.items()
+        }
+        token = f"dock_pallet_{sku}"
+        existing = list(plans.get(robot_id, []))
+        if not existing:
+            existing = [ROLE_LOOP, ROLE_DELIVER_EASY, ROLE_DELIVER_HARD]
+        if token in existing:
+            plans[robot_id] = existing
+        else:
+            plans[robot_id] = [token] + existing
+        return plans
+
+    def _build_suffix_state(
+        self,
+        *,
+        robot_positions: List[Tuple[int, int]],
+        pallet_map: Dict[Tuple[int, int], int],
+        remaining_orders: List[collections.Counter],
+    ):
+        width = self.state.width
+        height = self.state.height
+        grid = np.zeros((height, width), dtype=int)
+        grid[0, :] = 1
+        grid[-1, :] = 1
+        grid[:, 0] = 1
+        grid[:, -1] = 1
+        for (px, py) in pallet_map.keys():
+            grid[py, px] = 2
+        for rx, ry in robot_positions:
+            grid[ry, rx] = 3
+
+        return SimpleNamespace(
+            width=width,
+            height=height,
+            grid=grid,
+            robots=list(robot_positions),
+            pallets=dict(pallet_map),
+            orders=[collections.Counter(order) for order in remaining_orders],
+        )
+
+    def _find_hot_sku_streak_candidate(
+        self,
+        actions: List[Tuple[int, int, str, int, int]],
+        threshold: int,
+    ) -> Tuple[int, int, int, int] | None:
+        events_by_robot = self._extract_fulfill_events(actions)
+        best: Tuple[int, int, int, int] | None = None
+        all_skus = list(self.skus_by_demand)
+        if not all_skus:
+            all_skus = sorted({sku for order in self.orders for sku in order.items.keys()})
+
+        for rid, events in events_by_robot.items():
+            if len(events) < threshold:
+                continue
+            for sku in all_skus:
+                run = 0
+                run_start_t = -1
+                for event in events:
+                    if sku in event.skus:
+                        if run == 0:
+                            run_start_t = event.timestep
+                        run += 1
+                        if run >= threshold:
+                            candidate = (rid, sku, run, run_start_t)
+                            if best is None or (candidate[2], -candidate[3], -candidate[0], -candidate[1]) > (
+                                best[2],
+                                -best[3],
+                                -best[0],
+                                -best[1],
+                            ):
+                                best = candidate
+                    else:
+                        run = 0
+                        run_start_t = -1
+        return best
+
+    def _extract_fulfill_events(
+        self,
+        actions: List[Tuple[int, int, str, int, int]],
+    ) -> Dict[int, List[RobotFulfillEvent]]:
+        by_t: Dict[int, List[Tuple[int, str, int, int]]] = collections.defaultdict(list)
+        max_t = -1
+        for t, rid, action, x, y in actions:
+            by_t[t].append((rid, action.lower(), x, y))
+            if t > max_t:
+                max_t = t
+
+        robot_pos: List[List[int]] = [[x, y] for x, y in self.state.robots]
+        robot_storage: List[collections.Counter] = [collections.Counter() for _ in self.state.robots]
+        robot_docked: List[List[int]] = [[] for _ in self.state.robots]
+        pallets: List[dict] = []
+        pallet_at: Dict[int, int] = {}
+        for pid, ((x, y), sku) in enumerate(self.state.pallets.items()):
+            pallets.append({"id": pid, "x": x, "y": y, "sku": sku, "docked_to": None})
+            pallet_at[100 * y + x] = pid
+
+        order_defs = [collections.Counter(order.items) for order in self.orders]
+        orders_fulfilled = [False for _ in order_defs]
+        events_by_robot: Dict[int, List[RobotFulfillEvent]] = collections.defaultdict(list)
+
+        for t in range(max_t + 1):
+            timestep_actions = by_t.get(t, [])
+
+            for rid, action, x, y in timestep_actions:
+                if action != "undock":
+                    continue
+                pid = pallet_at.get(100 * y + x)
+                if pid is None:
+                    continue
+                if pallets[pid]["docked_to"] != rid:
+                    continue
+                pallets[pid]["docked_to"] = None
+                robot_docked[rid] = [p for p in robot_docked[rid] if p != pid]
+
+            for rid, action, x, y in timestep_actions:
+                if action != "pick":
+                    continue
+                pid = pallet_at.get(100 * y + x)
+                if pid is None:
+                    continue
+                sku = pallets[pid]["sku"]
+                robot_storage[rid][sku] += 1
+
+            for rid, action, x, y in timestep_actions:
+                if action != "dock":
+                    continue
+                pid = pallet_at.get(100 * y + x)
+                if pid is None:
+                    continue
+                if pallets[pid]["docked_to"] is not None:
+                    continue
+                pallets[pid]["docked_to"] = rid
+                if pid not in robot_docked[rid]:
+                    robot_docked[rid].append(pid)
+
+            for rid, action, x, y in timestep_actions:
+                if action != "move":
+                    continue
+                old_x, old_y = robot_pos[rid]
+                dx = x - old_x
+                dy = y - old_y
+                robot_pos[rid][0] = x
+                robot_pos[rid][1] = y
+                for pid in robot_docked[rid]:
+                    pallet = pallets[pid]
+                    old_key = 100 * pallet["y"] + pallet["x"]
+                    pallet_at.pop(old_key, None)
+                    pallet["x"] += dx
+                    pallet["y"] += dy
+                    pallet_at[100 * pallet["y"] + pallet["x"]] = pid
+
+            for rid, action, _, _ in timestep_actions:
+                if action != "fulfill":
+                    continue
+                bag = collections.Counter(robot_storage[rid])
+                matched_order_id = None
+                for oid, order_bag in enumerate(order_defs):
+                    if orders_fulfilled[oid]:
+                        continue
+                    if order_bag == bag:
+                        orders_fulfilled[oid] = True
+                        matched_order_id = oid
+                        break
+                events_by_robot[rid].append(
+                    RobotFulfillEvent(
+                        timestep=t,
+                        robot_id=rid,
+                        order_id=matched_order_id,
+                        skus=set(bag.keys()),
+                    )
+                )
+                robot_storage[rid].clear()
+
+        return events_by_robot
+
+    def _latest_clean_snapshot_before(
+        self,
+        actions: List[Tuple[int, int, str, int, int]],
+        target_t: int,
+    ) -> Tuple[int, List[Tuple[int, int]], Dict[Tuple[int, int], int], set[int]] | None:
+        by_t: Dict[int, List[Tuple[int, str, int, int]]] = collections.defaultdict(list)
+        max_t = -1
+        for t, rid, action, x, y in actions:
+            by_t[t].append((rid, action.lower(), x, y))
+            if t > max_t:
+                max_t = t
+
+        robot_pos: List[List[int]] = [[x, y] for x, y in self.state.robots]
+        robot_storage: List[collections.Counter] = [collections.Counter() for _ in self.state.robots]
+        robot_docked: List[List[int]] = [[] for _ in self.state.robots]
+        pallets: List[dict] = []
+        pallet_at: Dict[int, int] = {}
+        for pid, ((x, y), sku) in enumerate(self.state.pallets.items()):
+            pallets.append({"id": pid, "x": x, "y": y, "sku": sku, "docked_to": None})
+            pallet_at[100 * y + x] = pid
+
+        order_defs = [collections.Counter(order.items) for order in self.orders]
+        orders_fulfilled = [False for _ in order_defs]
+
+        latest = (
+            -1,
+            [tuple(pos) for pos in robot_pos],
+            {((x, y)): sku for (x, y), sku in self.state.pallets.items()},
+            set(),
+        )
+        horizon = min(max_t, target_t)
+        for t in range(horizon + 1):
+            timestep_actions = by_t.get(t, [])
+
+            for rid, action, x, y in timestep_actions:
+                if action != "undock":
+                    continue
+                pid = pallet_at.get(100 * y + x)
+                if pid is None:
+                    continue
+                if pallets[pid]["docked_to"] != rid:
+                    continue
+                pallets[pid]["docked_to"] = None
+                robot_docked[rid] = [p for p in robot_docked[rid] if p != pid]
+
+            for rid, action, x, y in timestep_actions:
+                if action != "pick":
+                    continue
+                pid = pallet_at.get(100 * y + x)
+                if pid is None:
+                    continue
+                sku = pallets[pid]["sku"]
+                robot_storage[rid][sku] += 1
+
+            for rid, action, x, y in timestep_actions:
+                if action != "dock":
+                    continue
+                pid = pallet_at.get(100 * y + x)
+                if pid is None:
+                    continue
+                if pallets[pid]["docked_to"] is not None:
+                    continue
+                pallets[pid]["docked_to"] = rid
+                if pid not in robot_docked[rid]:
+                    robot_docked[rid].append(pid)
+
+            for rid, action, x, y in timestep_actions:
+                if action != "move":
+                    continue
+                old_x, old_y = robot_pos[rid]
+                dx = x - old_x
+                dy = y - old_y
+                robot_pos[rid][0] = x
+                robot_pos[rid][1] = y
+                for pid in robot_docked[rid]:
+                    pallet = pallets[pid]
+                    old_key = 100 * pallet["y"] + pallet["x"]
+                    pallet_at.pop(old_key, None)
+                    pallet["x"] += dx
+                    pallet["y"] += dy
+                    pallet_at[100 * pallet["y"] + pallet["x"]] = pid
+
+            for rid, action, _, _ in timestep_actions:
+                if action != "fulfill":
+                    continue
+                bag = collections.Counter(robot_storage[rid])
+                for oid, order_bag in enumerate(order_defs):
+                    if orders_fulfilled[oid]:
+                        continue
+                    if order_bag == bag:
+                        orders_fulfilled[oid] = True
+                        break
+                robot_storage[rid].clear()
+
+            is_clean = all(not storage for storage in robot_storage) and all(
+                not docked for docked in robot_docked
+            )
+            if is_clean:
+                pallet_map = {
+                    (pallet["x"], pallet["y"]): int(pallet["sku"])
+                    for pallet in pallets
+                    if pallet["docked_to"] is None
+                }
+                latest = (
+                    t,
+                    [tuple(pos) for pos in robot_pos],
+                    pallet_map,
+                    {i for i, done in enumerate(orders_fulfilled) if done},
+                )
+
+        if latest[0] < 0:
+            return None
+        return latest
 
     def _log_solve_start(self, total_orders: int) -> None:
         self._log(f"solve_start total_orders={total_orders}")
@@ -1566,16 +1947,48 @@ class WarehouseSolver:
         return True
 
     def _validate_candidate_actions(
-        self, actions: List[Tuple[int, int, str, int, int]]
+        self,
+        actions: List[Tuple[int, int, str, int, int]],
+        log_on_error: bool = False,
     ) -> bool:
-        validator = SubmissionValidator(worklist_path=self.config.worklist_path)
+        validator = SubmissionValidator(worklist_text=self._worklist_text_from_state())
         try:
             for t, rid, action, x, y in actions:
                 validator.validate_line(f"{t} {rid} {action} {x} {y}")
             final_state = validator.finalize()
-        except ValidationError:
+        except ValidationError as exc:
+            if log_on_error:
+                self._log(f"candidate_validation_error: {exc}")
             return False
-        return final_state.fulfilled_orders == final_state.total_orders
+        ok = final_state.fulfilled_orders == final_state.total_orders
+        if log_on_error and not ok:
+            self._log(
+                f"candidate_validation_incomplete fulfilled={final_state.fulfilled_orders} "
+                f"total={final_state.total_orders} next_t={final_state.next_timestep}"
+            )
+        return ok
+
+    def _worklist_text_from_state(self) -> str:
+        lines: List[str] = []
+        lines.append(str(len(self.state.robots)))
+        for x, y in self.state.robots:
+            lines.append(f"{x} {y}")
+        lines.append(str(len(self.state.pallets)))
+        for (x, y), sku in self.state.pallets.items():
+            lines.append(f"{x} {y} {sku}")
+        lines.append(str(len(self.state.orders)))
+        for order in self.state.orders:
+            sku_stream: List[str] = []
+            if isinstance(order, collections.Counter):
+                items_iter = sorted(order.items())
+            else:
+                items_iter = sorted(collections.Counter(order).items())
+            for sku, qty in items_iter:
+                sku_stream.extend([str(sku)] * int(qty))
+            if not sku_stream:
+                sku_stream.append("0")
+            lines.append(" ".join(sku_stream))
+        return "\n".join(lines) + "\n"
 
     def _open_log(self) -> None:
         if self.config.log_path is None:
