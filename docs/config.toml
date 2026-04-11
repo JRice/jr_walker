@@ -1,7 +1,10 @@
+[loop]
+max_runs = 3
+
 [limits]
 # Hard stop on produced plan length. If exceeded before finishing all orders,
 # the run exits and writes partial output.
-max_makespan = 12000
+max_makespan = 13000
 # Seconds of compute budget (15 minutes default).
 max_plan_time = 900
 
@@ -16,9 +19,6 @@ input_path = "docs/BIG_ORDER.txt"
 # Reservation horizon (space-time planner tensor depth).
 max_time = 50000
 test_mode = false
-# Dock-trigger threshold N: only seed dock/relocate plans for SKUs that appear
-# in each of the next N jobs.
-min_jobs_for_dock = 3
 
 [lns]
 enabled = true

@@ -114,6 +114,7 @@ class SolverConfig:
     lns_window_actions: int = 28
     lns_tail_fraction: float = 0.35
     lns_max_shift: int = 2
+    dump_suggestions_path: Path | None = None
 
 
 def _select_best_non_test_run_id(conn: sqlite3.Connection) -> int | None:
@@ -388,6 +389,16 @@ class WarehouseSolver:
         for job in relocation_jobs:
             relocate_suggestions.append(RelocateSuggestion(job, self.scheduler))
 
+        # Normalize RelocateSuggestion gains to be on a similar scale to OrderSuggestion gains.
+        if relocate_suggestions:
+            max_relocate_gain = max(s.expected_gain for s in relocate_suggestions)
+            if max_relocate_gain > 0:
+                # Scale so the best relocation has a gain comparable to the order constant
+                scaling_factor = self.config.order_suggestion_gain_constant / max_relocate_gain
+                self._log(f"Normalizing relocation gains by factor {scaling_factor:.3f}")
+                for s in relocate_suggestions:
+                    s.scale_gain(scaling_factor)
+
         # Sort and truncate RelocateSuggestions
         relocate_suggestions.sort(key=lambda s: s.score(), reverse=True)
         if self.config.num_allowed_relocations >= 0:
@@ -420,6 +431,34 @@ class WarehouseSolver:
 
         # 3. Sort the combined list
         all_suggestions.sort(key=lambda s: s.score(), reverse=True)
+
+        if self.config.dump_suggestions_path:
+            dump_data = []
+            for s in all_suggestions:
+                item = {
+                    "score": s.score(),
+                    "cost": s.expected_cost,
+                    "gain": s.expected_gain,
+                    "center": s.center,
+                }
+                if isinstance(s, OrderSuggestion):
+                    item["type"] = "Order"
+                    item["order_idx"] = s.order_idx
+                elif isinstance(s, RelocateSuggestion):
+                    item["type"] = "Relocate"
+                    item["sku"] = s.job.sku
+                    item["target"] = s.job.preferred_target_xy
+                    item["hotspot"] = s.job.hotspot
+                    item["bucket"] = s.job.bucket
+                dump_data.append(item)
+
+            try:
+                import tomli_w
+                with open(self.config.dump_suggestions_path, "wb") as f:
+                    tomli_w.dump({"suggestion": dump_data}, f)
+                self._log(f"dumped {len(dump_data)} suggestions to {self.config.dump_suggestions_path}")
+            except ImportError:
+                self._log("tomli_w not installed, cannot dump suggestions.")
 
         return all_suggestions
 

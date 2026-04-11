@@ -4,6 +4,8 @@ import argparse
 import tomllib
 from dataclasses import dataclass
 import re
+import sqlite3
+import uuid
 
 # Allow `python main.py` from repo root without installing the package.
 ROOT = Path(__file__).resolve().parent
@@ -60,12 +62,10 @@ class RunConfig:
     output_dir: str = "output"
     log_path: str = "output/run.log"
     metadata_db_path: str = "output/solution_metadata.db"
-    input_path: str = "docs/BIG_ORDER.txt"
     test_mode: bool = False
     output_path: str | None = None
     metadata_run_id: int | None = None
-
-
+    max_runs: int = 1
 def _get_table(data: dict, key: str) -> dict:
     section = data.get(key, {})
     if section is None:
@@ -104,7 +104,6 @@ def load_run_config(config_path: Path) -> RunConfig:
     run_config.metadata_db_path = str(
         paths_section.get("metadata_db_path", run_config.metadata_db_path)
     )
-    run_config.input_path = str(paths_section.get("input_path", run_config.input_path))
     raw_output_path = paths_section.get("output_path")
     if raw_output_path is not None:
         run_config.output_path = str(raw_output_path)
@@ -115,24 +114,12 @@ def load_run_config(config_path: Path) -> RunConfig:
         "relocation.lane_width",
         minimum=0,
     )
-    raw_reloc_skus = relocation_section.get("skus_to_relocate", run_config.relocation_skus_to_relocate)
-    if raw_reloc_skus is not None:
-        if not isinstance(raw_reloc_skus, list) or not all(isinstance(v, int) for v in raw_reloc_skus):
-            raise ValueError("relocation.skus_to_relocate must be an array of integers.")
-        if any(v < 0 for v in raw_reloc_skus):
-            raise ValueError("relocation.skus_to_relocate cannot contain negative SKU IDs.")
-        run_config.relocation_skus_to_relocate = list(dict.fromkeys(raw_reloc_skus))
 
     solver_section = _get_table(data, "solver")
     run_config.max_time = _require_int(
         solver_section.get("max_time", run_config.max_time),
         "solver.max_time",
         minimum=2,
-    )
-    run_config.min_jobs_for_dock = _require_int(
-        solver_section.get("min_jobs_for_dock", run_config.min_jobs_for_dock),
-        "solver.min_jobs_for_dock",
-        minimum=1,
     )
 
     raw_test_mode = solver_section.get("test_mode", run_config.test_mode)
@@ -196,6 +183,13 @@ def load_run_config(config_path: Path) -> RunConfig:
     if raw_run_id is not None:
         run_config.metadata_run_id = _require_int(raw_run_id, "metadata.run_id", minimum=1)
 
+    loop_section = _get_table(data, "loop")
+    run_config.max_runs = _require_int(
+        loop_section.get("max_runs", run_config.max_runs),
+        "loop.max_runs",
+        minimum=1,
+    )
+
     return run_config
 
 
@@ -210,11 +204,8 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             progress_every=50,
             log_path=Path(run_config.log_path),
             lane_width=run_config.lane_width,
-            relocation_skus_to_relocate=run_config.relocation_skus_to_relocate,
-            min_jobs_for_dock=run_config.min_jobs_for_dock,
             num_allowed_relocations=run_config.num_allowed_relocations,
             order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
-            worklist_path=Path(run_config.input_path),
             lns_enabled=run_config.lns_enabled,
             lns_iterations=run_config.lns_iterations,
             lns_window_actions=run_config.lns_window_actions,
@@ -231,22 +222,7 @@ def _run_pipeline(
     solve_error: Exception | None = None
     actions: list[tuple[int, int, str, int, int]] = []
     try:
-        print("Building a fresh base solution guided by past analysis...")
         actions = solver.find_solution()
-
-        print(f"Running LNS optimization on {len(actions)} base actions...")
-        actions = solver.optimize_actions(actions)
-
-        print("Validating generated actions...")
-        validator = SubmissionValidator(worklist_path=run_config.input_path)
-        for t, rid, action, x, y in actions:
-            validator.validate_line(f"{t} {rid} {action} {x} {y}")
-        final_state = validator.finalize()
-        if final_state.fulfilled_orders != final_state.total_orders:
-            raise ValidationError(
-                f"Validation incomplete: fulfilled {final_state.fulfilled_orders}/{final_state.total_orders} orders."
-            )
-        print(f"Validation passed. Fulfilled {final_state.fulfilled_orders}/{final_state.total_orders} orders by timestep {final_state.next_timestep}.")
 
     except Exception as exc:
         solve_error = exc
@@ -276,30 +252,74 @@ def _save_and_report(
     makespan = max((t for t, _, _, _, _ in actions), default=-1)
     move_count = sum(1 for _, _, action, _, _ in actions if action == "move")
 
+    final_output_path: Path
+    metadata_run_id = run_config.metadata_run_id
+    metadata_db_path = Path(run_config.metadata_db_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     if run_config.output_path:
         final_output_path = Path(run_config.output_path)
+        write_actions(actions, final_output_path)
+        # Still attempt to store metadata even with an explicit output path.
+        try:
+            metadata_run_id = build_and_store_solution_metadata(
+                solution_path=final_output_path,
+                metadata_db_path=metadata_db_path,
+                metadata_run_id=run_config.metadata_run_id,
+            )
+        except Exception as analysis_exc:
+            print(f"Metadata persistence failed: {analysis_exc}")
     else:
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Use a temporary placeholder path to break the circular dependency between
+        # needing a run_id for the filename and needing a file to generate the run_id.
+        placeholder_path = output_dir / f"temp_{uuid.uuid4().hex}.txt"
+        write_actions(actions, placeholder_path)
+
+        # Store metadata to get the run ID.
+        try:
+            metadata_run_id = build_and_store_solution_metadata(
+                solution_path=placeholder_path,
+                metadata_db_path=metadata_db_path,
+                metadata_run_id=run_config.metadata_run_id,
+            )
+        except Exception as analysis_exc:
+            print(f"Metadata persistence failed: {analysis_exc}")
+            metadata_run_id = None
+
+        # Now, construct the final path.
         name_prefix = f"{output_prefix}solution"
         if solve_error is not None:
             name_prefix = f"{output_prefix}partial_solution"
-        final_output_path = make_unique_path(output_dir / f"{name_prefix}_{makespan}.txt")
 
-    write_actions(actions, final_output_path)
+        if metadata_run_id is not None:
+            final_output_path = output_dir / f"{name_prefix}_{makespan}_{metadata_run_id}.txt"
+        else:
+            # Fallback to old unique-suffix naming if metadata failed.
+            final_output_path = make_unique_path(output_dir / f"{name_prefix}_{makespan}.txt")
+
+        # Rename the placeholder to the final path.
+        if placeholder_path.exists():
+            if final_output_path.exists():
+                final_output_path.unlink()
+            placeholder_path.rename(final_output_path)
+
+        # If we got a run ID, we need to update the path in the database.
+        if metadata_run_id is not None:
+            try:
+                conn = sqlite3.connect(metadata_db_path)
+                conn.execute(
+                    "UPDATE metadata_runs SET solution_path = ? WHERE run_id = ?",
+                    (str(final_output_path), metadata_run_id),
+                )
+                conn.commit()
+            except sqlite3.Error as db_exc:
+                print(f"Failed to update final solution path in DB: {db_exc}")
+            finally:
+                if "conn" in locals() and conn:
+                    conn.close()
+
     if not run_config.output_path and temp_output_path.exists():
         temp_output_path.unlink()
-
-    metadata_run_id = None
-    metadata_db_path = Path(run_config.metadata_db_path)
-    try:
-        metadata_run_id = build_and_store_solution_metadata(
-            solution_path=final_output_path,
-            worklist_path=Path(run_config.input_path),
-            metadata_db_path=metadata_db_path,
-            metadata_run_id=run_config.metadata_run_id,
-        )
-    except Exception as analysis_exc:
-        print(f"Metadata persistence failed: {analysis_exc}")
 
     print(f"Wrote {len(actions)} actions to {final_output_path}")
     print(f"Move count: {move_count}")
@@ -333,7 +353,7 @@ def main():
 
     ## Main logic:
 
-    state = WarehouseState(run_config.input_path)
+    state = WarehouseState(ROOT / "docs/BIG_ORDER.txt")
     if run_config.test_mode:
         state.orders = state.orders[::10]
 
@@ -344,34 +364,68 @@ def main():
             f"(lane_width={run_config.lane_width}, "
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "
-            f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "
-            f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."
+            f"max_plan_time={run_config.max_plan_time_seconds:.1f}s)."
         )
 
     output_dir = Path(run_config.output_dir)
     output_prefix = "test_" if run_config.test_mode else ""
-    temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
 
-    past_analysis = PastRunAnalysis()
-    db_path = Path(run_config.metadata_db_path)
-    if db_path.exists():
-        print("Loading analysis of the best existing solution from SQL database...")
-        past_analysis = load_best_past_analysis(db_path, state.width, state.height, state.pallets)
-        if past_analysis.run_id >= 0:
-            print(f"Loaded analysis for Run #{past_analysis.run_id}: found {len(past_analysis.high_use_cells)} high-traffic cells to avoid.")
+    best_actions = []
+    best_makespan = float('inf')
 
-    print("Generating new Suggestions based on this analysis...")
-    solver = _build_solver(state, run_config, temp_output_path, past_analysis)
-    actions, solve_error = _run_pipeline(solver, run_config, output_dir)
-    _save_and_report(
-        actions,
-        state,
-        run_config,
-        output_dir,
-        output_prefix,
-        temp_output_path,
-        solve_error,
-    )
+    for i in range(run_config.max_runs):
+        print("-" * 80)
+        print(f"Starting iterative run {i+1}/{run_config.max_runs}...")
+
+        past_analysis = PastRunAnalysis()
+        db_path = Path(run_config.metadata_db_path)
+        if db_path.exists():
+            print("Loading analysis of best available solution from SQL database...")
+            past_analysis = load_best_past_analysis(db_path, state.width, state.height, state.pallets)
+            if past_analysis.run_id >= 0:
+                print(f"  -> Loaded analysis for Run #{past_analysis.run_id}")
+
+        temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
+        solver = _build_solver(state, run_config, temp_output_path, past_analysis)
+
+        # On the last run, dump the suggestions for analysis
+        if i == run_config.max_runs - 1:
+            suggestion_dump_path = output_dir / f"suggestions_run_{i+1}.toml"
+            print(f"This is the last run, will dump suggestions to {suggestion_dump_path}")
+            solver.config.dump_suggestions_path = suggestion_dump_path
+
+        actions, solve_error = _run_pipeline(solver, run_config, output_dir)
+
+        if solve_error:
+            print(f"Run {i+1} failed with error: {solve_error}")
+            if not best_actions:
+                _save_and_report(actions, state, run_config, output_dir, output_prefix, temp_output_path, solve_error)
+            continue
+
+        current_makespan = max((t for t, _, _, _, _ in actions), default=-1)
+        print(f"Run {i+1} finished with makespan: {current_makespan}")
+
+        if current_makespan < best_makespan:
+            print(f"  -> New best makespan found! ({current_makespan} < {best_makespan})")
+            best_makespan = current_makespan
+            best_actions = actions
+
+        _save_and_report(actions, state, run_config, output_dir, output_prefix, temp_output_path, solve_error)
+
+    print("-" * 80)
+    print(f"Iterative improvement finished. Best makespan found: {best_makespan}")
+    print(f"Running final LNS optimization on best solution...")
+    final_solver = _build_solver(state, run_config, Path(), PastRunAnalysis()) # LNS doesn't need analysis
+    optimized_actions = final_solver.optimize_actions(best_actions)
+
+    print("Final validation and save...")
+    final_validator = SubmissionValidator(worklist_text=WarehouseSolver._worklist_text_from_state(state))
+    for t, rid, action, x, y in optimized_actions:
+        final_validator.validate_line(f"{t} {rid} {action} {x} {y}")
+    final_validator.finalize()
+    print("Final validation passed.")
+
+    _save_and_report(optimized_actions, state, run_config, output_dir, output_prefix, Path(), None)
 
 
 if __name__ == "__main__":

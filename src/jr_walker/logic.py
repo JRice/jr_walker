@@ -51,6 +51,9 @@ class RelocateSuggestion(Suggestion):
             self._gain = self.job.score
         return self._gain
 
+    def scale_gain(self, factor: float):
+        self._gain = self.expected_gain * factor
+
     @property
     def center(self) -> Tuple[int, int]:
         if self._center == (-1, -1):
