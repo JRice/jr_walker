@@ -1,4 +1,5 @@
 import collections
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -249,6 +250,7 @@ def solution_analysis(
     ]
 
     lines_out: List[str] = []
+    now = datetime.now()
     lines_out.append(f"Solution Analysis: {solution_path}")
     lines_out.append(f"Date/time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
     lines_out.append(f"Worklist: {worklist_path}")
