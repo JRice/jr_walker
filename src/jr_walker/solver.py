@@ -1,5 +1,7 @@
 import collections
+import json
 import random
+import sqlite3
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -895,15 +897,17 @@ class WarehouseSolver:
 
     def _build_relocation_plan(self) -> Deque[RelocationJob]:
         forced_skus = list(dict.fromkeys(self.config.relocation_skus_to_relocate or []))
-        analysis_path = self.config.relocation_analysis_path
-        if analysis_path is None:
-            analysis_path = self._find_default_analysis_path()
+        metadata_db_path = self.config.relocation_analysis_path
+        if metadata_db_path is None:
+            metadata_db_path = self._find_default_metadata_db_path()
         bucket_items: Dict[str, int] = {}
         bucket_sku_counts: Dict[str, collections.Counter] = {}
-        if analysis_path is not None:
-            analysis_path = Path(analysis_path)
-            if analysis_path.exists():
-                bucket_items, bucket_sku_counts = self._parse_analysis_file(analysis_path)
+        if metadata_db_path is not None:
+            metadata_db_path = Path(metadata_db_path)
+            if metadata_db_path.exists():
+                bucket_items, bucket_sku_counts = self._load_bucket_stats_from_metadata_db(
+                    metadata_db_path
+                )
 
         if forced_skus:
             forced_jobs = self._build_forced_relocation_jobs(forced_skus, bucket_sku_counts)
@@ -1023,58 +1027,58 @@ class WarehouseSolver:
                 job.preferred_target_xy = (tx, ty)
                 planned_targets.add((tx, ty))
 
-    def _find_default_analysis_path(self) -> Path | None:
-        output_dir = Path("output")
-        if not output_dir.exists():
-            return None
-        candidates = sorted(output_dir.glob("solution_*_analysis.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not candidates:
-            return None
-        return candidates[0]
+    def _find_default_metadata_db_path(self) -> Path | None:
+        path = Path("output") / "solution_metadata.db"
+        if path.exists():
+            return path
+        return None
 
-    def _parse_analysis_file(
-        self, analysis_path: Path
+    def _bucket_for_edge(self, x: int, y: int) -> str:
+        if x == 0:
+            return "left_edge"
+        if x == self.state.width - 1:
+            return "right_edge"
+        if y == 0:
+            return "top_x0_29" if x < (self.state.width // 2) else "top_x30_59"
+        if y == self.state.height - 1:
+            return "bottom_x0_29" if x < (self.state.width // 2) else "bottom_x30_59"
+        return "non_edge"
+
+    def _load_bucket_stats_from_metadata_db(
+        self, metadata_db_path: Path
     ) -> Tuple[Dict[str, int], Dict[str, collections.Counter]]:
         bucket_items: Dict[str, int] = {}
         bucket_sku_counts: Dict[str, collections.Counter] = {}
-        current_bucket = None
 
-        for raw_line in analysis_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line:
+        conn = sqlite3.connect(metadata_db_path)
+        try:
+            row = conn.execute("SELECT MAX(run_id) FROM metadata_runs").fetchone()
+            if row is None or row[0] is None:
+                return bucket_items, bucket_sku_counts
+            run_id = int(row[0])
+            rows = conn.execute(
+                "SELECT x, y, skus_json FROM fulfills WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        for x, y, skus_json in rows:
+            bucket = self._bucket_for_edge(int(x), int(y))
+            bucket_counter = bucket_sku_counts.setdefault(bucket, collections.Counter())
+            try:
+                sku_values = json.loads(skus_json)
+            except Exception:
+                sku_values = []
+            if not isinstance(sku_values, list):
                 continue
-
-            if line.startswith("[") and line.endswith("]"):
-                current_bucket = line[1:-1]
-                if current_bucket not in bucket_sku_counts:
-                    bucket_sku_counts[current_bucket] = collections.Counter()
-                continue
-
-            if current_bucket is None:
-                continue
-
-            if line.startswith("items:"):
+            for sku_raw in sku_values:
                 try:
-                    bucket_items[current_bucket] = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    bucket_items[current_bucket] = 0
-                continue
-
-            if line.startswith("sku_counts:"):
-                value = line.split(":", 1)[1].strip()
-                if value == "(none)":
+                    sku = int(sku_raw)
+                except (TypeError, ValueError):
                     continue
-                parts = [p.strip() for p in value.split(",") if p.strip()]
-                for part in parts:
-                    if not part.startswith("SKU") or ":" not in part:
-                        continue
-                    sku_part, count_part = part.split(":", 1)
-                    try:
-                        sku = int(sku_part[3:])
-                        count = int(count_part)
-                    except ValueError:
-                        continue
-                    bucket_sku_counts[current_bucket][sku] = count
+                bucket_counter[sku] += 1
+                bucket_items[bucket] = bucket_items.get(bucket, 0) + 1
 
         return bucket_items, bucket_sku_counts
 

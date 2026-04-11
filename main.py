@@ -57,8 +57,6 @@ def find_best_existing_solution(output_dir: Path, *, test_mode: bool) -> Path | 
     candidates: list[tuple[int, float, Path]] = []
     for path in output_dir.glob(f"{prefix}*.txt"):
         stem = path.stem
-        if "_analysis" in stem:
-            continue
         if "_F" in stem:
             continue
         match = filename_pattern.match(path.name)
@@ -82,7 +80,8 @@ def append_leaderboard_entry(
     makespan: int,
     move_count: int,
     solution_path: Path,
-    analysis_path: Path,
+    metadata_db_path: Path,
+    metadata_run_id: int,
     algorithm_update: str,
 ) -> None:
     leaderboard_path = Path(leaderboard_path)
@@ -101,7 +100,8 @@ def append_leaderboard_entry(
         f"- Score (makespan): {makespan}",
         f"- Move count: {move_count}",
         f"- Solution: {solution_path}",
-        f"- Analysis: {analysis_path}",
+        f"- Metadata DB: {metadata_db_path}",
+        f"- Metadata run_id: {metadata_run_id}",
         f"- Latest algorithm update: {note}",
         "- Validated: TODO",
         "",
@@ -265,11 +265,6 @@ def main():
     parser = argparse.ArgumentParser(description="Build a warehouse action plan.")
     parser.add_argument("--input", default="docs/BIG_ORDER.txt", help="Path to BIG_ORDER-style input file.")
     parser.add_argument(
-        "--analyze-only",
-        default=None,
-        help="Analyze an existing solution file and exit.",
-    )
-    parser.add_argument(
         "--validate-only",
         default=None,
         help="Validate an existing solution file and exit on first error.",
@@ -311,21 +306,21 @@ def main():
         action="store_true",
         help="Force building a fresh base solution before optimization.",
     )
+    parser.add_argument(
+        "--metadata-db-path",
+        default="output/solution_metadata.db",
+        help="SQLite DB path used to persist per-run solution metadata.",
+    )
+    parser.add_argument(
+        "--metadata-run-id",
+        type=int,
+        default=None,
+        help=(
+            "Optional run ID for metadata persistence. "
+            "If omitted, inferred from solution filename suffix (e.g. *_1) or auto-incremented."
+        ),
+    )
     args = parser.parse_args()
-
-    if args.analyze_only:
-        from jr_walker.analysis import analysis_output_path_for_solution, solution_analysis
-
-        analysis_path = analysis_output_path_for_solution(
-            Path(args.analyze_only), output_dir=Path(args.output_dir)
-        )
-        written = solution_analysis(
-            solution_path=Path(args.analyze_only),
-            worklist_path=Path(args.input),
-            output_path=analysis_path,
-        )
-        print(f"Wrote analysis to {written}")
-        return
 
     if args.validate_only:
         try:
@@ -345,7 +340,7 @@ def main():
     from jr_walker.solver import SolverConfig, WarehouseSolver
     from jr_walker.view import WarehouseState
     from jr_walker.writer import write_actions
-    from jr_walker.analysis import analysis_output_path_for_solution, solution_analysis
+    from jr_walker.analysis import build_and_store_solution_metadata
 
     state = WarehouseState(args.input)
     if args.test:
@@ -458,18 +453,19 @@ def main():
     if not args.output and temp_output_path.exists():
         temp_output_path.unlink()
 
-    written_analysis_path = None
+    metadata_run_id = None
+    metadata_db_path = Path(args.metadata_db_path)
     try:
-        analysis_path = analysis_output_path_for_solution(final_output_path, output_dir=output_dir)
-        written_analysis_path = solution_analysis(
+        metadata_run_id = build_and_store_solution_metadata(
             solution_path=final_output_path,
             worklist_path=Path(args.input),
-            output_path=analysis_path,
+            metadata_db_path=metadata_db_path,
+            metadata_run_id=args.metadata_run_id,
         )
     except Exception as analysis_exc:
-        print(f"Analysis failed: {analysis_exc}")
+        print(f"Metadata persistence failed: {analysis_exc}")
 
-    if solve_error is None and written_analysis_path is not None:
+    if solve_error is None and metadata_run_id is not None:
         append_leaderboard_entry(
             output_dir / "leaderboard.md",
             run_mode="test-10x" if args.test else "full",
@@ -478,7 +474,8 @@ def main():
             makespan=makespan,
             move_count=move_count,
             solution_path=final_output_path,
-            analysis_path=written_analysis_path,
+            metadata_db_path=metadata_db_path,
+            metadata_run_id=metadata_run_id,
             algorithm_update=args.run_note,
         )
 
@@ -486,9 +483,9 @@ def main():
     print(f"Move count: {move_count}")
     print(f"Plan makespan: {makespan} timesteps")
     print(f"Orders used: {len(state.orders)}")
-    if written_analysis_path is not None:
-        print(f"Wrote analysis to {written_analysis_path}")
-    if solve_error is None and written_analysis_path is not None:
+    if metadata_run_id is not None:
+        print(f"Wrote metadata to {metadata_db_path} (run_id={metadata_run_id})")
+    if solve_error is None and metadata_run_id is not None:
         print(f"Updated leaderboard: {output_dir / 'leaderboard.md'}")
     if solve_error is not None:
         raise SystemExit(1)

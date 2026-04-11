@@ -1,10 +1,13 @@
-Solution Analysis: output\solution_11582.txt
-Worklist: data\BIG_ORDER.txt
+Solution Analysis: output\solution_11582_1.txt
+Date/time: 2026-04-11 17:50:34
+Worklist: docs\BIG_ORDER.txt
 
 Total fulfills: 1000
 Total items delivered: 9920
 Unknown pick coordinates: 0
 Makespan (max timestep): 11582
+Metadata DB: output\solution_metadata.db
+Metadata run_id: 1
 
 [left_edge]
   fulfills: 13
