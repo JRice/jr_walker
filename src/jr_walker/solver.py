@@ -10,21 +10,13 @@ from typing import Deque, Dict, List, Tuple
 
 import numpy as np
 
-from jr_walker.logic import EdgeAwareOrderScorer, OrderOptimizer
+from jr_walker.logic import EdgeAwareOrderScorer, OrderOptimizer, OrderSuggestion, RelocateSuggestion, Suggestion
 from jr_walker.planner import adjacent_cells
 from jr_walker.planner import ReservationPlanner
 from jr_walker.scheduler import GreedyScheduler
 from jr_walker.sim import ActionLog, RobotState
 from jr_walker.validator import SubmissionValidator, ValidationError
 from jr_walker.writer import write_actions
-
-ROLE_DELIVER = "deliver"
-ROLE_RELOCATE_PALLET = "relocate_pallet"
-DELIVER_EASY = "easy"
-DELIVER_HARD = "hard"
-ROLE_LOOP = "loop"
-ROLE_DELIVER_EASY = f"{ROLE_DELIVER}_{DELIVER_EASY}"
-ROLE_DELIVER_HARD = f"{ROLE_DELIVER}_{DELIVER_HARD}"
 
 # Planned delivery hotspot anchors.
 FULFILL_HOT_SPOTS: List[Tuple[int, int]] = [
@@ -83,26 +75,6 @@ class PlannedOrder:
     items: collections.Counter
     estimated_cost: float = float("inf")
 
-    def estimate_cost(self, scorer: EdgeAwareOrderScorer) -> float:
-        self.estimated_cost = scorer.estimate_order_cost(self.items)
-        return self.estimated_cost
-
-
-@dataclass
-class RobotFulfillEvent:
-    timestep: int
-    robot_id: int
-    order_id: int | None
-    skus: set[int]
-
-
-@dataclass
-class RobotRoleCursor:
-    roles: List[str]
-    next_index: int = 0
-    loop_index: int | None = None
-
-
 @dataclass
 class SolverConfig:
     max_time: int = 50000
@@ -110,8 +82,6 @@ class SolverConfig:
     max_plan_time_seconds: float = 600.0
     progress_every: int = 50
     output_path: Path = Path("output/solution.txt")
-    initial_relocate_dispatches: int = 8
-    relocate_pallet_probability: float = 0.0
     random_seed: int = 7
     max_delivery_order_attempts: int = 40
     delivery_candidate_window: int = 160
@@ -123,6 +93,8 @@ class SolverConfig:
     relocation_min_lift: float = 0.08
     relocation_max_attempts_per_sku: int = 5
     relocation_skus_to_relocate: List[int] | None = None
+    num_allowed_relocations: int = 10
+    order_suggestion_gain_constant: float = 100.0
     lane_width: int = 3
     min_jobs_for_dock: int = 3
     log_path: Path | None = None
@@ -133,9 +105,6 @@ class SolverConfig:
     lns_window_actions: int = 28
     lns_tail_fraction: float = 0.35
     lns_max_shift: int = 2
-    forced_dock_max_attempts_per_robot_sku: int = 3
-    forced_dock_cooldown_dispatches: int = 25
-    role_plans_by_robot: Dict[int, List[str]] | None = None
 
 
 class WarehouseSolver:
@@ -198,32 +167,7 @@ class WarehouseSolver:
         self.skus_by_demand: List[int] = [sku for sku, _ in sku_counter.most_common()]
         self.relocation_plan: Deque[RelocationJob] = self._build_relocation_plan()
 
-        self.role_plans_by_robot = self._normalize_role_plans(
-            self.config.role_plans_by_robot or {}
-        )
-        self._role_cursors_by_robot: Dict[int, RobotRoleCursor] = {}
-        for robot_id, roles in self.role_plans_by_robot.items():
-            loop_index = None
-            for idx, role in enumerate(roles):
-                if role == ROLE_LOOP:
-                    loop_index = idx
-                    break
-            self._role_cursors_by_robot[robot_id] = RobotRoleCursor(
-                roles=list(roles),
-                next_index=0,
-                loop_index=loop_index,
-            )
-
-        self._next_delivery_strategy_by_robot: Dict[int, str] = {
-            robot.id: DELIVER_EASY for robot in self.robots
-        }
-        self._initial_relocate_assigned = 0
-        self._dispatch_floor_t = -1
-        self._warmup_barrier_applied = False
-        self._lookahead_relocation_seeded_skus: set[int] = set()
         self._plan_started_monotonic = 0.0
-        self._forced_dock_failures: Dict[Tuple[int, int], int] = collections.defaultdict(int)
-        self._forced_dock_cooldown_until_dispatch: Dict[Tuple[int, int], int] = {}
         self._log_handle = None
 
     def _select_best_non_test_run_id(self, conn: sqlite3.Connection) -> int | None:
@@ -343,42 +287,71 @@ class WarehouseSolver:
 
     def _find_solution_actions_core(self) -> List[Tuple[int, int, str, int, int]]:
         """
-        Algorithm: greedy event-loop dispatcher.
-        Pattern: orchestrator loop that repeatedly assigns the next robot/task pair.
+        Algorithm: greedy suggestion-based dispatcher.
+        Pattern: orchestrator loop that iterates through a pre-sorted suggestion queue,
+        assigning tasks to the next available robot.
         """
         self._plan_started_monotonic = time.monotonic()
-        remaining_orders = self._build_ranked_order_queue()
-        self._recalculate_order_costs(remaining_orders)
-        total_orders = len(remaining_orders)
-        completed = 0
+
+        suggestion_queue = collections.deque(self._build_suggestion_queue())
+
+        total_orders = len(self.orders)
+        completed_orders: set[int] = set()
         dispatch_count = 0
         self._log_solve_start(total_orders)
 
-        while remaining_orders:
-            self._check_global_limits_or_raise(remaining_orders)
-            self._inject_lookahead_relocation_jobs(remaining_orders)
-            robot = self._next_available_robot()
-            handled = self._execute_dispatch(
-                robot=robot,
-                remaining_orders=remaining_orders,
-                completed=completed,
-                total_orders=total_orders,
-                dispatch_number=dispatch_count + 1,
+        # Keep trying suggestions until all orders are done or queue is empty
+        while suggestion_queue and len(completed_orders) < total_orders:
+            self._check_global_limits_or_raise(
+                collections.deque(o for o in range(total_orders) if o not in completed_orders)
             )
-            if not handled:
-                raise RuntimeError("Dispatcher could not assign a feasible next task.")
 
-            new_completed = total_orders - len(remaining_orders)
-            if new_completed != completed:
-                completed = new_completed
+            suggestion = suggestion_queue.popleft()
+
+            # Skip if already handled
+            if isinstance(suggestion, OrderSuggestion) and suggestion.order_idx in completed_orders:
+                continue
+            if isinstance(suggestion, RelocateSuggestion) and suggestion.job.sku in self.relocated_skus:
+                continue
+
+            # Find the best robot (earliest available) to handle this suggestion
+            robot = self._next_available_robot()
+
+            handled = False
+            if isinstance(suggestion, OrderSuggestion):
+                handled = self._plan_order_for_robot(suggestion.order_idx, suggestion.order, robot)
+                if handled:
+                    completed_orders.add(suggestion.order_idx)
+                else:
+                    # Failed, put it at the back of the queue to retry later with another robot
+                    suggestion_queue.append(suggestion)
+
+            elif isinstance(suggestion, RelocateSuggestion):
+                handled = self._plan_relocate_pallet_for_robot(robot, suggestion.job)
+                if handled:
+                    self.relocated_skus.add(suggestion.job.sku)
+                    self._log(
+                        f"relocation_done sku={suggestion.job.sku} bucket={suggestion.job.bucket} "
+                        f"target={suggestion.job.preferred_target_xy} score={suggestion.job.score:.3f}"
+                    )
+                    # Don't requeue successful relocations.
+                else:
+                    suggestion_queue.append(suggestion)
+
+            if handled:
+                dispatch_count += 1
                 self._maybe_log_progress(
-                    completed=completed,
+                    completed=len(completed_orders),
                     total_orders=total_orders,
-                    dispatch_count=dispatch_count + 1,
+                    dispatch_count=dispatch_count,
                 )
-            self._check_global_limits_or_raise(remaining_orders)
 
-            dispatch_count += 1
+            if dispatch_count > (total_orders + self.config.num_allowed_relocations) * 5:  # circuit breaker
+                self._log("Dispatcher seems to be stuck in a loop. Breaking.")
+                break
+
+        if len(completed_orders) < total_orders:
+            self._log(f"Warning: Only {len(completed_orders)}/{total_orders} orders were completed from suggestion queue.")
 
         sorted_actions = self.actions.sorted_actions()
         sorted_actions = self._repair_idle_wait_conflicts(sorted_actions)
@@ -388,390 +361,64 @@ class WarehouseSolver:
         )
         return sorted_actions
 
+    def _build_suggestion_queue(self) -> List[Suggestion]:
+        """
+        Generates and returns a list of all suggestions (Order and Relocate),
+        sorted by their score (gain - cost).
+        """
+        all_suggestions: List[Suggestion] = []
+
+        # 1. Generate RelocateSuggestions
+        relocate_suggestions: List[RelocateSuggestion] = []
+        relocation_jobs = list(self.relocation_plan)
+        for job in relocation_jobs:
+            relocate_suggestions.append(RelocateSuggestion(job, self.scheduler))
+
+        # Sort and truncate RelocateSuggestions
+        relocate_suggestions.sort(key=lambda s: s.score(), reverse=True)
+        if self.config.num_allowed_relocations >= 0:
+            all_suggestions.extend(relocate_suggestions[: self.config.num_allowed_relocations])
+
+        # 2. Generate OrderSuggestions
+        optimizer = OrderOptimizer(self.state.pallets)
+        scored_orders = optimizer.sort_orders_by_cluster_efficiency([o.items for o in self.orders])
+
+        for scored_order in scored_orders:
+            order_idx = scored_order["order_idx"]
+            order = self.orders[order_idx]
+            unique_skus = list(order.items.keys())
+            cluster, bbox_score = optimizer.find_tightest_cluster(unique_skus)
+            if cluster is None:
+                self._log(f"Could not find a pallet cluster for order {order_idx}, skipping suggestion.")
+                continue
+
+            all_suggestions.append(
+                OrderSuggestion(
+                    order_idx=order_idx,
+                    order=order.items,
+                    cluster=cluster,
+                    order_gain_constant=self.config.order_suggestion_gain_constant,
+                    warehouse_width=self.state.width,
+                    warehouse_height=self.state.height,
+                    scheduler=self.scheduler,
+                )
+            )
+
+        # 3. Sort the combined list
+        all_suggestions.sort(key=lambda s: s.score(), reverse=True)
+
+        return all_suggestions
+
     def _optimize_actions_core(
         self, actions: List[Tuple[int, int, str, int, int]]
     ) -> List[Tuple[int, int, str, int, int]]:
-        """
-        Pattern: optimization pipeline.
-        Step 1 repairs known validity issues, Step 2 applies local-search improvement (LNS).
-        """
         self._plan_started_monotonic = time.monotonic()
         repaired = self._repair_idle_wait_conflicts(list(actions))
         improved = self._lns_improve_actions(repaired)
         makespan = max((t for t, _, _, _, _ in improved), default=-1)
-        self._log(
-            f"optimize_end actions={len(improved)} makespan={makespan}"
-        )
+        self._log(f"optimize_end actions={len(improved)} makespan={makespan}")
         return improved
 
-    def _try_suffix_replan_for_hot_sku(
-        self, actions: List[Tuple[int, int, str, int, int]]
-    ) -> List[Tuple[int, int, str, int, int]]:
-        threshold = max(2, int(self.config.min_jobs_for_dock))
-        candidate = self._find_hot_sku_streak_candidate(actions, threshold)
-        if candidate is None:
-            self._log("suffix_replan_skip reason=no_hot_sku_streak")
-            return actions
-
-        robot_id, sku, streak_len, streak_start_t = candidate
-        target_t = streak_start_t - 1
-        snapshot = self._latest_clean_snapshot_before(actions, target_t)
-        if snapshot is None:
-            self._log(
-                f"suffix_replan_skip reason=no_clean_cut robot={robot_id} sku={sku} target_t={target_t}"
-            )
-            return actions
-
-        cut_t, robot_positions, pallet_map, fulfilled_order_ids = snapshot
-        if cut_t < 0:
-            self._log(
-                f"suffix_replan_skip reason=clean_cut_before_start robot={robot_id} sku={sku}"
-            )
-            return actions
-        remaining_orders = [
-            collections.Counter(self.orders[oid].items)
-            for oid in range(len(self.orders))
-            if oid not in fulfilled_order_ids
-        ]
-        if not remaining_orders:
-            self._log("suffix_replan_skip reason=no_remaining_orders")
-            return actions
-
-        suffix_state = self._build_suffix_state(
-            robot_positions=robot_positions,
-            pallet_map=pallet_map,
-            remaining_orders=remaining_orders,
-        )
-        suffix_plans = self._build_suffix_role_plans(robot_id=robot_id, sku=sku)
-        suffix_config = replace(
-            self.config,
-            role_plans_by_robot=suffix_plans,
-            relocation_skus_to_relocate=[sku],
-            relocation_analysis_path=None,
-            lns_enabled=False,
-            log_path=None,
-        )
-        suffix_solver = WarehouseSolver(suffix_state, suffix_config)
-        try:
-            suffix_actions = suffix_solver.find_solution()
-        except Exception as exc:
-            self._log(
-                f"suffix_replan_skip reason=suffix_solve_failed robot={robot_id} sku={sku} error={exc}"
-            )
-            return actions
-
-        shifted_suffix = [(t + cut_t + 1, rid, act, x, y) for (t, rid, act, x, y) in suffix_actions]
-        prefix = [row for row in actions if row[0] <= cut_t]
-        merged = sorted(prefix + shifted_suffix, key=lambda row: (row[0], row[1]))
-        if not self._validate_candidate_actions(merged, log_on_error=True):
-            self._log("suffix_replan_skip reason=merged_validation_failed")
-            return actions
-
-        old_makespan = max((t for t, _, _, _, _ in actions), default=-1)
-        new_makespan = max((t for t, _, _, _, _ in merged), default=-1)
-        if new_makespan < old_makespan:
-            self._log(
-                f"suffix_replan_accept robot={robot_id} sku={sku} streak={streak_len} "
-                f"cut_t={cut_t} old={old_makespan} new={new_makespan}"
-            )
-            return merged
-
-        self._log(
-            f"suffix_replan_reject robot={robot_id} sku={sku} streak={streak_len} "
-            f"cut_t={cut_t} old={old_makespan} new={new_makespan}"
-        )
-        return actions
-
-    def _build_suffix_role_plans(self, robot_id: int, sku: int) -> Dict[int, List[str]]:
-        plans: Dict[int, List[str]] = {
-            rid: list(roles) for rid, roles in self.role_plans_by_robot.items()
-        }
-        token = f"dock_pallet_{sku}"
-        existing = list(plans.get(robot_id, []))
-        if not existing:
-            existing = [ROLE_LOOP, ROLE_DELIVER_EASY, ROLE_DELIVER_HARD]
-        if token in existing:
-            plans[robot_id] = existing
-        else:
-            plans[robot_id] = [token] + existing
-        return plans
-
-    def _build_suffix_state(
-        self,
-        *,
-        robot_positions: List[Tuple[int, int]],
-        pallet_map: Dict[Tuple[int, int], int],
-        remaining_orders: List[collections.Counter],
-    ):
-        width = self.state.width
-        height = self.state.height
-        grid = np.zeros((height, width), dtype=int)
-        grid[0, :] = 1
-        grid[-1, :] = 1
-        grid[:, 0] = 1
-        grid[:, -1] = 1
-        for (px, py) in pallet_map.keys():
-            grid[py, px] = 2
-        for rx, ry in robot_positions:
-            grid[ry, rx] = 3
-
-        return SimpleNamespace(
-            width=width,
-            height=height,
-            grid=grid,
-            robots=list(robot_positions),
-            pallets=dict(pallet_map),
-            orders=[collections.Counter(order) for order in remaining_orders],
-        )
-
-    def _find_hot_sku_streak_candidate(
-        self,
-        actions: List[Tuple[int, int, str, int, int]],
-        threshold: int,
-    ) -> Tuple[int, int, int, int] | None:
-        events_by_robot = self._extract_fulfill_events(actions)
-        best: Tuple[int, int, int, int] | None = None
-        all_skus = list(self.skus_by_demand)
-        if not all_skus:
-            all_skus = sorted({sku for order in self.orders for sku in order.items.keys()})
-
-        for rid, events in events_by_robot.items():
-            if len(events) < threshold:
-                continue
-            for sku in all_skus:
-                run = 0
-                run_start_t = -1
-                for event in events:
-                    if sku in event.skus:
-                        if run == 0:
-                            run_start_t = event.timestep
-                        run += 1
-                        if run >= threshold:
-                            candidate = (rid, sku, run, run_start_t)
-                            if best is None or (candidate[2], -candidate[3], -candidate[0], -candidate[1]) > (
-                                best[2],
-                                -best[3],
-                                -best[0],
-                                -best[1],
-                            ):
-                                best = candidate
-                    else:
-                        run = 0
-                        run_start_t = -1
-        return best
-
-    def _extract_fulfill_events(
-        self,
-        actions: List[Tuple[int, int, str, int, int]],
-    ) -> Dict[int, List[RobotFulfillEvent]]:
-        by_t: Dict[int, List[Tuple[int, str, int, int]]] = collections.defaultdict(list)
-        max_t = -1
-        for t, rid, action, x, y in actions:
-            by_t[t].append((rid, action.lower(), x, y))
-            if t > max_t:
-                max_t = t
-
-        robot_pos: List[List[int]] = [[x, y] for x, y in self.state.robots]
-        robot_storage: List[collections.Counter] = [collections.Counter() for _ in self.state.robots]
-        robot_docked: List[List[int]] = [[] for _ in self.state.robots]
-        pallets: List[dict] = []
-        pallet_at: Dict[int, int] = {}
-        for pid, ((x, y), sku) in enumerate(self.state.pallets.items()):
-            pallets.append({"id": pid, "x": x, "y": y, "sku": sku, "docked_to": None})
-            pallet_at[100 * y + x] = pid
-
-        order_defs = [collections.Counter(order.items) for order in self.orders]
-        orders_fulfilled = [False for _ in order_defs]
-        events_by_robot: Dict[int, List[RobotFulfillEvent]] = collections.defaultdict(list)
-
-        for t in range(max_t + 1):
-            timestep_actions = by_t.get(t, [])
-
-            for rid, action, x, y in timestep_actions:
-                if action != "undock":
-                    continue
-                pid = pallet_at.get(100 * y + x)
-                if pid is None:
-                    continue
-                if pallets[pid]["docked_to"] != rid:
-                    continue
-                pallets[pid]["docked_to"] = None
-                robot_docked[rid] = [p for p in robot_docked[rid] if p != pid]
-
-            for rid, action, x, y in timestep_actions:
-                if action != "pick":
-                    continue
-                pid = pallet_at.get(100 * y + x)
-                if pid is None:
-                    continue
-                sku = pallets[pid]["sku"]
-                robot_storage[rid][sku] += 1
-
-            for rid, action, x, y in timestep_actions:
-                if action != "dock":
-                    continue
-                pid = pallet_at.get(100 * y + x)
-                if pid is None:
-                    continue
-                if pallets[pid]["docked_to"] is not None:
-                    continue
-                pallets[pid]["docked_to"] = rid
-                if pid not in robot_docked[rid]:
-                    robot_docked[rid].append(pid)
-
-            for rid, action, x, y in timestep_actions:
-                if action != "move":
-                    continue
-                old_x, old_y = robot_pos[rid]
-                dx = x - old_x
-                dy = y - old_y
-                robot_pos[rid][0] = x
-                robot_pos[rid][1] = y
-                for pid in robot_docked[rid]:
-                    pallet = pallets[pid]
-                    old_key = 100 * pallet["y"] + pallet["x"]
-                    pallet_at.pop(old_key, None)
-                    pallet["x"] += dx
-                    pallet["y"] += dy
-                    pallet_at[100 * pallet["y"] + pallet["x"]] = pid
-
-            for rid, action, _, _ in timestep_actions:
-                if action != "fulfill":
-                    continue
-                bag = collections.Counter(robot_storage[rid])
-                matched_order_id = None
-                for oid, order_bag in enumerate(order_defs):
-                    if orders_fulfilled[oid]:
-                        continue
-                    if order_bag == bag:
-                        orders_fulfilled[oid] = True
-                        matched_order_id = oid
-                        break
-                events_by_robot[rid].append(
-                    RobotFulfillEvent(
-                        timestep=t,
-                        robot_id=rid,
-                        order_id=matched_order_id,
-                        skus=set(bag.keys()),
-                    )
-                )
-                robot_storage[rid].clear()
-
-        return events_by_robot
-
-    def _latest_clean_snapshot_before(
-        self,
-        actions: List[Tuple[int, int, str, int, int]],
-        target_t: int,
-    ) -> Tuple[int, List[Tuple[int, int]], Dict[Tuple[int, int], int], set[int]] | None:
-        by_t: Dict[int, List[Tuple[int, str, int, int]]] = collections.defaultdict(list)
-        max_t = -1
-        for t, rid, action, x, y in actions:
-            by_t[t].append((rid, action.lower(), x, y))
-            if t > max_t:
-                max_t = t
-
-        robot_pos: List[List[int]] = [[x, y] for x, y in self.state.robots]
-        robot_storage: List[collections.Counter] = [collections.Counter() for _ in self.state.robots]
-        robot_docked: List[List[int]] = [[] for _ in self.state.robots]
-        pallets: List[dict] = []
-        pallet_at: Dict[int, int] = {}
-        for pid, ((x, y), sku) in enumerate(self.state.pallets.items()):
-            pallets.append({"id": pid, "x": x, "y": y, "sku": sku, "docked_to": None})
-            pallet_at[100 * y + x] = pid
-
-        order_defs = [collections.Counter(order.items) for order in self.orders]
-        orders_fulfilled = [False for _ in order_defs]
-
-        latest = (
-            -1,
-            [tuple(pos) for pos in robot_pos],
-            {((x, y)): sku for (x, y), sku in self.state.pallets.items()},
-            set(),
-        )
-        horizon = min(max_t, target_t)
-        for t in range(horizon + 1):
-            timestep_actions = by_t.get(t, [])
-
-            for rid, action, x, y in timestep_actions:
-                if action != "undock":
-                    continue
-                pid = pallet_at.get(100 * y + x)
-                if pid is None:
-                    continue
-                if pallets[pid]["docked_to"] != rid:
-                    continue
-                pallets[pid]["docked_to"] = None
-                robot_docked[rid] = [p for p in robot_docked[rid] if p != pid]
-
-            for rid, action, x, y in timestep_actions:
-                if action != "pick":
-                    continue
-                pid = pallet_at.get(100 * y + x)
-                if pid is None:
-                    continue
-                sku = pallets[pid]["sku"]
-                robot_storage[rid][sku] += 1
-
-            for rid, action, x, y in timestep_actions:
-                if action != "dock":
-                    continue
-                pid = pallet_at.get(100 * y + x)
-                if pid is None:
-                    continue
-                if pallets[pid]["docked_to"] is not None:
-                    continue
-                pallets[pid]["docked_to"] = rid
-                if pid not in robot_docked[rid]:
-                    robot_docked[rid].append(pid)
-
-            for rid, action, x, y in timestep_actions:
-                if action != "move":
-                    continue
-                old_x, old_y = robot_pos[rid]
-                dx = x - old_x
-                dy = y - old_y
-                robot_pos[rid][0] = x
-                robot_pos[rid][1] = y
-                for pid in robot_docked[rid]:
-                    pallet = pallets[pid]
-                    old_key = 100 * pallet["y"] + pallet["x"]
-                    pallet_at.pop(old_key, None)
-                    pallet["x"] += dx
-                    pallet["y"] += dy
-                    pallet_at[100 * pallet["y"] + pallet["x"]] = pid
-
-            for rid, action, _, _ in timestep_actions:
-                if action != "fulfill":
-                    continue
-                bag = collections.Counter(robot_storage[rid])
-                for oid, order_bag in enumerate(order_defs):
-                    if orders_fulfilled[oid]:
-                        continue
-                    if order_bag == bag:
-                        orders_fulfilled[oid] = True
-                        break
-                robot_storage[rid].clear()
-
-            is_clean = all(not storage for storage in robot_storage) and all(
-                not docked for docked in robot_docked
-            )
-            if is_clean:
-                pallet_map = {
-                    (pallet["x"], pallet["y"]): int(pallet["sku"])
-                    for pallet in pallets
-                    if pallet["docked_to"] is None
-                }
-                latest = (
-                    t,
-                    [tuple(pos) for pos in robot_pos],
-                    pallet_map,
-                    {i for i, done in enumerate(orders_fulfilled) if done},
-                )
-
-        if latest[0] < 0:
-            return None
-        return latest
 
     def _log_solve_start(self, total_orders: int) -> None:
         self._log(f"solve_start total_orders={total_orders}")
@@ -783,124 +430,6 @@ class WarehouseSolver:
             self._log(f"relocation_plan count={len(self.relocation_plan)} top=[{summary}]")
         else:
             self._log("relocation_plan count=0")
-
-    def _execute_dispatch(
-        self,
-        *,
-        robot: RobotState,
-        remaining_orders: Deque[int],
-        completed: int,
-        total_orders: int,
-        dispatch_number: int,
-    ) -> bool:
-        """
-        Pattern: command-dispatch template.
-        Select role token, execute role with fallbacks, and emit consistent lifecycle logs.
-        """
-        role_token, from_plan = self._dispatch_role(robot)
-        role, strategy, forced_reloc_sku = self._decode_role_token(role_token, robot.id)
-        if role == ROLE_DELIVER:
-            self._ensure_warmup_barrier()
-
-        if robot.last_t < self._dispatch_floor_t:
-            robot.last_t = self._dispatch_floor_t
-
-        self._log_dispatch_start(
-            dispatch_number=dispatch_number,
-            robot=robot,
-            role_token=role_token,
-            completed=completed,
-            total_orders=total_orders,
-            remaining=len(remaining_orders),
-        )
-        t0 = time.perf_counter()
-        handled = self._execute_role_with_fallbacks(
-            robot=robot,
-            role=role,
-            strategy=strategy,
-            forced_reloc_sku=forced_reloc_sku,
-            dispatch_number=dispatch_number,
-            from_plan=from_plan,
-            remaining_orders=remaining_orders,
-        )
-        elapsed = time.perf_counter() - t0
-        self._log_dispatch_end(
-            dispatch_number=dispatch_number,
-            robot=robot,
-            role=role,
-            handled=handled,
-            elapsed_s=elapsed,
-            completed=total_orders - len(remaining_orders),
-            total_orders=total_orders,
-            remaining=len(remaining_orders),
-        )
-        return handled
-
-    def _execute_role_with_fallbacks(
-        self,
-        *,
-        robot: RobotState,
-        role: str,
-        strategy: str,
-        forced_reloc_sku: int | None,
-        dispatch_number: int,
-        from_plan: bool,
-        remaining_orders: Deque[int],
-    ) -> bool:
-        if role == ROLE_DELIVER:
-            handled = self._role_deliver(robot, remaining_orders, strategy=strategy)
-            if handled and not from_plan:
-                self._toggle_delivery_strategy(robot.id)
-            return handled
-
-        handled = self._role_relocate_pallet(
-            robot,
-            remaining_orders,
-            forced_sku=forced_reloc_sku,
-            dispatch_number=dispatch_number,
-        )
-        if not handled:
-            self._ensure_warmup_barrier()
-            handled = self._deliver_with_robot_strategy(robot, remaining_orders)
-        if not handled:
-            handled = self._fallback_deliver_any_robot(remaining_orders)
-        return handled
-
-    def _log_dispatch_start(
-        self,
-        *,
-        dispatch_number: int,
-        robot: RobotState,
-        role_token: str,
-        completed: int,
-        total_orders: int,
-        remaining: int,
-    ) -> None:
-        if dispatch_number % self.config.dispatch_log_every != 0:
-            return
-        self._log(
-            f"dispatch_start n={dispatch_number} robot={robot.id} role={role_token} "
-            f"robot_t={robot.last_t} completed={completed}/{total_orders} remaining={remaining}"
-        )
-
-    def _log_dispatch_end(
-        self,
-        *,
-        dispatch_number: int,
-        robot: RobotState,
-        role: str,
-        handled: bool,
-        elapsed_s: float,
-        completed: int,
-        total_orders: int,
-        remaining: int,
-    ) -> None:
-        if dispatch_number % self.config.dispatch_log_every != 0:
-            return
-        self._log(
-            f"dispatch_end n={dispatch_number} robot={robot.id} role={role} success={handled} "
-            f"elapsed_s={elapsed_s:.2f} completed={completed}/{total_orders} remaining={remaining}"
-        )
 
     def _maybe_log_progress(self, *, completed: int, total_orders: int, dispatch_count: int) -> None:
         if completed % self.config.progress_every != 0:
@@ -936,67 +465,6 @@ class WarehouseSolver:
                     f"Reached max_makespan={self.config.max_makespan} at makespan={current_makespan} "
                     f"with {len(remaining_orders)} orders remaining."
                 )
-
-    def _build_ranked_order_queue(self) -> Deque[int]:
-        optimizer = OrderOptimizer(self.state.pallets)
-        scored = optimizer.sort_orders_by_cluster_efficiency([o.items for o in self.orders])
-        return collections.deque(item["order_idx"] for item in scored)
-
-    def _recalculate_order_costs(self, order_ids: Deque[int] | List[int] | None = None) -> None:
-        if order_ids is None:
-            ids = range(len(self.orders))
-        else:
-            ids = list(order_ids)
-        for order_idx in ids:
-            self.orders[order_idx].estimate_cost(self.edge_scorer)
-
-    def _toggle_delivery_strategy(self, robot_id: int) -> None:
-        current = self._next_delivery_strategy_by_robot.get(robot_id, DELIVER_EASY)
-        self._next_delivery_strategy_by_robot[robot_id] = (
-            DELIVER_HARD if current == DELIVER_EASY else DELIVER_EASY
-        )
-
-    def _deliver_with_robot_strategy(self, robot: RobotState, remaining_orders: Deque[int]) -> bool:
-        strategy = self._next_delivery_strategy_by_robot.get(robot.id, DELIVER_EASY)
-        handled = self._role_deliver(robot, remaining_orders, strategy=strategy)
-        if handled:
-            self._toggle_delivery_strategy(robot.id)
-        return handled
-
-    def _normalize_role_plans(
-        self, role_plans: Dict[int, List[str]]
-    ) -> Dict[int, List[str]]:
-        normalized: Dict[int, List[str]] = {}
-        allowed = {
-            ROLE_RELOCATE_PALLET,
-            ROLE_DELIVER,
-            ROLE_DELIVER_EASY,
-            ROLE_DELIVER_HARD,
-            ROLE_LOOP,
-        }
-        for robot_id, roles in role_plans.items():
-            rid = int(robot_id)
-            cleaned = [str(role).strip().lower() for role in roles if str(role).strip()]
-            if not cleaned:
-                continue
-            for role in cleaned:
-                if role not in allowed and self._parse_forced_relocate_role(role) is None:
-                    raise ValueError(
-                        f"Unknown role '{role}' in plan for robot {rid}. "
-                        f"Allowed: {sorted(allowed)}"
-                    )
-            normalized[rid] = cleaned
-        return normalized
-
-    def _parse_forced_relocate_role(self, role_token: str) -> int | None:
-        token = role_token.strip().lower()
-        prefix = "dock_pallet_"
-        if not token.startswith(prefix):
-            return None
-        sku_part = token[len(prefix) :]
-        if not sku_part.isdigit():
-            return None
-        return int(sku_part)
 
     def _build_relocation_plan(self) -> Deque[RelocationJob]:
         """
@@ -1324,171 +792,6 @@ class WarehouseSolver:
     def _next_available_robot(self) -> RobotState:
         return min(self.robots, key=lambda r: (r.last_t, r.id))
 
-    def _ensure_warmup_barrier(self) -> None:
-        if self._warmup_barrier_applied:
-            return
-        if self._initial_relocate_assigned <= 0:
-            return
-        if not self.robots:
-            return
-        floor_t = max(r.last_t for r in self.robots)
-        if floor_t > self._dispatch_floor_t:
-            self._dispatch_floor_t = floor_t
-        self._warmup_barrier_applied = True
-        self._log(f"warmup_barrier floor_t={self._dispatch_floor_t}")
-
-    def _dispatch_role(self, robot: RobotState) -> Tuple[str, bool]:
-        """
-        Pattern: strategy selection (policy-based dispatch).
-        Chooses between planned-role strategy, relocation strategy, or delivery strategy.
-        """
-        planned = self._next_role_from_plan(robot.id)
-        if planned is not None:
-            return planned, True
-
-        if (
-            self._initial_relocate_assigned < self.config.initial_relocate_dispatches
-            and self._has_relocation_candidate()
-        ):
-            self._initial_relocate_assigned += 1
-            return ROLE_RELOCATE_PALLET, False
-
-        if self._has_relocation_candidate():
-            if self.rng.random() < self.config.relocate_pallet_probability:
-                return ROLE_RELOCATE_PALLET, False
-
-        strategy = self._next_delivery_strategy_by_robot.get(robot.id, DELIVER_EASY)
-        if strategy == DELIVER_HARD:
-            return ROLE_DELIVER_HARD, False
-        return ROLE_DELIVER_EASY, False
-
-    def _next_role_from_plan(self, robot_id: int) -> str | None:
-        cursor = self._role_cursors_by_robot.get(robot_id)
-        if cursor is None or not cursor.roles:
-            return None
-
-        max_steps = len(cursor.roles) + 2
-        steps = 0
-        while steps < max_steps:
-            if cursor.next_index >= len(cursor.roles):
-                if cursor.loop_index is not None:
-                    cursor.next_index = cursor.loop_index
-                else:
-                    cursor.next_index = 0
-
-            token = cursor.roles[cursor.next_index]
-            cursor.next_index += 1
-            if token == ROLE_LOOP:
-                steps += 1
-                continue
-            return token
-
-        raise RuntimeError(f"Robot {robot_id} plan does not contain any dispatchable roles.")
-
-    def _decode_role_token(self, role_token: str, robot_id: int) -> Tuple[str, str, int | None]:
-        token = role_token.strip().lower()
-        forced_sku = self._parse_forced_relocate_role(token)
-        if forced_sku is not None:
-            return ROLE_RELOCATE_PALLET, DELIVER_EASY, forced_sku
-        if token == ROLE_RELOCATE_PALLET:
-            return ROLE_RELOCATE_PALLET, DELIVER_EASY, None
-        if token == ROLE_DELIVER:
-            return ROLE_DELIVER, DELIVER_EASY, None
-        if token == ROLE_DELIVER_EASY:
-            return ROLE_DELIVER, DELIVER_EASY, None
-        if token == ROLE_DELIVER_HARD:
-            return ROLE_DELIVER, DELIVER_HARD, None
-        raise ValueError(f"Unknown role token '{role_token}' for robot {robot_id}")
-
-    def _has_relocation_candidate(self) -> bool:
-        while self.relocation_plan:
-            head = self.relocation_plan[0]
-            if head.sku in self.relocated_skus:
-                self.relocation_plan.popleft()
-                continue
-            if not self.scheduler.has_sku(head.sku):
-                self.relocation_plan.popleft()
-                continue
-            return True
-        return False
-
-    def _inject_lookahead_relocation_jobs(self, remaining_orders: Deque[int]) -> None:
-        threshold = int(self.config.min_jobs_for_dock)
-        if threshold <= 1:
-            return
-        if len(remaining_orders) < threshold:
-            return
-
-        lookahead_ids = list(remaining_orders)[:threshold]
-        sku_job_hits: collections.Counter = collections.Counter()
-        for order_idx in lookahead_ids:
-            for sku in self.orders[order_idx].items.keys():
-                sku_job_hits[sku] += 1
-
-        candidates = [
-            (hits, sku)
-            for sku, hits in sku_job_hits.items()
-            if hits >= threshold
-            and sku not in self.relocated_skus
-            and sku not in self._lookahead_relocation_seeded_skus
-            and self.scheduler.has_sku(sku)
-        ]
-        if not candidates:
-            return
-
-        candidates.sort(key=lambda row: (-row[0], row[1]))
-        seeded = 0
-        for hits, sku in candidates:
-            if seeded >= 3:
-                break
-            job = self._build_lookahead_relocation_job(sku=sku, hits=hits)
-            if job is None:
-                continue
-            self.relocation_plan.appendleft(job)
-            self._lookahead_relocation_seeded_skus.add(sku)
-            seeded += 1
-            self._log(
-                f"lookahead_relocation_seed sku={sku} hits={hits} "
-                f"bucket={job.bucket} target={job.preferred_target_xy} score={job.score:.2f}"
-            )
-
-    def _build_lookahead_relocation_job(self, *, sku: int, hits: int) -> RelocationJob | None:
-        pallets = self.scheduler.pallet_cells_for_sku(sku)
-        if not pallets:
-            return None
-        anchor_xy = pallets[0]
-        sku_cells = self._metadata_sku_cells.get(sku, [])
-        if sku_cells:
-            anchor_xy = (sku_cells[0][0], sku_cells[0][1])
-        bucket = self._closest_bucket_for_cell(anchor_xy[0], anchor_xy[1])
-        hotspot = anchor_xy
-        score = float(hits * 10)
-        job = RelocationJob(sku=sku, bucket=bucket, hotspot=hotspot, score=score)
-
-        reserved = set(self.relocated_pallet_targets)
-        for queued in self.relocation_plan:
-            if queued.preferred_target_xy is not None:
-                reserved.add(queued.preferred_target_xy)
-        target_xy = self._choose_metadata_guided_relocation_target(
-            job=job,
-            reserved_targets=reserved,
-        )
-        if target_xy is None:
-            offset = self._choose_unique_relocation_offset(
-                bucket=job.bucket,
-                hotspot=job.hotspot,
-                reserved_targets=reserved,
-            )
-            job.placement_offset = offset
-            tx, ty = hotspot[0] + offset[0], hotspot[1] + offset[1]
-            if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
-                job.preferred_target_xy = (tx, ty)
-        else:
-            tx, ty = target_xy
-            job.preferred_target_xy = target_xy
-            job.placement_offset = (tx - hotspot[0], ty - hotspot[1])
-        return job
-
     def _closest_bucket_for_cell(self, x: int, y: int) -> str:
         choices = list(BUCKET_TO_HOTSPOT.items())
         _, bucket = min(
@@ -1496,154 +799,6 @@ class WarehouseSolver:
             key=lambda row: (row[0], row[1]),
         )
         return bucket
-
-    def _role_deliver(self, robot: RobotState, remaining_orders: Deque[int], strategy: str) -> bool:
-        """
-        Algorithm: greedy best-first attempt over a bounded candidate window.
-        The ranking key switches by strategy ('easy' vs 'hard').
-        """
-        if not remaining_orders:
-            return False
-        if strategy not in {DELIVER_EASY, DELIVER_HARD}:
-            raise ValueError(f"Unknown deliver strategy: {strategy}")
-
-        candidate_window = min(len(remaining_orders), self.config.delivery_candidate_window)
-        candidate_order_ids = list(remaining_orders)[:candidate_window]
-        ranked_order_ids = sorted(
-            candidate_order_ids,
-            key=lambda oid: (
-                self.orders[oid].estimated_cost if strategy == DELIVER_EASY else -self.orders[oid].estimated_cost,
-                oid,
-            ),
-        )
-        ranked_order_ids = ranked_order_ids[: self.config.max_delivery_order_attempts]
-
-        for order_idx in ranked_order_ids:
-            order = self.orders[order_idx].items
-            if self._plan_order_for_robot(order_idx, order, robot):
-                try:
-                    remaining_orders.remove(order_idx)
-                except ValueError:
-                    pass
-                return True
-        return False
-
-    def _fallback_deliver_any_robot(self, remaining_orders: Deque[int]) -> bool:
-        for robot in sorted(self.robots, key=lambda r: (r.last_t, r.id)):
-            if self._deliver_with_robot_strategy(robot, remaining_orders):
-                return True
-        return False
-
-    def _role_relocate_pallet(
-        self,
-        robot: RobotState,
-        remaining_orders: Deque[int],
-        forced_sku: int | None = None,
-        dispatch_number: int | None = None,
-    ) -> bool:
-        if forced_sku is not None:
-            return self._relocate_forced_sku(
-                robot,
-                remaining_orders,
-                forced_sku,
-                dispatch_number=dispatch_number,
-            )
-
-        if not self._has_relocation_candidate():
-            return False
-
-        attempts = min(3, len(self.relocation_plan))
-        for _ in range(attempts):
-            if not self.relocation_plan:
-                return False
-            job = self.relocation_plan[0]
-            if job.sku in self.relocated_skus:
-                self.relocation_plan.popleft()
-                continue
-
-            ok = self._plan_relocate_pallet_for_robot(
-                robot=robot,
-                job=job,
-            )
-            if ok:
-                self._recalculate_order_costs(remaining_orders)
-                self.relocated_skus.add(job.sku)
-                self.relocation_plan.popleft()
-                self._log(
-                    f"relocation_done sku={job.sku} bucket={job.bucket} "
-                    f"hotspot={job.hotspot} offset={job.placement_offset} "
-                    f"target={job.preferred_target_xy} score={job.score:.3f}"
-                )
-                return True
-
-            job.attempts += 1
-            self.relocation_plan.rotate(-1)
-            if job.attempts >= self.config.relocation_max_attempts_per_sku:
-                try:
-                    self.relocation_plan.remove(job)
-                except ValueError:
-                    pass
-        return False
-
-    def _relocate_forced_sku(
-        self,
-        robot: RobotState,
-        remaining_orders: Deque[int],
-        forced_sku: int,
-        dispatch_number: int | None = None,
-    ) -> bool:
-        if (
-            dispatch_number is not None
-            and not self._should_attempt_forced_dock(robot.id, forced_sku, dispatch_number)
-        ):
-            return False
-        if forced_sku in self.relocated_skus:
-            return False
-        if not self.scheduler.has_sku(forced_sku):
-            return False
-        forced_job = self._build_lookahead_relocation_job(
-            sku=forced_sku,
-            hits=max(1, self.config.min_jobs_for_dock),
-        )
-        if forced_job is None:
-            return False
-        ok = self._plan_relocate_pallet_for_robot(robot=robot, job=forced_job)
-        if not ok:
-            if dispatch_number is not None:
-                self._record_forced_dock_failure(robot.id, forced_sku, dispatch_number)
-            return False
-        self._recalculate_order_costs(remaining_orders)
-        self.relocated_skus.add(forced_sku)
-        self._forced_dock_failures[(robot.id, forced_sku)] = 0
-        self._forced_dock_cooldown_until_dispatch.pop((robot.id, forced_sku), None)
-        self._log(
-            f"forced_relocation_done sku={forced_sku} bucket={forced_job.bucket} "
-            f"target={forced_job.preferred_target_xy}"
-        )
-        return True
-
-    def _should_attempt_forced_dock(self, robot_id: int, sku: int, dispatch_number: int) -> bool:
-        key = (robot_id, sku)
-        cooldown_until = self._forced_dock_cooldown_until_dispatch.get(key)
-        if cooldown_until is None:
-            return True
-        return dispatch_number >= cooldown_until
-
-    def _record_forced_dock_failure(self, robot_id: int, sku: int, dispatch_number: int) -> None:
-        key = (robot_id, sku)
-        self._forced_dock_failures[key] += 1
-        failures = self._forced_dock_failures[key]
-        max_attempts = max(1, int(self.config.forced_dock_max_attempts_per_robot_sku))
-        if failures < max_attempts:
-            return
-
-        cooldown = max(1, int(self.config.forced_dock_cooldown_dispatches))
-        self._forced_dock_failures[key] = 0
-        self._forced_dock_cooldown_until_dispatch[key] = dispatch_number + cooldown
-        self._log(
-            f"forced_dock_cooldown robot={robot_id} sku={sku} "
-            f"until_dispatch={dispatch_number + cooldown}"
-        )
 
     def _plan_order_for_robot(
         self, order_idx: int, order: collections.Counter, robot: RobotState

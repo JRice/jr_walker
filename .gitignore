@@ -15,3 +15,4 @@ models/
 *log
 .env
 output/*.log
+output/test_case_*

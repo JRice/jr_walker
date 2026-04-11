@@ -81,13 +81,14 @@ def _parse_robot_key(raw_key: str) -> int:
 
 @dataclass
 class RunConfig:
-    role_plans_by_robot: dict[int, list[str]] | None = None
     lane_width: int = 3
     relocation_skus_to_relocate: list[int] | None = None
     max_time: int = 50000
     max_makespan: int | None = None
     max_plan_time_seconds: float = 600.0
     min_jobs_for_dock: int = 3
+    num_allowed_relocations: int = 10
+    order_suggestion_gain_constant: float = 100.0
     lns_enabled: bool = True
     lns_iterations: int = 60
     lns_window_actions: int = 28
@@ -127,31 +128,6 @@ def load_run_config(config_path: Path, robot_count: int) -> RunConfig:
 
     run_config = RunConfig()
 
-    robots_section = data.get("robots")
-    if robots_section is not None:
-        if not isinstance(robots_section, dict):
-            raise ValueError('If present, [robots] must be a table.')
-        plans: dict[int, list[str]] = {}
-        for raw_key, raw_roles in robots_section.items():
-            robot_id = _parse_robot_key(str(raw_key))
-            if robot_id < 0 or robot_id >= robot_count:
-                raise ValueError(
-                    f"Dispatch config references robot {robot_id}, but valid IDs are 0..{robot_count - 1}."
-                )
-            if not isinstance(raw_roles, list) or not all(isinstance(role, str) for role in raw_roles):
-                raise ValueError(
-                    f'Roles for "{raw_key}" must be an array of strings.'
-                )
-            cleaned = [role.strip().lower() for role in raw_roles if role.strip()]
-            if not cleaned:
-                raise ValueError(f'Roles for "{raw_key}" cannot be empty.')
-            plans[robot_id] = cleaned
-
-        missing = [rid for rid in range(robot_count) if rid not in plans]
-        if missing:
-            raise ValueError(f"Dispatch config is missing role plans for robots: {missing}")
-        run_config.role_plans_by_robot = plans
-
     relocation_section = _get_table(data, "relocation")
     run_config.lane_width = _require_int(
         relocation_section.get("lane_width", run_config.lane_width),
@@ -176,6 +152,16 @@ def load_run_config(config_path: Path, robot_count: int) -> RunConfig:
         solver_section.get("min_jobs_for_dock", run_config.min_jobs_for_dock),
         "solver.min_jobs_for_dock",
         minimum=1,
+    )
+    run_config.num_allowed_relocations = _require_int(
+        solver_section.get("num_allowed_relocations", run_config.num_allowed_relocations),
+        "solver.num_allowed_relocations",
+        minimum=0,
+    )
+    run_config.order_suggestion_gain_constant = _require_number(
+        solver_section.get("order_suggestion_gain_constant", run_config.order_suggestion_gain_constant),
+        "solver.order_suggestion_gain_constant",
+        minimum=0.0,
     )
 
     limits_section = _get_table(data, "limits")
@@ -339,10 +325,11 @@ def main():
             output_path=Path(args.output) if args.output else temp_output_path,
             progress_every=50,
             log_path=Path(args.log_path),
-            role_plans_by_robot=run_config.role_plans_by_robot,
             lane_width=run_config.lane_width,
             relocation_skus_to_relocate=run_config.relocation_skus_to_relocate,
             min_jobs_for_dock=run_config.min_jobs_for_dock,
+            num_allowed_relocations=run_config.num_allowed_relocations,
+            order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
             worklist_path=Path(args.input),
             lns_enabled=run_config.lns_enabled,
             lns_iterations=run_config.lns_iterations,

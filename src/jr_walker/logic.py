@@ -1,8 +1,121 @@
 import collections
 from typing import Dict, Iterable, List, Tuple
+from abc import ABC, abstractmethod
 
 def manhattan_distance(p1: Tuple[int, int], p2: Tuple[int, int]) -> int:
     return abs(p1[0] - p2[0]) + abs(p1[1] - p2[1])
+
+
+class Suggestion(ABC):
+    @property
+    @abstractmethod
+    def expected_cost(self) -> float:
+        ...
+
+    @property
+    @abstractmethod
+    def expected_gain(self) -> float:
+        ...
+
+    @property
+    @abstractmethod
+    def center(self) -> Tuple[int, int]:
+        ...
+
+    def score(self) -> float:
+        return self.expected_gain - self.expected_cost
+
+
+class RelocateSuggestion(Suggestion):
+    def __init__(self, job, scheduler):
+        self.job = job
+        self.scheduler = scheduler
+        self._cost = -1.0
+        self._gain = -1.0
+        self._center = (-1, -1)
+
+    @property
+    def expected_cost(self) -> float:
+        if self._cost < 0:
+            source_pallets = self.scheduler.pallet_cells_for_sku(self.job.sku)
+            if not source_pallets or self.job.preferred_target_xy is None:
+                self._cost = float("inf")
+            else:
+                closest_source = min(source_pallets, key=lambda p: manhattan_distance(p, self.job.preferred_target_xy))
+                self._cost = float(manhattan_distance(closest_source, self.job.preferred_target_xy))
+        return self._cost
+
+    @property
+    def expected_gain(self) -> float:
+        if self._gain < 0:
+            self._gain = self.job.score
+        return self._gain
+
+    @property
+    def center(self) -> Tuple[int, int]:
+        if self._center == (-1, -1):
+            source_pallets = self.scheduler.pallet_cells_for_sku(self.job.sku)
+            if not source_pallets:
+                self._center = self.job.hotspot
+            else:
+                self._center = min(source_pallets, key=lambda p: manhattan_distance(p, self.job.hotspot))
+        return self._center
+
+
+class OrderSuggestion(Suggestion):
+    def __init__(self, order_idx, order, cluster, order_gain_constant, warehouse_width, warehouse_height, scheduler):
+        self.order_idx = order_idx
+        self.order = order
+        self.cluster = cluster
+        self._order_gain_constant = order_gain_constant
+        self._width = warehouse_width
+        self._height = warehouse_height
+        self._scheduler = scheduler
+        self._cost = -1.0
+        self._center = (-1, -1)
+
+    def _nearest_available_edge_distance(self, current_xy: Tuple[int, int]) -> float:
+        cx, cy = current_xy
+        perimeter_cells = set()
+        for x in range(self._width):
+            perimeter_cells.add((x, 0))
+            perimeter_cells.add((x, self._height - 1))
+        for y in range(self._height):
+            perimeter_cells.add((0, y))
+            perimeter_cells.add((self._width - 1, y))
+
+        best = float("inf")
+        for ex, ey in perimeter_cells:
+            if (ex, ey) in self._scheduler.pallets:
+                continue
+            best = min(best, manhattan_distance((cx, cy), (ex, ey)))
+        return best
+
+    @property
+    def expected_cost(self) -> float:
+        if self._cost < 0:
+            xs = [pos[0] for pos in self.cluster.values()]
+            ys = [pos[1] for pos in self.cluster.values()]
+            span_x = max(xs) - min(xs)
+            span_y = max(ys) - min(ys)
+            center_xy = self.center
+            dist_to_edge = self._nearest_available_edge_distance(center_xy)
+            self._cost = float(span_x * span_y + dist_to_edge)
+        return self._cost
+
+    @property
+    def expected_gain(self) -> float:
+        return self._order_gain_constant
+
+    @property
+    def center(self) -> Tuple[int, int]:
+        if self._center == (-1, -1):
+            xs = [pos[0] for pos in self.cluster.values()]
+            ys = [pos[1] for pos in self.cluster.values()]
+            span_x = max(xs) - min(xs)
+            span_y = max(ys) - min(ys)
+            self._center = (int(min(xs) + span_x / 2), int(min(ys) + span_y / 2))
+        return self._center
 
 
 class EdgeAwareOrderScorer:
