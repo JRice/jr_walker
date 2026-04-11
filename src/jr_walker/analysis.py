@@ -250,6 +250,7 @@ def solution_analysis(
 
     lines_out: List[str] = []
     lines_out.append(f"Solution Analysis: {solution_path}")
+    lines_out.append(f"Date/time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
     lines_out.append(f"Worklist: {worklist_path}")
     lines_out.append("")
     lines_out.append(f"Total fulfills: {total_fulfills}")
@@ -295,10 +296,11 @@ def solution_analysis(
         order_fulfill_records,
         key=lambda r: (-r["duration"], -r["fulfill_t"], r["order_id"]),
     )[:100]
-    least_time = sorted(
-        order_fulfill_records,
-        key=lambda r: (r["duration"], r["fulfill_t"], r["order_id"]),
-    )[:100]
+    if len(order_fulfill_records) > 100
+        least_time = sorted(
+            order_fulfill_records,
+            key=lambda r: (r["duration"], r["fulfill_t"], r["order_id"]),
+        )[:100]
 
     lines_out.append("  Longest:")
     if not most_time:
