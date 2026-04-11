@@ -172,7 +172,6 @@ class WarehouseSolver:
         self._metadata_db_path = self.config.relocation_analysis_path
         if self._metadata_db_path is None:
             self._metadata_db_path = self._find_default_metadata_db_path()
-        self._metadata_best_run_id: int | None = None
         self._metadata_use_by_cell: Dict[Tuple[int, int], int] = {}
         self._metadata_sku_cells: Dict[int, List[Tuple[int, int, int]]] = {}
         self._metadata_high_use_cells: set[Tuple[int, int]] = set()
@@ -262,8 +261,6 @@ class WarehouseSolver:
                 run_id = self._select_best_non_test_run_id(conn)
                 if run_id is None:
                     return
-                self._metadata_best_run_id = run_id
-
                 use_rows = conn.execute(
                     "SELECT x, y, use_score FROM cell_metadata WHERE run_id = ?",
                     (run_id,),
@@ -1215,86 +1212,93 @@ class WarehouseSolver:
             return False
         return True
 
+    def _iter_manhattan_cells(
+        self, center_x: int, center_y: int, *, max_radius: int
+    ):
+        for radius in range(0, max_radius + 1):
+            min_x = max(0, center_x - radius)
+            max_x = min(self.state.width - 1, center_x + radius)
+            min_y = max(0, center_y - radius)
+            max_y = min(self.state.height - 1, center_y + radius)
+            for tx in range(min_x, max_x + 1):
+                for ty in range(min_y, max_y + 1):
+                    if abs(tx - center_x) + abs(ty - center_y) != radius:
+                        continue
+                    yield tx, ty, radius
+
+    def _iter_sku_anchor_rows(self, sku: int, *, limit: int) -> List[Tuple[int, int, int]]:
+        sku_rows = self._metadata_sku_cells.get(sku, [])
+        if not sku_rows:
+            return []
+        return sku_rows[: min(len(sku_rows), limit)]
+
     def _choose_metadata_guided_relocation_target(
         self,
         *,
         job: RelocationJob,
         reserved_targets: set[Tuple[int, int]],
     ) -> Tuple[int, int] | None:
-        sku_rows = self._metadata_sku_cells.get(job.sku, [])
-        if not sku_rows:
+        anchor_rows = self._iter_sku_anchor_rows(job.sku, limit=24)
+        if not anchor_rows:
             return None
 
         best: Tuple[int, int] | None = None
         best_key: Tuple[int, int, int, int] | None = None
-        anchor_limit = min(len(sku_rows), 24)
-        for sx, sy, sku_count in sku_rows[:anchor_limit]:
-            for radius in range(0, 10):
-                for tx in range(max(0, sx - radius), min(self.state.width - 1, sx + radius) + 1):
-                    for ty in range(max(0, sy - radius), min(self.state.height - 1, sy + radius) + 1):
-                        if abs(tx - sx) + abs(ty - sy) != radius:
-                            continue
-                        cell = (tx, ty)
-                        if not self._is_relocation_target_cell_allowed(
-                            cell,
-                            reserved_targets=reserved_targets,
-                            block_high_use=True,
-                        ):
-                            continue
-                        use_score = self._metadata_use_by_cell.get(cell, 0)
-                        key = (
-                            use_score,
-                            abs(tx - sx) + abs(ty - sy),
-                            abs(tx - job.hotspot[0]) + abs(ty - job.hotspot[1]),
-                            -sku_count,
-                        )
-                        if best_key is None or key < best_key:
-                            best_key = key
-                            best = cell
+        for sx, sy, sku_count in anchor_rows:
+            for tx, ty, radius in self._iter_manhattan_cells(sx, sy, max_radius=9):
+                cell = (tx, ty)
+                if not self._is_relocation_target_cell_allowed(
+                    cell,
+                    reserved_targets=reserved_targets,
+                    block_high_use=True,
+                ):
+                    continue
+                use_score = self._metadata_use_by_cell.get(cell, 0)
+                key = (
+                    use_score,
+                    radius,
+                    abs(tx - job.hotspot[0]) + abs(ty - job.hotspot[1]),
+                    -sku_count,
+                )
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best = cell
 
         if best is not None:
             return best
 
         # If no strict low-use option exists, retry allowing high-use (still avoids lanes).
-        for sx, sy, _ in sku_rows[:anchor_limit]:
-            for radius in range(0, 12):
-                for tx in range(max(0, sx - radius), min(self.state.width - 1, sx + radius) + 1):
-                    for ty in range(max(0, sy - radius), min(self.state.height - 1, sy + radius) + 1):
-                        if abs(tx - sx) + abs(ty - sy) != radius:
-                            continue
-                        cell = (tx, ty)
-                        if self._is_relocation_target_cell_allowed(
-                            cell,
-                            reserved_targets=reserved_targets,
-                            block_high_use=False,
-                        ):
-                            return cell
+        for sx, sy, _ in anchor_rows:
+            for tx, ty, _ in self._iter_manhattan_cells(sx, sy, max_radius=11):
+                cell = (tx, ty)
+                if self._is_relocation_target_cell_allowed(
+                    cell,
+                    reserved_targets=reserved_targets,
+                    block_high_use=False,
+                ):
+                    return cell
         return None
 
     def _metadata_candidate_targets_for_sku(self, sku: int, limit: int = 64) -> List[Tuple[int, int]]:
         out: List[Tuple[int, int]] = []
         seen: set[Tuple[int, int]] = set()
-        sku_rows = self._metadata_sku_cells.get(sku, [])
-        if not sku_rows:
+        anchor_rows = self._iter_sku_anchor_rows(sku, limit=18)
+        if not anchor_rows:
             return out
 
-        for sx, sy, _ in sku_rows[: min(len(sku_rows), 18)]:
-            for radius in range(0, 5):
-                for tx in range(max(0, sx - radius), min(self.state.width - 1, sx + radius) + 1):
-                    for ty in range(max(0, sy - radius), min(self.state.height - 1, sy + radius) + 1):
-                        if abs(tx - sx) + abs(ty - sy) != radius:
-                            continue
-                        cell = (tx, ty)
-                        if cell in seen:
-                            continue
-                        if cell in self.scheduler.pallets:
-                            continue
-                        if cell in self.travel_lane_cells:
-                            continue
-                        seen.add(cell)
-                        out.append(cell)
-                        if len(out) >= limit:
-                            return out
+        for sx, sy, _ in anchor_rows:
+            for tx, ty, _ in self._iter_manhattan_cells(sx, sy, max_radius=4):
+                cell = (tx, ty)
+                if cell in seen:
+                    continue
+                if cell in self.scheduler.pallets:
+                    continue
+                if cell in self.travel_lane_cells:
+                    continue
+                seen.add(cell)
+                out.append(cell)
+                if len(out) >= limit:
+                    return out
         return out
 
     def _next_available_robot(self) -> RobotState:
@@ -1682,24 +1686,32 @@ class WarehouseSolver:
         )
         return True
 
-    def _plan_relocate_pallet_for_robot(self, robot: RobotState, job: RelocationJob) -> bool:
-        sku = job.sku
+    def _select_relocation_source_pallet(
+        self, robot: RobotState, sku: int
+    ) -> Tuple[Tuple[int, int], int] | None:
         pallet_cells = self.scheduler.pallet_cells_for_sku(sku)
         if not pallet_cells:
-            return False
-
+            return None
         rx, ry = robot.x, robot.y
         pallet_xy = min(pallet_cells, key=lambda p: abs(p[0] - rx) + abs(p[1] - ry))
         pallet_id = self.pallet_id_by_coord.get(pallet_xy)
         if pallet_id is None:
-            return False
+            return None
+        return pallet_xy, pallet_id
 
+    def _candidate_relocation_stand_cells(
+        self, robot: RobotState, pallet_xy: Tuple[int, int]
+    ) -> List[Tuple[int, int]]:
         stand_cells = self.scheduler.pick_cells_for_pallet(pallet_xy)
         if not stand_cells:
-            return False
+            return []
+        rx, ry = robot.x, robot.y
         stand_cells.sort(key=lambda p: abs(p[0] - rx) + abs(p[1] - ry))
-        stand_cells = stand_cells[: self.config.relocate_stand_candidate_limit]
+        return stand_cells[: self.config.relocate_stand_candidate_limit]
 
+    def _ranked_relocation_target_cells(
+        self, job: RelocationJob, pallet_xy: Tuple[int, int]
+    ) -> List[Tuple[int, int]]:
         target_pallet_cells = self._candidate_relocation_targets(job)
         target_pallet_cells.sort(
             key=lambda p: (
@@ -1712,101 +1724,146 @@ class WarehouseSolver:
                 abs(p[0] - pallet_xy[0]) + abs(p[1] - pallet_xy[1]),
             )
         )
-        target_pallet_cells = target_pallet_cells[: self.config.relocate_target_candidate_limit]
+        return target_pallet_cells[: self.config.relocate_target_candidate_limit]
 
-        for stand_x, stand_y in stand_cells:
-            temp_robot = self._clone_robot_state(robot)
-            pending_actions: List[Tuple[int, int, str, int, int]] = []
-            pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
-            pending_footprints: List[Tuple[RobotState, int, int, int]] = []
-            pending_static_additions: List[Tuple[int, int, int]] = []
+    def _attempt_relocation_via_stand(
+        self,
+        *,
+        robot: RobotState,
+        pallet_xy: Tuple[int, int],
+        pallet_id: int,
+        stand_xy: Tuple[int, int],
+        target_pallet_cells: List[Tuple[int, int]],
+    ) -> Tuple[Tuple[int, int], int, int] | None:
+        stand_x, stand_y = stand_xy
+        temp_robot = self._clone_robot_state(robot)
+        pending_actions: List[Tuple[int, int, str, int, int]] = []
+        pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+        pending_footprints: List[Tuple[RobotState, int, int, int]] = []
+        pending_static_additions: List[Tuple[int, int, int]] = []
 
-            path_to_stand = self._safe_plan_path(temp_robot, stand_x, stand_y)
-            if not path_to_stand and (temp_robot.x != stand_x or temp_robot.y != stand_y):
-                continue
-            if path_to_stand:
-                pending_paths.append((self._clone_robot_state(temp_robot), path_to_stand))
-            pending_actions.extend(self._apply_moves_to_robot(temp_robot, path_to_stand))
+        path_to_stand = self._safe_plan_path(temp_robot, stand_x, stand_y)
+        if not path_to_stand and (temp_robot.x != stand_x or temp_robot.y != stand_y):
+            return None
+        if path_to_stand:
+            pending_paths.append((self._clone_robot_state(temp_robot), path_to_stand))
+        pending_actions.extend(self._apply_moves_to_robot(temp_robot, path_to_stand))
 
-            dx = pallet_xy[0] - temp_robot.x
-            dy = pallet_xy[1] - temp_robot.y
-            if abs(dx) + abs(dy) != 1:
-                continue
+        dx = pallet_xy[0] - temp_robot.x
+        dy = pallet_xy[1] - temp_robot.y
+        if abs(dx) + abs(dy) != 1:
+            return None
 
-            dock_t = temp_robot.last_t + 1
-            if not self.planner.can_occupy(temp_robot, dock_t, temp_robot.x, temp_robot.y):
-                continue
-            pending_actions.append((dock_t, temp_robot.id, "dock", pallet_xy[0], pallet_xy[1]))
-            pending_footprints.append((self._clone_robot_state(temp_robot), dock_t, temp_robot.x, temp_robot.y))
-            temp_robot.last_t = dock_t
-            temp_robot.docks[(dx, dy)] = pallet_id
+        dock_t = temp_robot.last_t + 1
+        if not self.planner.can_occupy(temp_robot, dock_t, temp_robot.x, temp_robot.y):
+            return None
+        pending_actions.append((dock_t, temp_robot.id, "dock", pallet_xy[0], pallet_xy[1]))
+        pending_footprints.append((self._clone_robot_state(temp_robot), dock_t, temp_robot.x, temp_robot.y))
+        temp_robot.last_t = dock_t
+        temp_robot.docks[(dx, dy)] = pallet_id
 
-            chosen = None
-            for tx, ty in target_pallet_cells:
-                if (tx, ty) in self.scheduler.pallets and (tx, ty) != pallet_xy:
-                    continue
-
-                target_robot_x = tx - dx
-                target_robot_y = ty - dy
-                if not (0 <= target_robot_x < self.state.width and 0 <= target_robot_y < self.state.height):
-                    continue
-                if (target_robot_x, target_robot_y) in self.scheduler.pallets and (
-                    target_robot_x, target_robot_y
-                ) != pallet_xy:
-                    continue
-
-                carry_path = self._safe_plan_path(temp_robot, target_robot_x, target_robot_y)
-                if not carry_path and (temp_robot.x != target_robot_x or temp_robot.y != target_robot_y):
-                    continue
-
-                chosen = (tx, ty, carry_path)
-                break
-
-            if chosen is None:
+        chosen_target: Tuple[int, int, List[Tuple[int, int, int]]] | None = None
+        for tx, ty in target_pallet_cells:
+            if (tx, ty) in self.scheduler.pallets and (tx, ty) != pallet_xy:
                 continue
 
-            target_pallet_x, target_pallet_y, carry_path = chosen
-            if carry_path:
-                pending_paths.append((self._clone_robot_state(temp_robot), carry_path))
-            pending_actions.extend(self._apply_moves_to_robot(temp_robot, carry_path))
-
-            undock_t = temp_robot.last_t + 1
-            if not self.planner.can_occupy(temp_robot, undock_t, temp_robot.x, temp_robot.y):
+            target_robot_x = tx - dx
+            target_robot_y = ty - dy
+            if not (0 <= target_robot_x < self.state.width and 0 <= target_robot_y < self.state.height):
                 continue
-            pending_actions.append((undock_t, temp_robot.id, "undock", target_pallet_x, target_pallet_y))
-            pending_footprints.append((self._clone_robot_state(temp_robot), undock_t, temp_robot.x, temp_robot.y))
-            temp_robot.last_t = undock_t
-            del temp_robot.docks[(dx, dy)]
+            if (target_robot_x, target_robot_y) in self.scheduler.pallets and (
+                target_robot_x, target_robot_y
+            ) != pallet_xy:
+                continue
 
-            # The undocked pallet becomes static from the next timestep onward.
-            pending_static_additions.append((undock_t + 1, target_pallet_x, target_pallet_y))
+            carry_path = self._safe_plan_path(temp_robot, target_robot_x, target_robot_y)
+            if not carry_path and (temp_robot.x != target_robot_x or temp_robot.y != target_robot_y):
+                continue
 
-            self._commit_plan(
+            chosen_target = (tx, ty, carry_path)
+            break
+
+        if chosen_target is None:
+            return None
+
+        target_pallet_x, target_pallet_y, carry_path = chosen_target
+        if carry_path:
+            pending_paths.append((self._clone_robot_state(temp_robot), carry_path))
+        pending_actions.extend(self._apply_moves_to_robot(temp_robot, carry_path))
+
+        undock_t = temp_robot.last_t + 1
+        if not self.planner.can_occupy(temp_robot, undock_t, temp_robot.x, temp_robot.y):
+            return None
+        pending_actions.append((undock_t, temp_robot.id, "undock", target_pallet_x, target_pallet_y))
+        pending_footprints.append((self._clone_robot_state(temp_robot), undock_t, temp_robot.x, temp_robot.y))
+        temp_robot.last_t = undock_t
+        del temp_robot.docks[(dx, dy)]
+
+        pending_static_additions.append((undock_t + 1, target_pallet_x, target_pallet_y))
+        self._commit_plan(
+            robot=robot,
+            temp_robot=temp_robot,
+            pending_actions=pending_actions,
+            pending_paths=pending_paths,
+            pending_footprints=pending_footprints,
+            pending_static_additions=pending_static_additions,
+        )
+        return (target_pallet_x, target_pallet_y), dock_t, undock_t
+
+    def _finalize_relocation_pallet_state(
+        self,
+        *,
+        pallet_id: int,
+        old_xy: Tuple[int, int],
+        new_xy: Tuple[int, int],
+        dock_t: int,
+        undock_t: int,
+    ) -> None:
+        if new_xy == old_xy:
+            return
+        self._record_pallet_move(
+            pallet_id=pallet_id,
+            old_xy=old_xy,
+            new_xy=new_xy,
+            dock_t=dock_t,
+            undock_t=undock_t,
+        )
+        self.scheduler.move_pallet(old_xy, new_xy)
+        self.pallet_id_by_coord.pop(old_xy, None)
+        self.pallet_id_by_coord[new_xy] = pallet_id
+        self.pallet_by_id[pallet_id]["x"] = new_xy[0]
+        self.pallet_by_id[pallet_id]["y"] = new_xy[1]
+        self.relocated_pallet_targets.add(new_xy)
+
+    def _plan_relocate_pallet_for_robot(self, robot: RobotState, job: RelocationJob) -> bool:
+        source = self._select_relocation_source_pallet(robot, job.sku)
+        if source is None:
+            return False
+        pallet_xy, pallet_id = source
+
+        stand_cells = self._candidate_relocation_stand_cells(robot, pallet_xy)
+        if not stand_cells:
+            return False
+        target_pallet_cells = self._ranked_relocation_target_cells(job, pallet_xy)
+
+        for stand_xy in stand_cells:
+            outcome = self._attempt_relocation_via_stand(
                 robot=robot,
-                temp_robot=temp_robot,
-                pending_actions=pending_actions,
-                pending_paths=pending_paths,
-                pending_footprints=pending_footprints,
-                pending_static_additions=pending_static_additions,
+                pallet_xy=pallet_xy,
+                pallet_id=pallet_id,
+                stand_xy=stand_xy,
+                target_pallet_cells=target_pallet_cells,
             )
-
-            old_xy = pallet_xy
-            new_xy = (target_pallet_x, target_pallet_y)
-            if new_xy != old_xy:
-                self._record_pallet_move(
-                    pallet_id=pallet_id,
-                    old_xy=old_xy,
-                    new_xy=new_xy,
-                    dock_t=dock_t,
-                    undock_t=undock_t,
-                )
-                self.scheduler.move_pallet(old_xy, new_xy)
-                self.pallet_id_by_coord.pop(old_xy, None)
-                self.pallet_id_by_coord[new_xy] = pallet_id
-                self.pallet_by_id[pallet_id]["x"] = new_xy[0]
-                self.pallet_by_id[pallet_id]["y"] = new_xy[1]
-                self.relocated_pallet_targets.add(new_xy)
-
+            if outcome is None:
+                continue
+            new_xy, dock_t, undock_t = outcome
+            self._finalize_relocation_pallet_state(
+                pallet_id=pallet_id,
+                old_xy=pallet_xy,
+                new_xy=new_xy,
+                dock_t=dock_t,
+                undock_t=undock_t,
+            )
             return True
 
         return False
