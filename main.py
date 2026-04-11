@@ -12,6 +12,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from jr_walker.validator import ValidationError, validate_solution_file
+from jr_walker.solver import SolverConfig, WarehouseSolver
+from jr_walker.view import WarehouseState
+from jr_walker.writer import write_actions
+from jr_walker.analysis import build_and_store_solution_metadata
 
 
 def make_unique_path(path: Path) -> Path:
@@ -98,6 +102,10 @@ class RunConfig:
     log_path: str = "output/run.log"
     metadata_db_path: str = "output/solution_metadata.db"
     force_new_solution: bool = False
+    input_path: str = "docs/BIG_ORDER.txt"
+    test_mode: bool = False
+    output_path: str | None = None
+    metadata_run_id: int | None = None
 
 
 def _get_table(data: dict, key: str) -> dict:
@@ -126,7 +134,7 @@ def _require_number(value, field_name: str, *, minimum: float | None = None) -> 
     return out
 
 
-def load_run_config(config_path: Path, robot_count: int) -> RunConfig:
+def load_run_config(config_path: Path) -> RunConfig:
     with config_path.open("rb") as handle:
         data = tomllib.load(handle)
 
@@ -138,6 +146,10 @@ def load_run_config(config_path: Path, robot_count: int) -> RunConfig:
     run_config.metadata_db_path = str(
         paths_section.get("metadata_db_path", run_config.metadata_db_path)
     )
+    run_config.input_path = str(paths_section.get("input_path", run_config.input_path))
+    raw_output_path = paths_section.get("output_path")
+    if raw_output_path is not None:
+        run_config.output_path = str(raw_output_path)
 
     relocation_section = _get_table(data, "relocation")
     run_config.lane_width = _require_int(
@@ -168,6 +180,11 @@ def load_run_config(config_path: Path, robot_count: int) -> RunConfig:
     if not isinstance(raw_force_new, bool):
         raise ValueError("solver.force_new_solution must be a boolean.")
     run_config.force_new_solution = raw_force_new
+
+    raw_test_mode = solver_section.get("test_mode", run_config.test_mode)
+    if not isinstance(raw_test_mode, bool):
+        raise ValueError("solver.test_mode must be a boolean.")
+    run_config.test_mode = raw_test_mode
 
     run_config.num_allowed_relocations = _require_int(
         solver_section.get("num_allowed_relocations", run_config.num_allowed_relocations),
@@ -220,100 +237,37 @@ def load_run_config(config_path: Path, robot_count: int) -> RunConfig:
         minimum=1,
     )
 
+    metadata_section = _get_table(data, "metadata")
+    raw_run_id = metadata_section.get("run_id")
+    if raw_run_id is not None:
+        run_config.metadata_run_id = _require_int(raw_run_id, "metadata.run_id", minimum=1)
+
     return run_config
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Build a warehouse action plan.")
-    parser.add_argument("--input", default="docs/BIG_ORDER.txt", help="Path to BIG_ORDER-style input file.")
-    parser.add_argument(
-        "--validate-only",
-        default=None,
-        help="Validate an existing solution file and exit on first error.",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Optional explicit output path. If omitted, uses solution_<makespan>.txt.",
-    )
-    parser.add_argument(
-        "--test",
-        action="store_true",
-        help="Test mode: only keep every 10th order from the input worklist.",
-    )
-    parser.add_argument(
-        "--config",
-        default="docs/config.toml",
-        help="TOML run config with solver and path parameters. Default: docs/config.toml",
-    )
-    parser.add_argument(
-        "--metadata-run-id",
-        type=int,
-        default=None,
-        help=(
-            "Optional run ID for metadata persistence. "
-            "If omitted, inferred from solution filename suffix (e.g. *_1) or auto-incremented."
-        ),
-    )
-    args = parser.parse_args()
-
-    if args.validate_only:
-        try:
-            final_state = validate_solution_file(
-                Path(args.validate_only),
-                worklist_path=Path(args.input),
-            )
-        except ValidationError as exc:
-            print(str(exc))
-            raise SystemExit(1)
-        print(
-            f"Validation passed. Fulfilled {final_state.fulfilled_orders}/{final_state.total_orders} "
-            f"orders by timestep {final_state.next_timestep}."
+def _run_validation(validate_path: str, input_path: str) -> None:
+    try:
+        final_state = validate_solution_file(
+            Path(validate_path),
+            worklist_path=Path(input_path),
         )
-        return
+    except ValidationError as exc:
+        print(str(exc))
+        raise SystemExit(1)
+    print(
+        f"Validation passed. Fulfilled {final_state.fulfilled_orders}/{final_state.total_orders} "
+        f"orders by timestep {final_state.next_timestep}."
+    )
 
-    from jr_walker.solver import SolverConfig, WarehouseSolver
-    from jr_walker.view import WarehouseState
-    from jr_walker.writer import write_actions
-    from jr_walker.analysis import build_and_store_solution_metadata
 
-    state = WarehouseState(args.input)
-    if args.test:
-        state.orders = state.orders[::10]
-
-    run_config = RunConfig()
-    config_path = Path(args.config)
-    if config_path.exists():
-        try:
-            run_config = load_run_config(
-                config_path=config_path,
-                robot_count=len(state.robots),
-            )
-        except Exception as exc:
-            print(f"Failed to parse config {config_path}: {exc}")
-            raise SystemExit(1)
-        print(
-            "Loaded config from "
-            f"{config_path} "
-            f"(lane_width={run_config.lane_width}, "
-            f"max_time={run_config.max_time}, "
-            f"max_makespan={run_config.max_makespan}, "
-            f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "
-            f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."
-        )
-    else:
-        print(f"Config file not found at {config_path}; using solver defaults.")
-
-    output_dir = Path(run_config.output_dir)
-    output_prefix = "test_" if args.test else ""
-    temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
-    solver = WarehouseSolver(
+def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path: Path) -> WarehouseSolver:
+    return WarehouseSolver(
         state,
         SolverConfig(
             max_time=run_config.max_time,
             max_makespan=run_config.max_makespan,
             max_plan_time_seconds=run_config.max_plan_time_seconds,
-            output_path=Path(args.output) if args.output else temp_output_path,
+            output_path=Path(run_config.output_path) if run_config.output_path else temp_output_path,
             progress_every=50,
             log_path=Path(run_config.log_path),
             lane_width=run_config.lane_width,
@@ -321,7 +275,7 @@ def main():
             min_jobs_for_dock=run_config.min_jobs_for_dock,
             num_allowed_relocations=run_config.num_allowed_relocations,
             order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
-            worklist_path=Path(args.input),
+            worklist_path=Path(run_config.input_path),
             lns_enabled=run_config.lns_enabled,
             lns_iterations=run_config.lns_iterations,
             lns_window_actions=run_config.lns_window_actions,
@@ -329,15 +283,19 @@ def main():
             lns_max_shift=run_config.lns_max_shift,
         ),
     )
+
+
+def _run_pipeline(
+    solver: WarehouseSolver, run_config: RunConfig, output_dir: Path
+) -> tuple[list[tuple[int, int, str, int, int]], Exception | None]:
     solve_error: Exception | None = None
     actions: list[tuple[int, int, str, int, int]] = []
-    baseline_solution_path: Path | None = None
     try:
         if run_config.force_new_solution:
             print("Building a fresh base solution (force_new_solution=true in config)...")
             actions = solver.find_solution()
         else:
-            baseline_solution_path = find_best_existing_solution(output_dir, test_mode=args.test)
+            baseline_solution_path = find_best_existing_solution(output_dir, test_mode=run_config.test_mode)
             if baseline_solution_path is not None:
                 print(f"Using existing base solution for optimization: {baseline_solution_path}")
                 try:
@@ -348,7 +306,6 @@ def main():
                         "Falling back to fresh solve."
                     )
                     actions = []
-                    baseline_solution_path = None
 
             if not actions:
                 print("No reusable base solution found; building a fresh base solution...")
@@ -369,12 +326,23 @@ def main():
         except Exception:
             # Best-effort only; keep raw planned actions if repair fails.
             pass
+    return actions, solve_error
 
+
+def _save_and_report(
+    actions: list[tuple[int, int, str, int, int]],
+    state: WarehouseState,
+    run_config: RunConfig,
+    output_dir: Path,
+    output_prefix: str,
+    temp_output_path: Path,
+    solve_error: Exception | None,
+) -> None:
     makespan = max((t for t, _, _, _, _ in actions), default=-1)
     move_count = sum(1 for _, _, action, _, _ in actions if action == "move")
 
-    if args.output:
-        final_output_path = Path(args.output)
+    if run_config.output_path:
+        final_output_path = Path(run_config.output_path)
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
         name_prefix = f"{output_prefix}solution"
@@ -383,7 +351,7 @@ def main():
         final_output_path = make_unique_path(output_dir / f"{name_prefix}_{makespan}.txt")
 
     write_actions(actions, final_output_path)
-    if not args.output and temp_output_path.exists():
+    if not run_config.output_path and temp_output_path.exists():
         temp_output_path.unlink()
 
     metadata_run_id = None
@@ -391,9 +359,9 @@ def main():
     try:
         metadata_run_id = build_and_store_solution_metadata(
             solution_path=final_output_path,
-            worklist_path=Path(args.input),
+            worklist_path=Path(run_config.input_path),
             metadata_db_path=metadata_db_path,
-            metadata_run_id=args.metadata_run_id,
+            metadata_run_id=run_config.metadata_run_id,
         )
     except Exception as analysis_exc:
         print(f"Metadata persistence failed: {analysis_exc}")
@@ -406,6 +374,67 @@ def main():
         print(f"Wrote metadata to {metadata_db_path} (run_id={metadata_run_id})")
     if solve_error is not None:
         raise SystemExit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build a warehouse action plan.")
+    parser.add_argument(
+        "--validate-only",
+        default=None,
+        help="Validate an existing solution file and exit on first error.",
+    )
+    parser.add_argument(
+        "--config",
+        default="docs/config.toml",
+        help="TOML run config with solver and path parameters. Default: docs/config.toml",
+    )
+    args = parser.parse_args()
+
+    config_path = Path(args.config)
+    run_config = RunConfig()
+    if config_path.exists():
+        try:
+            run_config = load_run_config(config_path)
+        except Exception as exc:
+            print(f"Failed to parse config {config_path}: {exc}")
+            raise SystemExit(1)
+    else:
+        print(f"Config file not found at {config_path}; using defaults.")
+
+    if args.validate_only:
+        _run_validation(args.validate_only, run_config.input_path)
+        return
+
+    state = WarehouseState(run_config.input_path)
+    if run_config.test_mode:
+        state.orders = state.orders[::10]
+
+    if config_path.exists():
+        print(
+            "Loaded config from "
+            f"{config_path} "
+            f"(lane_width={run_config.lane_width}, "
+            f"max_time={run_config.max_time}, "
+            f"max_makespan={run_config.max_makespan}, "
+            f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "
+            f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."
+        )
+
+    output_dir = Path(run_config.output_dir)
+    output_prefix = "test_" if run_config.test_mode else ""
+    temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
+
+    solver = _build_solver(state, run_config, temp_output_path)
+    actions, solve_error = _run_pipeline(solver, run_config, output_dir)
+    _save_and_report(
+        actions,
+        state,
+        run_config,
+        output_dir,
+        output_prefix,
+        temp_output_path,
+        solve_error,
+    )
 
 
 if __name__ == "__main__":
