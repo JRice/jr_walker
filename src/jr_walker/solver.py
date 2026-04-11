@@ -76,6 +76,15 @@ class PlannedOrder:
     estimated_cost: float = float("inf")
 
 @dataclass
+class PastRunAnalysis:
+    run_id: int = -1
+    use_by_cell: Dict[Tuple[int, int], int] = field(default_factory=dict)
+    sku_cells: Dict[int, List[Tuple[int, int, int]]] = field(default_factory=dict)
+    high_use_cells: set[Tuple[int, int]] = field(default_factory=set)
+    bucket_items: Dict[str, int] = field(default_factory=dict)
+    bucket_sku_counts: Dict[str, collections.Counter] = field(default_factory=dict)
+
+@dataclass
 class SolverConfig:
     max_time: int = 50000
     max_makespan: int | None = None
@@ -107,11 +116,108 @@ class SolverConfig:
     lns_max_shift: int = 2
 
 
+def _select_best_non_test_run_id(conn: sqlite3.Connection) -> int | None:
+    row = conn.execute(
+        """
+        SELECT run_id
+        FROM metadata_runs
+        WHERE solution_path NOT LIKE '%test_solution_%'
+          AND solution_path NOT LIKE '%partial_solution_%'
+        ORDER BY makespan ASC, run_id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is not None and row[0] is not None:
+        return int(row[0])
+
+    fallback = conn.execute(
+        "SELECT run_id FROM metadata_runs ORDER BY makespan ASC, run_id DESC LIMIT 1"
+    ).fetchone()
+    if fallback is None or fallback[0] is None:
+        return None
+    return int(fallback[0])
+
+
+def _bucket_for_edge(x: int, y: int, width: int, height: int) -> str:
+    if x == 0:
+        return "left_edge"
+    if x == width - 1:
+        return "right_edge"
+    if y == 0:
+        return "top_x0_29" if x < (width // 2) else "top_x30_59"
+    if y == height - 1:
+        return "bottom_x0_29" if x < (width // 2) else "bottom_x30_59"
+    return "non_edge"
+
+
+def load_best_past_analysis(db_path: Path, width: int, height: int, pallets: Dict[Tuple[int, int], int]) -> PastRunAnalysis:
+    analysis = PastRunAnalysis()
+    if not db_path.exists():
+        return analysis
+
+    try:
+        conn = sqlite3.connect(db_path)
+        run_id = _select_best_non_test_run_id(conn)
+        if run_id is None:
+            return analysis
+        analysis.run_id = run_id
+
+        use_rows = conn.execute("SELECT x, y, use_score FROM cell_metadata WHERE run_id = ?", (run_id,)).fetchall()
+        for x, y, use_score in use_rows:
+            analysis.use_by_cell[(int(x), int(y))] = int(use_score)
+
+        sku_rows = conn.execute("SELECT x, y, sku, count FROM cell_sku_flow WHERE run_id = ?", (run_id,)).fetchall()
+        for x, y, sku, count in sku_rows:
+            analysis.sku_cells.setdefault(int(sku), []).append((int(x), int(y), int(count)))
+
+        for sku, rows in analysis.sku_cells.items():
+            rows.sort(key=lambda row: (-row[2], analysis.use_by_cell.get((row[0], row[1]), 0), row[1], row[0]))
+
+        dynamic_use_values: List[int] = []
+        for (x, y), use_score in analysis.use_by_cell.items():
+            if use_score <= 0 or (x, y) in pallets:
+                continue
+            dynamic_use_values.append(use_score)
+
+        if dynamic_use_values:
+            dynamic_use_values.sort()
+            idx = int((len(dynamic_use_values) - 1) * 0.85)
+            cutoff = dynamic_use_values[max(0, idx)]
+            for (x, y), use_score in analysis.use_by_cell.items():
+                if use_score >= cutoff and (x, y) not in pallets:
+                    analysis.high_use_cells.add((x, y))
+
+        fulfill_rows = conn.execute("SELECT x, y, skus_json FROM fulfills WHERE run_id = ?", (run_id,)).fetchall()
+        for x, y, skus_json in fulfill_rows:
+            bucket = _bucket_for_edge(int(x), int(y), width, height)
+            bucket_counter = analysis.bucket_sku_counts.setdefault(bucket, collections.Counter())
+            try:
+                sku_values = json.loads(skus_json)
+            except Exception:
+                sku_values = []
+            if not isinstance(sku_values, list):
+                continue
+            for sku_raw in sku_values:
+                try:
+                    sku = int(sku_raw)
+                except (TypeError, ValueError):
+                    continue
+                bucket_counter[sku] += 1
+                analysis.bucket_items[bucket] = analysis.bucket_items.get(bucket, 0) + 1
+    except sqlite3.Error:
+        pass
+    finally:
+        if 'conn' in locals():
+            conn.close()
+    return analysis
+
+
 class WarehouseSolver:
-    def __init__(self, warehouse_state, config: SolverConfig | None = None):
+    def __init__(self, warehouse_state, config: SolverConfig | None = None, past_analysis: PastRunAnalysis | None = None):
         self.state = warehouse_state
         self.config = config or SolverConfig()
         self.rng = random.Random(self.config.random_seed)
+        self.past_analysis = past_analysis or PastRunAnalysis()
 
         self.robots: List[RobotState] = [
             RobotState(id=rid, x=x, y=y) for rid, (x, y) in enumerate(self.state.robots)
@@ -138,13 +244,6 @@ class WarehouseSolver:
             height=self.state.height,
             hot_spots=FULFILL_HOT_SPOTS,
         )
-        self._metadata_db_path = self.config.relocation_analysis_path
-        if self._metadata_db_path is None:
-            self._metadata_db_path = self._find_default_metadata_db_path()
-        self._metadata_use_by_cell: Dict[Tuple[int, int], int] = {}
-        self._metadata_sku_cells: Dict[int, List[Tuple[int, int, int]]] = {}
-        self._metadata_high_use_cells: set[Tuple[int, int]] = set()
-        self._load_relocation_metadata()
         self.travel_lane_cells: set[Tuple[int, int]] = self._build_travel_lane_cells(
             lane_width=self.config.lane_width
         )
@@ -169,90 +268,6 @@ class WarehouseSolver:
 
         self._plan_started_monotonic = 0.0
         self._log_handle = None
-
-    def _select_best_non_test_run_id(self, conn: sqlite3.Connection) -> int | None:
-        row = conn.execute(
-            """
-            SELECT run_id
-            FROM metadata_runs
-            WHERE solution_path NOT LIKE '%test_solution_%'
-              AND solution_path NOT LIKE '%partial_solution_%'
-            ORDER BY makespan ASC, run_id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        if row is not None and row[0] is not None:
-            return int(row[0])
-
-        fallback = conn.execute(
-            "SELECT run_id FROM metadata_runs ORDER BY makespan ASC, run_id DESC LIMIT 1"
-        ).fetchone()
-        if fallback is None or fallback[0] is None:
-            return None
-        return int(fallback[0])
-
-    def _load_relocation_metadata(self) -> None:
-        path = self._metadata_db_path
-        if path is None:
-            return
-        path = Path(path)
-        if not path.exists():
-            return
-
-        conn = sqlite3.connect(path)
-        try:
-            try:
-                run_id = self._select_best_non_test_run_id(conn)
-                if run_id is None:
-                    return
-                use_rows = conn.execute(
-                    "SELECT x, y, use_score FROM cell_metadata WHERE run_id = ?",
-                    (run_id,),
-                ).fetchall()
-                for x, y, use_score in use_rows:
-                    self._metadata_use_by_cell[(int(x), int(y))] = int(use_score)
-
-                sku_rows = conn.execute(
-                    "SELECT x, y, sku, count FROM cell_sku_flow WHERE run_id = ?",
-                    (run_id,),
-                ).fetchall()
-                for x, y, sku, count in sku_rows:
-                    self._metadata_sku_cells.setdefault(int(sku), []).append(
-                        (int(x), int(y), int(count))
-                    )
-                for sku, rows in self._metadata_sku_cells.items():
-                    rows.sort(
-                        key=lambda row: (
-                            -row[2],
-                            self._metadata_use_by_cell.get((row[0], row[1]), 0),
-                            row[1],
-                            row[0],
-                        )
-                    )
-
-                # Reinforce corridor detection from metadata "use" values while ignoring currently
-                # occupied pallet cells (they can trivially dominate use due to static occupancy).
-                dynamic_use_values: List[int] = []
-                for (x, y), use_score in self._metadata_use_by_cell.items():
-                    if use_score <= 0:
-                        continue
-                    if (x, y) in self.scheduler.pallets:
-                        continue
-                    dynamic_use_values.append(use_score)
-                if dynamic_use_values:
-                    dynamic_use_values.sort()
-                    idx = int((len(dynamic_use_values) - 1) * 0.85)
-                    cutoff = dynamic_use_values[max(0, idx)]
-                    for (x, y), use_score in self._metadata_use_by_cell.items():
-                        if use_score < cutoff:
-                            continue
-                        if (x, y) in self.scheduler.pallets:
-                            continue
-                        self._metadata_high_use_cells.add((x, y))
-            except sqlite3.Error:
-                return
-        finally:
-            conn.close()
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
         self._open_log()
@@ -471,15 +486,8 @@ class WarehouseSolver:
         Pattern: plan builder that ranks relocation candidates then decorates them with targets.
         """
         forced_skus = list(dict.fromkeys(self.config.relocation_skus_to_relocate or []))
-        metadata_db_path = self._metadata_db_path
-        bucket_items: Dict[str, int] = {}
-        bucket_sku_counts: Dict[str, collections.Counter] = {}
-        if metadata_db_path is not None:
-            metadata_db_path = Path(metadata_db_path)
-            if metadata_db_path.exists():
-                bucket_items, bucket_sku_counts = self._load_bucket_stats_from_metadata_db(
-                    metadata_db_path
-                )
+        bucket_items = self.past_analysis.bucket_items
+        bucket_sku_counts = self.past_analysis.bucket_sku_counts
 
         if forced_skus:
             forced_jobs = self._build_forced_relocation_jobs(forced_skus, bucket_sku_counts)
@@ -525,7 +533,7 @@ class WarehouseSolver:
 
             score, lift, bucket, count = best
             hotspot = BUCKET_TO_HOTSPOT[bucket]
-            sku_cells = self._metadata_sku_cells.get(sku, [])
+            sku_cells = self.past_analysis.sku_cells.get(sku, [])
             if sku_cells:
                 hotspot = (sku_cells[0][0], sku_cells[0][1])
             jobs.append(
@@ -558,7 +566,7 @@ class WarehouseSolver:
                 continue
             bucket = self._choose_bucket_for_sku(sku, bucket_sku_counts)
             hotspot = BUCKET_TO_HOTSPOT[bucket]
-            sku_cells = self._metadata_sku_cells.get(sku, [])
+            sku_cells = self.past_analysis.sku_cells.get(sku, [])
             if sku_cells:
                 hotspot = (sku_cells[0][0], sku_cells[0][1])
             jobs.append(
@@ -618,63 +626,6 @@ class WarehouseSolver:
                 job.preferred_target_xy = (tx, ty)
                 planned_targets.add((tx, ty))
 
-    def _find_default_metadata_db_path(self) -> Path | None:
-        path = Path("output") / "solution_metadata.db"
-        if path.exists():
-            return path
-        return None
-
-    def _bucket_for_edge(self, x: int, y: int) -> str:
-        if x == 0:
-            return "left_edge"
-        if x == self.state.width - 1:
-            return "right_edge"
-        if y == 0:
-            return "top_x0_29" if x < (self.state.width // 2) else "top_x30_59"
-        if y == self.state.height - 1:
-            return "bottom_x0_29" if x < (self.state.width // 2) else "bottom_x30_59"
-        return "non_edge"
-
-    def _load_bucket_stats_from_metadata_db(
-        self, metadata_db_path: Path
-    ) -> Tuple[Dict[str, int], Dict[str, collections.Counter]]:
-        bucket_items: Dict[str, int] = {}
-        bucket_sku_counts: Dict[str, collections.Counter] = {}
-
-        conn = sqlite3.connect(metadata_db_path)
-        try:
-            try:
-                run_id = self._select_best_non_test_run_id(conn)
-                if run_id is None:
-                    return bucket_items, bucket_sku_counts
-                rows = conn.execute(
-                    "SELECT x, y, skus_json FROM fulfills WHERE run_id = ?",
-                    (run_id,),
-                ).fetchall()
-            except sqlite3.Error:
-                return bucket_items, bucket_sku_counts
-        finally:
-            conn.close()
-
-        for x, y, skus_json in rows:
-            bucket = self._bucket_for_edge(int(x), int(y))
-            bucket_counter = bucket_sku_counts.setdefault(bucket, collections.Counter())
-            try:
-                sku_values = json.loads(skus_json)
-            except Exception:
-                sku_values = []
-            if not isinstance(sku_values, list):
-                continue
-            for sku_raw in sku_values:
-                try:
-                    sku = int(sku_raw)
-                except (TypeError, ValueError):
-                    continue
-                bucket_counter[sku] += 1
-                bucket_items[bucket] = bucket_items.get(bucket, 0) + 1
-
-        return bucket_items, bucket_sku_counts
-
     def _is_relocation_target_cell_allowed(
         self,
         cell: Tuple[int, int],
@@ -691,7 +642,7 @@ class WarehouseSolver:
             return False
         if cell in self.travel_lane_cells:
             return False
-        if block_high_use and cell in self._metadata_high_use_cells:
+        if block_high_use and cell in self.past_analysis.high_use_cells:
             return False
         return True
 
@@ -710,7 +661,7 @@ class WarehouseSolver:
                     yield tx, ty, radius
 
     def _iter_sku_anchor_rows(self, sku: int, *, limit: int) -> List[Tuple[int, int, int]]:
-        sku_rows = self._metadata_sku_cells.get(sku, [])
+        sku_rows = self.past_analysis.sku_cells.get(sku, [])
         if not sku_rows:
             return []
         return sku_rows[: min(len(sku_rows), limit)]
@@ -740,7 +691,7 @@ class WarehouseSolver:
                     block_high_use=True,
                 ):
                     continue
-                use_score = self._metadata_use_by_cell.get(cell, 0)
+                use_score = self.past_analysis.use_by_cell.get(cell, 0)
                 key = (
                     use_score,
                     radius,
@@ -1140,7 +1091,7 @@ class WarehouseSolver:
                         cells.add((tx, ty))
 
         # Reinforce lanes using metadata high-use cells (with a 1-cell Manhattan halo).
-        for x, y in self._metadata_high_use_cells:
+        for x, y in self.past_analysis.high_use_cells:
             cells.add((x, y))
             for nx, ny in adjacent_cells(self.state.width, self.state.height, x, y):
                 cells.add((nx, ny))
@@ -1342,7 +1293,9 @@ class WarehouseSolver:
         best_makespan = max((t for t, _, _, _, _ in best), default=-1)
         attempts = 0
         accepted = 0
-        for _ in range(self.config.lns_iterations):
+        for i in range(self.config.lns_iterations):
+            if i > 0 and i % 10 == 0:
+                print(f"[lns] iteration {i}/{self.config.lns_iterations}, best makespan={best_makespan}")
             if self.config.max_plan_time_seconds > 0 and self._elapsed_plan_seconds() >= self.config.max_plan_time_seconds:
                 break
             candidate = self._lns_shift_candidate(best)

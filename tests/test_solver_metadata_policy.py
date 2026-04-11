@@ -12,10 +12,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 try:
-    from jr_walker.solver import RelocationJob, WarehouseSolver  # noqa: E402
+    from jr_walker.solver import RelocationJob, WarehouseSolver, PastRunAnalysis, _select_best_non_test_run_id  # noqa: E402
 except Exception:  # pragma: no cover - environment-dependent optional import
     RelocationJob = None
     WarehouseSolver = None
+    PastRunAnalysis = None
+    _select_best_non_test_run_id = None
 
 
 @unittest.skipIf(WarehouseSolver is None or RelocationJob is None, "solver dependencies unavailable")
@@ -32,9 +34,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver.state = SimpleNamespace(width=60, height=40)
         solver.scheduler = SimpleNamespace(pallets={})
         solver.travel_lane_cells = set()
-        solver._metadata_high_use_cells = set()
-        solver._metadata_use_by_cell = {}
-        solver._metadata_sku_cells = {}
+        solver.past_analysis = PastRunAnalysis()
         return solver
 
     def test_select_best_non_test_run_id_prefers_best_non_test(self) -> None:
@@ -53,8 +53,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
                     (4, "output/partial_solution_90.txt", 90),
                 ],
             )
-            solver = self._new_solver_shell()
-            selected = solver._select_best_non_test_run_id(conn)
+            selected = _select_best_non_test_run_id(conn)
         finally:
             conn.close()
         self.assertEqual(selected, 3)
@@ -73,8 +72,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
                     (2, "output/partial_solution_80.txt", 80),
                 ],
             )
-            solver = self._new_solver_shell()
-            selected = solver._select_best_non_test_run_id(conn)
+            selected = _select_best_non_test_run_id(conn)
         finally:
             conn.close()
         self.assertEqual(selected, 2)
@@ -83,9 +81,9 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver = self._new_solver_shell()
         solver.state = SimpleNamespace(width=3, height=3)
         solver.travel_lane_cells = {(1, 1)}
-        solver._metadata_high_use_cells = {(0, 1)}
-        solver._metadata_sku_cells = {7: [(1, 1, 50)]}
-        solver._metadata_use_by_cell = {
+        solver.past_analysis.high_use_cells = {(0, 1)}
+        solver.past_analysis.sku_cells = {7: [(1, 1, 50)]}
+        solver.past_analysis.use_by_cell = {
             (1, 0): 20,
             (2, 1): 5,
             (1, 2): 1,
@@ -104,7 +102,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
 
     def test_build_travel_lane_cells_includes_metadata_high_use_halo(self) -> None:
         solver = self._new_solver_shell()
-        solver._metadata_high_use_cells = {(15, 15)}
+        solver.past_analysis.high_use_cells = {(15, 15)}
 
         lanes = solver._build_travel_lane_cells(lane_width=0)
         self.assertIn((15, 15), lanes)

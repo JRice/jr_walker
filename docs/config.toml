@@ -19,9 +19,6 @@ test_mode = false
 # Dock-trigger threshold N: only seed dock/relocate plans for SKUs that appear
 # in each of the next N jobs.
 min_jobs_for_dock = 3
-# If true, the solver will always generate a new plan from scratch,
-# ignoring any existing solution files.
-force_new_solution = false
 
 [lns]
 enabled = true

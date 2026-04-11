@@ -11,8 +11,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from jr_walker.validator import ValidationError, validate_solution_file
-from jr_walker.solver import SolverConfig, WarehouseSolver
+from jr_walker.validator import SubmissionValidator, ValidationError
+from jr_walker.solver import SolverConfig, WarehouseSolver, PastRunAnalysis, load_best_past_analysis
 from jr_walker.view import WarehouseState
 from jr_walker.writer import write_actions
 from jr_walker.analysis import build_and_store_solution_metadata
@@ -31,47 +31,6 @@ def make_unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         i += 1
-
-
-def load_actions_from_solution(solution_path: Path) -> list[tuple[int, int, str, int, int]]:
-    actions: list[tuple[int, int, str, int, int]] = []
-    for line_no, raw in enumerate(solution_path.read_text(encoding="utf-8").splitlines(), start=1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) < 5:
-            raise ValueError(f"Invalid action row in {solution_path} at line {line_no}: {raw}")
-        t_s, rid_s, action, x_s, y_s = parts[:5]
-        try:
-            action_row = (int(t_s), int(rid_s), action.lower(), int(x_s), int(y_s))
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid numeric value in {solution_path} at line {line_no}: {raw}"
-            ) from exc
-        actions.append(action_row)
-    actions.sort(key=lambda row: (row[0], row[1]))
-    return actions
-
-
-def find_best_existing_solution(output_dir: Path, *, test_mode: bool) -> Path | None:
-    prefix = "test_solution_" if test_mode else "solution_"
-    filename_pattern = re.compile(rf"^{re.escape(prefix)}(\d+)(?:_\d+)?\.txt$")
-    candidates: list[tuple[int, float, Path]] = []
-    for path in output_dir.glob(f"{prefix}*.txt"):
-        stem = path.stem
-        if "_F" in stem:
-            continue
-        match = filename_pattern.match(path.name)
-        if not match:
-            continue
-        score = int(match.group(1))
-        candidates.append((score, path.stat().st_mtime, path))
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda row: (row[0], row[1]))
-    return candidates[0][2]
 
 
 def _parse_robot_key(raw_key: str) -> int:
@@ -101,7 +60,6 @@ class RunConfig:
     output_dir: str = "output"
     log_path: str = "output/run.log"
     metadata_db_path: str = "output/solution_metadata.db"
-    force_new_solution: bool = False
     input_path: str = "docs/BIG_ORDER.txt"
     test_mode: bool = False
     output_path: str | None = None
@@ -176,10 +134,6 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.min_jobs_for_dock",
         minimum=1,
     )
-    raw_force_new = solver_section.get("force_new_solution", run_config.force_new_solution)
-    if not isinstance(raw_force_new, bool):
-        raise ValueError("solver.force_new_solution must be a boolean.")
-    run_config.force_new_solution = raw_force_new
 
     raw_test_mode = solver_section.get("test_mode", run_config.test_mode)
     if not isinstance(raw_test_mode, bool):
@@ -245,22 +199,7 @@ def load_run_config(config_path: Path) -> RunConfig:
     return run_config
 
 
-def _run_validation(validate_path: str, input_path: str) -> None:
-    try:
-        final_state = validate_solution_file(
-            Path(validate_path),
-            worklist_path=Path(input_path),
-        )
-    except ValidationError as exc:
-        print(str(exc))
-        raise SystemExit(1)
-    print(
-        f"Validation passed. Fulfilled {final_state.fulfilled_orders}/{final_state.total_orders} "
-        f"orders by timestep {final_state.next_timestep}."
-    )
-
-
-def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path: Path) -> WarehouseSolver:
+def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path: Path, past_analysis: PastRunAnalysis) -> WarehouseSolver:
     return WarehouseSolver(
         state,
         SolverConfig(
@@ -282,6 +221,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             lns_tail_fraction=run_config.lns_tail_fraction,
             lns_max_shift=run_config.lns_max_shift,
         ),
+        past_analysis=past_analysis
     )
 
 
@@ -291,28 +231,23 @@ def _run_pipeline(
     solve_error: Exception | None = None
     actions: list[tuple[int, int, str, int, int]] = []
     try:
-        if run_config.force_new_solution:
-            print("Building a fresh base solution (force_new_solution=true in config)...")
-            actions = solver.find_solution()
-        else:
-            baseline_solution_path = find_best_existing_solution(output_dir, test_mode=run_config.test_mode)
-            if baseline_solution_path is not None:
-                print(f"Using existing base solution for optimization: {baseline_solution_path}")
-                try:
-                    actions = load_actions_from_solution(baseline_solution_path)
-                except Exception as exc:
-                    print(
-                        f"Failed to load existing base solution {baseline_solution_path}: {exc}. "
-                        "Falling back to fresh solve."
-                    )
-                    actions = []
-
-            if not actions:
-                print("No reusable base solution found; building a fresh base solution...")
-                actions = solver.find_solution()
+        print("Building a fresh base solution guided by past analysis...")
+        actions = solver.find_solution()
 
         print(f"Running LNS optimization on {len(actions)} base actions...")
         actions = solver.optimize_actions(actions)
+
+        print("Validating generated actions...")
+        validator = SubmissionValidator(worklist_path=run_config.input_path)
+        for t, rid, action, x, y in actions:
+            validator.validate_line(f"{t} {rid} {action} {x} {y}")
+        final_state = validator.finalize()
+        if final_state.fulfilled_orders != final_state.total_orders:
+            raise ValidationError(
+                f"Validation incomplete: fulfilled {final_state.fulfilled_orders}/{final_state.total_orders} orders."
+            )
+        print(f"Validation passed. Fulfilled {final_state.fulfilled_orders}/{final_state.total_orders} orders by timestep {final_state.next_timestep}.")
+
     except Exception as exc:
         solve_error = exc
         print(f"Solver/optimizer failed: {exc}")
@@ -379,11 +314,6 @@ def _save_and_report(
 def main():
     parser = argparse.ArgumentParser(description="Build a warehouse action plan.")
     parser.add_argument(
-        "--validate-only",
-        default=None,
-        help="Validate an existing solution file and exit on first error.",
-    )
-    parser.add_argument(
         "--config",
         default="docs/config.toml",
         help="TOML run config with solver and path parameters. Default: docs/config.toml",
@@ -401,9 +331,7 @@ def main():
     else:
         print(f"Config file not found at {config_path}; using defaults.")
 
-    if args.validate_only:
-        _run_validation(args.validate_only, run_config.input_path)
-        return
+    ## Main logic:
 
     state = WarehouseState(run_config.input_path)
     if run_config.test_mode:
@@ -424,7 +352,16 @@ def main():
     output_prefix = "test_" if run_config.test_mode else ""
     temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
 
-    solver = _build_solver(state, run_config, temp_output_path)
+    past_analysis = PastRunAnalysis()
+    db_path = Path(run_config.metadata_db_path)
+    if db_path.exists():
+        print("Loading analysis of the best existing solution from SQL database...")
+        past_analysis = load_best_past_analysis(db_path, state.width, state.height, state.pallets)
+        if past_analysis.run_id >= 0:
+            print(f"Loaded analysis for Run #{past_analysis.run_id}: found {len(past_analysis.high_use_cells)} high-traffic cells to avoid.")
+
+    print("Generating new Suggestions based on this analysis...")
+    solver = _build_solver(state, run_config, temp_output_path, past_analysis)
     actions, solve_error = _run_pipeline(solver, run_config, output_dir)
     _save_and_report(
         actions,
