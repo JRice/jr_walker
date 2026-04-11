@@ -100,3 +100,23 @@
 - Analysis: output\test_solution_1417_analysis.txt
 - Latest algorithm update: TODO: describe latest algorithm update
 - Validated: TODO
+## Run 2026-04-11 10:24:19
+- Mode: full
+- Input: docs\BIG_ORDER.txt
+- Orders used: 1000
+- Score (makespan): 11582
+- Move count: 46574
+- Solution: output\solution_11582_2.txt
+- Analysis: output\solution_11582_2_analysis.txt
+- Latest algorithm update: TODO: describe latest algorithm update
+- Validated: TODO
+## Run 2026-04-11 10:25:26
+- Mode: full
+- Input: docs\BIG_ORDER.txt
+- Orders used: 1000
+- Score (makespan): 11582
+- Move count: 46574
+- Solution: output\solution_11582_3.txt
+- Analysis: output\solution_11582_3_analysis.txt
+- Latest algorithm update: TODO: describe latest algorithm update
+- Validated: TODO

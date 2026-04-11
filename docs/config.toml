@@ -3,7 +3,7 @@
 # the run exits and writes partial output.
 max_makespan = 13000
 # Seconds of compute budget (10 minutes default).
-max_plan_time = 600
+max_plan_time = 900
 
 [solver]
 # Reservation horizon (space-time planner tensor depth).
@@ -21,10 +21,13 @@ max_shift = 2
 
 [relocation]
 lane_width = 3
+# Optional explicit relocation SKU order. If provided, only these SKUs are
+# used for startup relocation planning (in listed order).
+# skus_to_relocate = [1, 2, 3, 4, 5]
 
 [robots]
-robot_0 = ["relocate_pallet", "loop", "deliver_easy", "deliver_hard"]
-robot_1 = ["relocate_pallet", "loop", "deliver_hard", "deliver_easy"]
-robot_2 = ["relocate_pallet", "loop", "deliver_easy", "deliver_hard"]
-robot_3 = ["relocate_pallet", "loop", "deliver_hard", "deliver_easy"]
-robot_4 = ["relocate_pallet", "loop", "deliver_easy", "deliver_hard"]
+robot_0 = ["dock_pallet_1", "loop", "deliver_easy", "deliver_hard"]
+robot_1 = ["dock_pallet_1", "loop", "deliver_hard", "deliver_easy"]
+robot_2 = ["dock_pallet_1", "loop", "deliver_easy", "deliver_hard"]
+robot_3 = ["dock_pallet_1", "loop", "deliver_hard", "deliver_easy"]
+robot_4 = ["dock_pallet_1", "loop", "deliver_easy", "deliver_hard"]

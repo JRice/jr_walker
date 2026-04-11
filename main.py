@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime
 import tomllib
 from dataclasses import dataclass
+import re
 
 # Allow `python main.py` from repo root without installing the package.
 ROOT = Path(__file__).resolve().parent
@@ -27,6 +28,49 @@ def make_unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         i += 1
+
+
+def load_actions_from_solution(solution_path: Path) -> list[tuple[int, int, str, int, int]]:
+    actions: list[tuple[int, int, str, int, int]] = []
+    for line_no, raw in enumerate(solution_path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            raise ValueError(f"Invalid action row in {solution_path} at line {line_no}: {raw}")
+        t_s, rid_s, action, x_s, y_s = parts[:5]
+        try:
+            action_row = (int(t_s), int(rid_s), action.lower(), int(x_s), int(y_s))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid numeric value in {solution_path} at line {line_no}: {raw}"
+            ) from exc
+        actions.append(action_row)
+    actions.sort(key=lambda row: (row[0], row[1]))
+    return actions
+
+
+def find_best_existing_solution(output_dir: Path, *, test_mode: bool) -> Path | None:
+    prefix = "test_solution_" if test_mode else "solution_"
+    filename_pattern = re.compile(rf"^{re.escape(prefix)}(\d+)(?:_\d+)?\.txt$")
+    candidates: list[tuple[int, float, Path]] = []
+    for path in output_dir.glob(f"{prefix}*.txt"):
+        stem = path.stem
+        if "_analysis" in stem:
+            continue
+        if "_F" in stem:
+            continue
+        match = filename_pattern.match(path.name)
+        if not match:
+            continue
+        score = int(match.group(1))
+        candidates.append((score, path.stat().st_mtime, path))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: (row[0], row[1]))
+    return candidates[0][2]
 
 
 def append_leaderboard_entry(
@@ -79,6 +123,7 @@ def _parse_robot_key(raw_key: str) -> int:
 class RunConfig:
     role_plans_by_robot: dict[int, list[str]] | None = None
     lane_width: int = 3
+    relocation_skus_to_relocate: list[int] | None = None
     max_time: int = 50000
     max_makespan: int | None = None
     max_plan_time_seconds: float = 600.0
@@ -153,6 +198,13 @@ def load_run_config(config_path: Path, robot_count: int) -> RunConfig:
         "relocation.lane_width",
         minimum=0,
     )
+    raw_reloc_skus = relocation_section.get("skus_to_relocate", run_config.relocation_skus_to_relocate)
+    if raw_reloc_skus is not None:
+        if not isinstance(raw_reloc_skus, list) or not all(isinstance(v, int) for v in raw_reloc_skus):
+            raise ValueError("relocation.skus_to_relocate must be an array of integers.")
+        if any(v < 0 for v in raw_reloc_skus):
+            raise ValueError("relocation.skus_to_relocate cannot contain negative SKU IDs.")
+        run_config.relocation_skus_to_relocate = list(dict.fromkeys(raw_reloc_skus))
 
     solver_section = _get_table(data, "solver")
     run_config.max_time = _require_int(
@@ -254,6 +306,11 @@ def main():
         default="docs/config.toml",
         help='TOML run config with per-robot role plans and relocation params. Default: docs/config.toml',
     )
+    parser.add_argument(
+        "--find-solution",
+        action="store_true",
+        help="Force building a fresh base solution before optimization.",
+    )
     args = parser.parse_args()
 
     if args.analyze_only:
@@ -311,7 +368,8 @@ def main():
             f"(lane_width={run_config.lane_width}, "
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "
-            f"max_plan_time={run_config.max_plan_time_seconds:.1f}s)."
+            f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "
+            f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."
         )
     else:
         print(f"Config file not found at {config_path}; using solver defaults.")
@@ -333,6 +391,7 @@ def main():
             log_path=Path(args.log_path),
             role_plans_by_robot=run_config.role_plans_by_robot,
             lane_width=run_config.lane_width,
+            relocation_skus_to_relocate=run_config.relocation_skus_to_relocate,
             min_jobs_for_dock=run_config.min_jobs_for_dock,
             worklist_path=Path(args.input),
             lns_enabled=run_config.lns_enabled,
@@ -343,13 +402,40 @@ def main():
         ),
     )
     solve_error: Exception | None = None
+    actions: list[tuple[int, int, str, int, int]] = []
+    baseline_solution_path: Path | None = None
     try:
-        _, actions = solver.solve()
+        if args.find_solution:
+            print("Building a fresh base solution (--find-solution enabled)...")
+            actions = solver.find_solution()
+        else:
+            baseline_solution_path = find_best_existing_solution(output_dir, test_mode=args.test)
+            if baseline_solution_path is not None:
+                print(f"Using existing base solution for optimization: {baseline_solution_path}")
+                try:
+                    actions = load_actions_from_solution(baseline_solution_path)
+                except Exception as exc:
+                    print(
+                        f"Failed to load existing base solution {baseline_solution_path}: {exc}. "
+                        "Falling back to fresh solve."
+                    )
+                    actions = []
+                    baseline_solution_path = None
+
+            if not actions:
+                print("No reusable base solution found; building a fresh base solution...")
+                actions = solver.find_solution()
+
+        print(f"Running LNS optimization on {len(actions)} base actions...")
+        actions = solver.optimize_actions(actions)
     except Exception as exc:
         solve_error = exc
-        print(f"Solver failed: {exc}")
-        print("Writing partial output from actions planned so far...")
-        actions = solver.actions.sorted_actions()
+        print(f"Solver/optimizer failed: {exc}")
+        if actions:
+            print("Writing best-known actions from current baseline...")
+        else:
+            print("Writing partial output from actions planned so far...")
+            actions = solver.actions.sorted_actions()
         try:
             actions = solver._repair_idle_wait_conflicts(actions)
         except Exception:

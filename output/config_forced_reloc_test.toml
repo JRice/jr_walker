@@ -1,0 +1,25 @@
+[limits]
+max_makespan = 13000
+max_plan_time = 60
+
+[solver]
+max_time = 50000
+min_jobs_for_dock = 3
+
+[lns]
+enabled = true
+iterations = 5
+window_actions = 20
+tail_fraction = 0.35
+max_shift = 2
+
+[relocation]
+lane_width = 3
+skus_to_relocate = [1, 5, 7]
+
+[robots]
+robot_0 = ["relocate_pallet", "loop", "deliver_easy", "deliver_hard"]
+robot_1 = ["relocate_pallet", "loop", "deliver_hard", "deliver_easy"]
+robot_2 = ["relocate_pallet", "loop", "deliver_easy", "deliver_hard"]
+robot_3 = ["relocate_pallet", "loop", "deliver_hard", "deliver_easy"]
+robot_4 = ["relocate_pallet", "loop", "deliver_easy", "deliver_hard"]

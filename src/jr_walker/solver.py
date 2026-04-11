@@ -109,6 +109,7 @@ class SolverConfig:
     relocation_top_skus: int = 8
     relocation_min_lift: float = 0.08
     relocation_max_attempts_per_sku: int = 5
+    relocation_skus_to_relocate: List[int] | None = None
     lane_width: int = 3
     min_jobs_for_dock: int = 3
     log_path: Path | None = None
@@ -203,44 +204,9 @@ class WarehouseSolver:
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
         self._open_log()
-        self._plan_started_monotonic = time.monotonic()
-        remaining_orders = self._build_ranked_order_queue()
-        self._recalculate_order_costs(remaining_orders)
-        total_orders = len(remaining_orders)
-        completed = 0
-        dispatch_count = 0
-        self._log_solve_start(total_orders)
-
         try:
-            while remaining_orders:
-                self._check_global_limits_or_raise(remaining_orders)
-                self._inject_lookahead_relocation_jobs(remaining_orders)
-                robot = self._next_available_robot()
-                handled = self._execute_dispatch(
-                    robot=robot,
-                    remaining_orders=remaining_orders,
-                    completed=completed,
-                    total_orders=total_orders,
-                    dispatch_number=dispatch_count + 1,
-                )
-                if not handled:
-                    raise RuntimeError("Dispatcher could not assign a feasible next task.")
-
-                new_completed = total_orders - len(remaining_orders)
-                if new_completed != completed:
-                    completed = new_completed
-                    self._maybe_log_progress(
-                        completed=completed,
-                        total_orders=total_orders,
-                        dispatch_count=dispatch_count + 1,
-                    )
-                self._check_global_limits_or_raise(remaining_orders)
-
-                dispatch_count += 1
-
-            sorted_actions = self.actions.sorted_actions()
-            sorted_actions = self._repair_idle_wait_conflicts(sorted_actions)
-            sorted_actions = self._lns_improve_actions(sorted_actions)
+            base_actions = self._find_solution_actions_core()
+            sorted_actions = self._optimize_actions_core(base_actions)
             output_path = write_actions(sorted_actions, self.config.output_path)
             makespan = max((t for t, _, _, _, _ in sorted_actions), default=-1)
             self._log(
@@ -249,6 +215,77 @@ class WarehouseSolver:
             return output_path, sorted_actions
         finally:
             self._close_log()
+
+    def find_solution(self) -> List[Tuple[int, int, str, int, int]]:
+        self._open_log()
+        try:
+            return self._find_solution_actions_core()
+        finally:
+            self._close_log()
+
+    def optimize_actions(
+        self, actions: List[Tuple[int, int, str, int, int]]
+    ) -> List[Tuple[int, int, str, int, int]]:
+        self._open_log()
+        try:
+            return self._optimize_actions_core(actions)
+        finally:
+            self._close_log()
+
+    def _find_solution_actions_core(self) -> List[Tuple[int, int, str, int, int]]:
+        self._plan_started_monotonic = time.monotonic()
+        remaining_orders = self._build_ranked_order_queue()
+        self._recalculate_order_costs(remaining_orders)
+        total_orders = len(remaining_orders)
+        completed = 0
+        dispatch_count = 0
+        self._log_solve_start(total_orders)
+
+        while remaining_orders:
+            self._check_global_limits_or_raise(remaining_orders)
+            self._inject_lookahead_relocation_jobs(remaining_orders)
+            robot = self._next_available_robot()
+            handled = self._execute_dispatch(
+                robot=robot,
+                remaining_orders=remaining_orders,
+                completed=completed,
+                total_orders=total_orders,
+                dispatch_number=dispatch_count + 1,
+            )
+            if not handled:
+                raise RuntimeError("Dispatcher could not assign a feasible next task.")
+
+            new_completed = total_orders - len(remaining_orders)
+            if new_completed != completed:
+                completed = new_completed
+                self._maybe_log_progress(
+                    completed=completed,
+                    total_orders=total_orders,
+                    dispatch_count=dispatch_count + 1,
+                )
+            self._check_global_limits_or_raise(remaining_orders)
+
+            dispatch_count += 1
+
+        sorted_actions = self.actions.sorted_actions()
+        sorted_actions = self._repair_idle_wait_conflicts(sorted_actions)
+        makespan = max((t for t, _, _, _, _ in sorted_actions), default=-1)
+        self._log(
+            f"find_solution_end actions={len(sorted_actions)} makespan={makespan}"
+        )
+        return sorted_actions
+
+    def _optimize_actions_core(
+        self, actions: List[Tuple[int, int, str, int, int]]
+    ) -> List[Tuple[int, int, str, int, int]]:
+        self._plan_started_monotonic = time.monotonic()
+        repaired = self._repair_idle_wait_conflicts(list(actions))
+        improved = self._lns_improve_actions(repaired)
+        makespan = max((t for t, _, _, _, _ in improved), default=-1)
+        self._log(
+            f"optimize_end actions={len(improved)} makespan={makespan}"
+        )
+        return improved
 
     def _log_solve_start(self, total_orders: int) -> None:
         self._log(f"solve_start total_orders={total_orders}")
@@ -271,7 +308,7 @@ class WarehouseSolver:
         dispatch_number: int,
     ) -> bool:
         role_token, from_plan = self._dispatch_role(robot)
-        role, strategy = self._decode_role_token(role_token, robot.id)
+        role, strategy, forced_reloc_sku = self._decode_role_token(role_token, robot.id)
         if role == ROLE_DELIVER:
             self._ensure_warmup_barrier()
 
@@ -291,6 +328,7 @@ class WarehouseSolver:
             robot=robot,
             role=role,
             strategy=strategy,
+            forced_reloc_sku=forced_reloc_sku,
             from_plan=from_plan,
             remaining_orders=remaining_orders,
         )
@@ -313,6 +351,7 @@ class WarehouseSolver:
         robot: RobotState,
         role: str,
         strategy: str,
+        forced_reloc_sku: int | None,
         from_plan: bool,
         remaining_orders: Deque[int],
     ) -> bool:
@@ -322,7 +361,11 @@ class WarehouseSolver:
                 self._toggle_delivery_strategy(robot.id)
             return handled
 
-        handled = self._role_relocate_pallet(robot, remaining_orders)
+        handled = self._role_relocate_pallet(
+            robot,
+            remaining_orders,
+            forced_sku=forced_reloc_sku,
+        )
         if not handled:
             self._ensure_warmup_barrier()
             handled = self._deliver_with_robot_strategy(robot, remaining_orders)
@@ -444,7 +487,7 @@ class WarehouseSolver:
             if not cleaned:
                 continue
             for role in cleaned:
-                if role not in allowed:
+                if role not in allowed and self._parse_forced_relocate_role(role) is None:
                     raise ValueError(
                         f"Unknown role '{role}' in plan for robot {rid}. "
                         f"Allowed: {sorted(allowed)}"
@@ -452,17 +495,33 @@ class WarehouseSolver:
             normalized[rid] = cleaned
         return normalized
 
+    def _parse_forced_relocate_role(self, role_token: str) -> int | None:
+        token = role_token.strip().lower()
+        prefix = "dock_pallet_"
+        if not token.startswith(prefix):
+            return None
+        sku_part = token[len(prefix) :]
+        if not sku_part.isdigit():
+            return None
+        return int(sku_part)
+
     def _build_relocation_plan(self) -> Deque[RelocationJob]:
+        forced_skus = list(dict.fromkeys(self.config.relocation_skus_to_relocate or []))
         analysis_path = self.config.relocation_analysis_path
         if analysis_path is None:
             analysis_path = self._find_default_analysis_path()
-        if analysis_path is None:
-            return collections.deque()
-        analysis_path = Path(analysis_path)
-        if not analysis_path.exists():
-            return collections.deque()
+        bucket_items: Dict[str, int] = {}
+        bucket_sku_counts: Dict[str, collections.Counter] = {}
+        if analysis_path is not None:
+            analysis_path = Path(analysis_path)
+            if analysis_path.exists():
+                bucket_items, bucket_sku_counts = self._parse_analysis_file(analysis_path)
 
-        bucket_items, bucket_sku_counts = self._parse_analysis_file(analysis_path)
+        if forced_skus:
+            forced_jobs = self._build_forced_relocation_jobs(forced_skus, bucket_sku_counts)
+            self._assign_relocation_targets(forced_jobs)
+            return collections.deque(forced_jobs)
+
         tracked_buckets = [b for b in BUCKET_TO_HOTSPOT.keys() if b in bucket_items]
         total_items = sum(bucket_items.get(b, 0) for b in tracked_buckets)
         if total_items <= 0:
@@ -517,6 +576,52 @@ class WarehouseSolver:
 
         jobs.sort(key=lambda j: (-j.score, j.sku))
         jobs = jobs[: self.config.relocation_top_skus]
+        self._assign_relocation_targets(jobs)
+        return collections.deque(jobs)
+
+    def _build_forced_relocation_jobs(
+        self,
+        forced_skus: List[int],
+        bucket_sku_counts: Dict[str, collections.Counter],
+    ) -> List[RelocationJob]:
+        jobs: List[RelocationJob] = []
+        for idx, sku in enumerate(forced_skus):
+            if not self.scheduler.has_sku(sku):
+                continue
+            bucket = self._choose_bucket_for_sku(sku, bucket_sku_counts)
+            jobs.append(
+                RelocationJob(
+                    sku=sku,
+                    bucket=bucket,
+                    hotspot=BUCKET_TO_HOTSPOT[bucket],
+                    score=float(1_000_000 - idx),
+                    metadata={"forced": 1.0, "forced_rank": float(idx)},
+                )
+            )
+        return jobs
+
+    def _choose_bucket_for_sku(
+        self,
+        sku: int,
+        bucket_sku_counts: Dict[str, collections.Counter],
+    ) -> str:
+        best_bucket = None
+        best_count = 0
+        for bucket in BUCKET_TO_HOTSPOT.keys():
+            count = int(bucket_sku_counts.get(bucket, collections.Counter()).get(sku, 0))
+            if count > best_count:
+                best_count = count
+                best_bucket = bucket
+        if best_bucket is not None and best_count > 0:
+            return best_bucket
+
+        pallet_cells = self.scheduler.pallet_cells_for_sku(sku)
+        if pallet_cells:
+            px, py = pallet_cells[0]
+            return self._closest_bucket_for_cell(px, py)
+        return "left_edge"
+
+    def _assign_relocation_targets(self, jobs: List[RelocationJob]) -> None:
         planned_targets: set[Tuple[int, int]] = set()
         for job in jobs:
             offset = self._choose_unique_relocation_offset(
@@ -529,7 +634,6 @@ class WarehouseSolver:
             if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
                 job.preferred_target_xy = (tx, ty)
                 planned_targets.add((tx, ty))
-        return collections.deque(jobs)
 
     def _find_default_analysis_path(self) -> Path | None:
         output_dir = Path("output")
@@ -646,16 +750,19 @@ class WarehouseSolver:
 
         raise RuntimeError(f"Robot {robot_id} plan does not contain any dispatchable roles.")
 
-    def _decode_role_token(self, role_token: str, robot_id: int) -> Tuple[str, str]:
+    def _decode_role_token(self, role_token: str, robot_id: int) -> Tuple[str, str, int | None]:
         token = role_token.strip().lower()
+        forced_sku = self._parse_forced_relocate_role(token)
+        if forced_sku is not None:
+            return ROLE_RELOCATE_PALLET, DELIVER_EASY, forced_sku
         if token == ROLE_RELOCATE_PALLET:
-            return ROLE_RELOCATE_PALLET, DELIVER_EASY
+            return ROLE_RELOCATE_PALLET, DELIVER_EASY, None
         if token == ROLE_DELIVER:
-            return ROLE_DELIVER, DELIVER_EASY
+            return ROLE_DELIVER, DELIVER_EASY, None
         if token == ROLE_DELIVER_EASY:
-            return ROLE_DELIVER, DELIVER_EASY
+            return ROLE_DELIVER, DELIVER_EASY, None
         if token == ROLE_DELIVER_HARD:
-            return ROLE_DELIVER, DELIVER_HARD
+            return ROLE_DELIVER, DELIVER_HARD, None
         raise ValueError(f"Unknown role token '{role_token}' for robot {robot_id}")
 
     def _has_relocation_candidate(self) -> bool:
@@ -776,7 +883,15 @@ class WarehouseSolver:
                 return True
         return False
 
-    def _role_relocate_pallet(self, robot: RobotState, remaining_orders: Deque[int]) -> bool:
+    def _role_relocate_pallet(
+        self,
+        robot: RobotState,
+        remaining_orders: Deque[int],
+        forced_sku: int | None = None,
+    ) -> bool:
+        if forced_sku is not None:
+            return self._relocate_forced_sku(robot, remaining_orders, forced_sku)
+
         if not self._has_relocation_candidate():
             return False
 
@@ -812,6 +927,33 @@ class WarehouseSolver:
                 except ValueError:
                     pass
         return False
+
+    def _relocate_forced_sku(
+        self,
+        robot: RobotState,
+        remaining_orders: Deque[int],
+        forced_sku: int,
+    ) -> bool:
+        if forced_sku in self.relocated_skus:
+            return False
+        if not self.scheduler.has_sku(forced_sku):
+            return False
+        forced_job = self._build_lookahead_relocation_job(
+            sku=forced_sku,
+            hits=max(1, self.config.min_jobs_for_dock),
+        )
+        if forced_job is None:
+            return False
+        ok = self._plan_relocate_pallet_for_robot(robot=robot, job=forced_job)
+        if not ok:
+            return False
+        self._recalculate_order_costs(remaining_orders)
+        self.relocated_skus.add(forced_sku)
+        self._log(
+            f"forced_relocation_done sku={forced_sku} bucket={forced_job.bucket} "
+            f"target={forced_job.preferred_target_xy}"
+        )
+        return True
 
     def _plan_order_for_robot(
         self, order_idx: int, order: collections.Counter, robot: RobotState
