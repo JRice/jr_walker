@@ -1,7 +1,6 @@
 import sys
 from pathlib import Path
 import argparse
-from datetime import datetime
 import tomllib
 from dataclasses import dataclass
 import re
@@ -69,45 +68,6 @@ def find_best_existing_solution(output_dir: Path, *, test_mode: bool) -> Path | 
         return None
     candidates.sort(key=lambda row: (row[0], row[1]))
     return candidates[0][2]
-
-
-def append_leaderboard_entry(
-    leaderboard_path: Path,
-    *,
-    run_mode: str,
-    input_path: Path,
-    total_orders: int,
-    makespan: int,
-    move_count: int,
-    solution_path: Path,
-    metadata_db_path: Path,
-    metadata_run_id: int,
-    algorithm_update: str,
-) -> None:
-    leaderboard_path = Path(leaderboard_path)
-    leaderboard_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not leaderboard_path.exists():
-        leaderboard_path.write_text("# Leaderboard\n\n", encoding="utf-8")
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    note = algorithm_update.strip() or "TODO: describe latest algorithm update"
-    lines = [
-        f"## Run {timestamp}",
-        f"- Mode: {run_mode}",
-        f"- Input: {input_path}",
-        f"- Orders used: {total_orders}",
-        f"- Score (makespan): {makespan}",
-        f"- Move count: {move_count}",
-        f"- Solution: {solution_path}",
-        f"- Metadata DB: {metadata_db_path}",
-        f"- Metadata run_id: {metadata_run_id}",
-        f"- Latest algorithm update: {note}",
-        "- Validated: TODO",
-        "",
-    ]
-    with leaderboard_path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write("\n".join(lines))
 
 
 def _parse_robot_key(raw_key: str) -> int:
@@ -292,11 +252,6 @@ def main():
         help="Test mode: only keep every 10th order from the input worklist.",
     )
     parser.add_argument(
-        "--run-note",
-        default="",
-        help="Optional note describing the latest algorithm change for leaderboard.md.",
-    )
-    parser.add_argument(
         "--config",
         default="docs/config.toml",
         help='TOML run config with per-robot role plans and relocation params. Default: docs/config.toml',
@@ -465,28 +420,12 @@ def main():
     except Exception as analysis_exc:
         print(f"Metadata persistence failed: {analysis_exc}")
 
-    if solve_error is None and metadata_run_id is not None:
-        append_leaderboard_entry(
-            output_dir / "leaderboard.md",
-            run_mode="test-10x" if args.test else "full",
-            input_path=Path(args.input),
-            total_orders=len(state.orders),
-            makespan=makespan,
-            move_count=move_count,
-            solution_path=final_output_path,
-            metadata_db_path=metadata_db_path,
-            metadata_run_id=metadata_run_id,
-            algorithm_update=args.run_note,
-        )
-
     print(f"Wrote {len(actions)} actions to {final_output_path}")
     print(f"Move count: {move_count}")
     print(f"Plan makespan: {makespan} timesteps")
     print(f"Orders used: {len(state.orders)}")
     if metadata_run_id is not None:
         print(f"Wrote metadata to {metadata_db_path} (run_id={metadata_run_id})")
-    if solve_error is None and metadata_run_id is not None:
-        print(f"Updated leaderboard: {output_dir / 'leaderboard.md'}")
     if solve_error is not None:
         raise SystemExit(1)
 
