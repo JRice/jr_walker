@@ -498,6 +498,11 @@ class SubmissionValidator:
         return self._pallet_by_pos.get(_key(x, y))
 
     def _run_tick(self, timestep: int, actions: list[Action]) -> None:
+        """
+        Pattern: deterministic multi-phase simulation pipeline.
+        Validation precedes mutation; then actions are applied in fixed phase order:
+        undock -> pick -> dock -> move -> fulfill.
+        """
         if not actions:
             return
 

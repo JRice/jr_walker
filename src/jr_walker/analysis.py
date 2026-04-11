@@ -93,6 +93,11 @@ def _build_solution_metadata(
     actions_by_timestep: Dict[int, List[Tuple[int, str, int, int]]],
     max_timestep: int,
 ):
+    """
+    Algorithm: single-pass time-step simulation over recorded actions.
+    Pattern: phased tick pipeline matching validator semantics
+    (undock -> pick -> dock -> move -> fulfill).
+    """
     width = 60
     height = 40
     metadata = SolutionMetadata(

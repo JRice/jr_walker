@@ -342,6 +342,10 @@ class WarehouseSolver:
             self._close_log()
 
     def _find_solution_actions_core(self) -> List[Tuple[int, int, str, int, int]]:
+        """
+        Algorithm: greedy event-loop dispatcher.
+        Pattern: orchestrator loop that repeatedly assigns the next robot/task pair.
+        """
         self._plan_started_monotonic = time.monotonic()
         remaining_orders = self._build_ranked_order_queue()
         self._recalculate_order_costs(remaining_orders)
@@ -387,6 +391,10 @@ class WarehouseSolver:
     def _optimize_actions_core(
         self, actions: List[Tuple[int, int, str, int, int]]
     ) -> List[Tuple[int, int, str, int, int]]:
+        """
+        Pattern: optimization pipeline.
+        Step 1 repairs known validity issues, Step 2 applies local-search improvement (LNS).
+        """
         self._plan_started_monotonic = time.monotonic()
         repaired = self._repair_idle_wait_conflicts(list(actions))
         improved = self._lns_improve_actions(repaired)
@@ -785,6 +793,10 @@ class WarehouseSolver:
         total_orders: int,
         dispatch_number: int,
     ) -> bool:
+        """
+        Pattern: command-dispatch template.
+        Select role token, execute role with fallbacks, and emit consistent lifecycle logs.
+        """
         role_token, from_plan = self._dispatch_role(robot)
         role, strategy, forced_reloc_sku = self._decode_role_token(role_token, robot.id)
         if role == ROLE_DELIVER:
@@ -987,6 +999,10 @@ class WarehouseSolver:
         return int(sku_part)
 
     def _build_relocation_plan(self) -> Deque[RelocationJob]:
+        """
+        Algorithm: weighted lift heuristic over bucket-level SKU frequencies.
+        Pattern: plan builder that ranks relocation candidates then decorates them with targets.
+        """
         forced_skus = list(dict.fromkeys(self.config.relocation_skus_to_relocate or []))
         metadata_db_path = self._metadata_db_path
         bucket_items: Dict[str, int] = {}
@@ -1238,6 +1254,10 @@ class WarehouseSolver:
         job: RelocationJob,
         reserved_targets: set[Tuple[int, int]],
     ) -> Tuple[int, int] | None:
+        """
+        Algorithm: constrained nearest-neighbor search on Manhattan rings.
+        Optimizes for low-use cells near high SKU-flow anchors under lane/occupancy constraints.
+        """
         anchor_rows = self._iter_sku_anchor_rows(job.sku, limit=24)
         if not anchor_rows:
             return None
@@ -1318,6 +1338,10 @@ class WarehouseSolver:
         self._log(f"warmup_barrier floor_t={self._dispatch_floor_t}")
 
     def _dispatch_role(self, robot: RobotState) -> Tuple[str, bool]:
+        """
+        Pattern: strategy selection (policy-based dispatch).
+        Chooses between planned-role strategy, relocation strategy, or delivery strategy.
+        """
         planned = self._next_role_from_plan(robot.id)
         if planned is not None:
             return planned, True
@@ -1474,6 +1498,10 @@ class WarehouseSolver:
         return bucket
 
     def _role_deliver(self, robot: RobotState, remaining_orders: Deque[int], strategy: str) -> bool:
+        """
+        Algorithm: greedy best-first attempt over a bounded candidate window.
+        The ranking key switches by strategy ('easy' vs 'hard').
+        """
         if not remaining_orders:
             return False
         if strategy not in {DELIVER_EASY, DELIVER_HARD}:
@@ -2074,6 +2102,7 @@ class WarehouseSolver:
     def _safe_plan_path(
         self, robot: RobotState, target_x: int, target_y: int
     ) -> List[Tuple[int, int, int]]:
+        """Adapter boundary for planner pathfinding (Space-Time A* in ReservationPlanner)."""
         return self.planner.plan_path(
             robot,
             target_x,
@@ -2142,6 +2171,10 @@ class WarehouseSolver:
     def _lns_improve_actions(
         self, actions: List[Tuple[int, int, str, int, int]]
     ) -> List[Tuple[int, int, str, int, int]]:
+        """
+        Algorithm: Large Neighborhood Search (LNS).
+        Repeatedly samples a tail-window shift neighborhood and accepts improving valid moves.
+        """
         if not self.config.lns_enabled:
             return actions
         if self.config.lns_iterations <= 0:
