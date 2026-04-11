@@ -169,6 +169,14 @@ class WarehouseSolver:
             height=self.state.height,
             hot_spots=FULFILL_HOT_SPOTS,
         )
+        self._metadata_db_path = self.config.relocation_analysis_path
+        if self._metadata_db_path is None:
+            self._metadata_db_path = self._find_default_metadata_db_path()
+        self._metadata_best_run_id: int | None = None
+        self._metadata_use_by_cell: Dict[Tuple[int, int], int] = {}
+        self._metadata_sku_cells: Dict[int, List[Tuple[int, int, int]]] = {}
+        self._metadata_high_use_cells: set[Tuple[int, int]] = set()
+        self._load_relocation_metadata()
         self.travel_lane_cells: set[Tuple[int, int]] = self._build_travel_lane_cells(
             lane_width=self.config.lane_width
         )
@@ -218,6 +226,92 @@ class WarehouseSolver:
         self._forced_dock_failures: Dict[Tuple[int, int], int] = collections.defaultdict(int)
         self._forced_dock_cooldown_until_dispatch: Dict[Tuple[int, int], int] = {}
         self._log_handle = None
+
+    def _select_best_non_test_run_id(self, conn: sqlite3.Connection) -> int | None:
+        row = conn.execute(
+            """
+            SELECT run_id
+            FROM metadata_runs
+            WHERE solution_path NOT LIKE '%test_solution_%'
+              AND solution_path NOT LIKE '%partial_solution_%'
+            ORDER BY makespan ASC, run_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is not None and row[0] is not None:
+            return int(row[0])
+
+        fallback = conn.execute(
+            "SELECT run_id FROM metadata_runs ORDER BY makespan ASC, run_id DESC LIMIT 1"
+        ).fetchone()
+        if fallback is None or fallback[0] is None:
+            return None
+        return int(fallback[0])
+
+    def _load_relocation_metadata(self) -> None:
+        path = self._metadata_db_path
+        if path is None:
+            return
+        path = Path(path)
+        if not path.exists():
+            return
+
+        conn = sqlite3.connect(path)
+        try:
+            try:
+                run_id = self._select_best_non_test_run_id(conn)
+                if run_id is None:
+                    return
+                self._metadata_best_run_id = run_id
+
+                use_rows = conn.execute(
+                    "SELECT x, y, use_score FROM cell_metadata WHERE run_id = ?",
+                    (run_id,),
+                ).fetchall()
+                for x, y, use_score in use_rows:
+                    self._metadata_use_by_cell[(int(x), int(y))] = int(use_score)
+
+                sku_rows = conn.execute(
+                    "SELECT x, y, sku, count FROM cell_sku_flow WHERE run_id = ?",
+                    (run_id,),
+                ).fetchall()
+                for x, y, sku, count in sku_rows:
+                    self._metadata_sku_cells.setdefault(int(sku), []).append(
+                        (int(x), int(y), int(count))
+                    )
+                for sku, rows in self._metadata_sku_cells.items():
+                    rows.sort(
+                        key=lambda row: (
+                            -row[2],
+                            self._metadata_use_by_cell.get((row[0], row[1]), 0),
+                            row[1],
+                            row[0],
+                        )
+                    )
+
+                # Reinforce corridor detection from metadata "use" values while ignoring currently
+                # occupied pallet cells (they can trivially dominate use due to static occupancy).
+                dynamic_use_values: List[int] = []
+                for (x, y), use_score in self._metadata_use_by_cell.items():
+                    if use_score <= 0:
+                        continue
+                    if (x, y) in self.scheduler.pallets:
+                        continue
+                    dynamic_use_values.append(use_score)
+                if dynamic_use_values:
+                    dynamic_use_values.sort()
+                    idx = int((len(dynamic_use_values) - 1) * 0.85)
+                    cutoff = dynamic_use_values[max(0, idx)]
+                    for (x, y), use_score in self._metadata_use_by_cell.items():
+                        if use_score < cutoff:
+                            continue
+                        if (x, y) in self.scheduler.pallets:
+                            continue
+                        self._metadata_high_use_cells.add((x, y))
+            except sqlite3.Error:
+                return
+        finally:
+            conn.close()
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
         self._open_log()
@@ -897,9 +991,7 @@ class WarehouseSolver:
 
     def _build_relocation_plan(self) -> Deque[RelocationJob]:
         forced_skus = list(dict.fromkeys(self.config.relocation_skus_to_relocate or []))
-        metadata_db_path = self.config.relocation_analysis_path
-        if metadata_db_path is None:
-            metadata_db_path = self._find_default_metadata_db_path()
+        metadata_db_path = self._metadata_db_path
         bucket_items: Dict[str, int] = {}
         bucket_sku_counts: Dict[str, collections.Counter] = {}
         if metadata_db_path is not None:
@@ -952,11 +1044,15 @@ class WarehouseSolver:
                 continue
 
             score, lift, bucket, count = best
+            hotspot = BUCKET_TO_HOTSPOT[bucket]
+            sku_cells = self._metadata_sku_cells.get(sku, [])
+            if sku_cells:
+                hotspot = (sku_cells[0][0], sku_cells[0][1])
             jobs.append(
                 RelocationJob(
                     sku=sku,
                     bucket=bucket,
-                    hotspot=BUCKET_TO_HOTSPOT[bucket],
+                    hotspot=hotspot,
                     score=float(score),
                     metadata={
                         "lift": float(lift),
@@ -981,11 +1077,15 @@ class WarehouseSolver:
             if not self.scheduler.has_sku(sku):
                 continue
             bucket = self._choose_bucket_for_sku(sku, bucket_sku_counts)
+            hotspot = BUCKET_TO_HOTSPOT[bucket]
+            sku_cells = self._metadata_sku_cells.get(sku, [])
+            if sku_cells:
+                hotspot = (sku_cells[0][0], sku_cells[0][1])
             jobs.append(
                 RelocationJob(
                     sku=sku,
                     bucket=bucket,
-                    hotspot=BUCKET_TO_HOTSPOT[bucket],
+                    hotspot=hotspot,
                     score=float(1_000_000 - idx),
                     metadata={"forced": 1.0, "forced_rank": float(idx)},
                 )
@@ -1016,6 +1116,17 @@ class WarehouseSolver:
     def _assign_relocation_targets(self, jobs: List[RelocationJob]) -> None:
         planned_targets: set[Tuple[int, int]] = set()
         for job in jobs:
+            target_xy = self._choose_metadata_guided_relocation_target(
+                job=job,
+                reserved_targets=planned_targets,
+            )
+            if target_xy is not None:
+                tx, ty = target_xy
+                job.preferred_target_xy = target_xy
+                job.placement_offset = (tx - job.hotspot[0], ty - job.hotspot[1])
+                planned_targets.add(target_xy)
+                continue
+
             offset = self._choose_unique_relocation_offset(
                 bucket=job.bucket,
                 hotspot=job.hotspot,
@@ -1052,14 +1163,16 @@ class WarehouseSolver:
 
         conn = sqlite3.connect(metadata_db_path)
         try:
-            row = conn.execute("SELECT MAX(run_id) FROM metadata_runs").fetchone()
-            if row is None or row[0] is None:
+            try:
+                run_id = self._select_best_non_test_run_id(conn)
+                if run_id is None:
+                    return bucket_items, bucket_sku_counts
+                rows = conn.execute(
+                    "SELECT x, y, skus_json FROM fulfills WHERE run_id = ?",
+                    (run_id,),
+                ).fetchall()
+            except sqlite3.Error:
                 return bucket_items, bucket_sku_counts
-            run_id = int(row[0])
-            rows = conn.execute(
-                "SELECT x, y, skus_json FROM fulfills WHERE run_id = ?",
-                (run_id,),
-            ).fetchall()
         finally:
             conn.close()
 
@@ -1081,6 +1194,108 @@ class WarehouseSolver:
                 bucket_items[bucket] = bucket_items.get(bucket, 0) + 1
 
         return bucket_items, bucket_sku_counts
+
+    def _is_relocation_target_cell_allowed(
+        self,
+        cell: Tuple[int, int],
+        *,
+        reserved_targets: set[Tuple[int, int]],
+        block_high_use: bool = True,
+    ) -> bool:
+        x, y = cell
+        if not (0 <= x < self.state.width and 0 <= y < self.state.height):
+            return False
+        if cell in self.scheduler.pallets:
+            return False
+        if cell in reserved_targets:
+            return False
+        if cell in self.travel_lane_cells:
+            return False
+        if block_high_use and cell in self._metadata_high_use_cells:
+            return False
+        return True
+
+    def _choose_metadata_guided_relocation_target(
+        self,
+        *,
+        job: RelocationJob,
+        reserved_targets: set[Tuple[int, int]],
+    ) -> Tuple[int, int] | None:
+        sku_rows = self._metadata_sku_cells.get(job.sku, [])
+        if not sku_rows:
+            return None
+
+        best: Tuple[int, int] | None = None
+        best_key: Tuple[int, int, int, int] | None = None
+        anchor_limit = min(len(sku_rows), 24)
+        for sx, sy, sku_count in sku_rows[:anchor_limit]:
+            for radius in range(0, 10):
+                for tx in range(max(0, sx - radius), min(self.state.width - 1, sx + radius) + 1):
+                    for ty in range(max(0, sy - radius), min(self.state.height - 1, sy + radius) + 1):
+                        if abs(tx - sx) + abs(ty - sy) != radius:
+                            continue
+                        cell = (tx, ty)
+                        if not self._is_relocation_target_cell_allowed(
+                            cell,
+                            reserved_targets=reserved_targets,
+                            block_high_use=True,
+                        ):
+                            continue
+                        use_score = self._metadata_use_by_cell.get(cell, 0)
+                        key = (
+                            use_score,
+                            abs(tx - sx) + abs(ty - sy),
+                            abs(tx - job.hotspot[0]) + abs(ty - job.hotspot[1]),
+                            -sku_count,
+                        )
+                        if best_key is None or key < best_key:
+                            best_key = key
+                            best = cell
+
+        if best is not None:
+            return best
+
+        # If no strict low-use option exists, retry allowing high-use (still avoids lanes).
+        for sx, sy, _ in sku_rows[:anchor_limit]:
+            for radius in range(0, 12):
+                for tx in range(max(0, sx - radius), min(self.state.width - 1, sx + radius) + 1):
+                    for ty in range(max(0, sy - radius), min(self.state.height - 1, sy + radius) + 1):
+                        if abs(tx - sx) + abs(ty - sy) != radius:
+                            continue
+                        cell = (tx, ty)
+                        if self._is_relocation_target_cell_allowed(
+                            cell,
+                            reserved_targets=reserved_targets,
+                            block_high_use=False,
+                        ):
+                            return cell
+        return None
+
+    def _metadata_candidate_targets_for_sku(self, sku: int, limit: int = 64) -> List[Tuple[int, int]]:
+        out: List[Tuple[int, int]] = []
+        seen: set[Tuple[int, int]] = set()
+        sku_rows = self._metadata_sku_cells.get(sku, [])
+        if not sku_rows:
+            return out
+
+        for sx, sy, _ in sku_rows[: min(len(sku_rows), 18)]:
+            for radius in range(0, 5):
+                for tx in range(max(0, sx - radius), min(self.state.width - 1, sx + radius) + 1):
+                    for ty in range(max(0, sy - radius), min(self.state.height - 1, sy + radius) + 1):
+                        if abs(tx - sx) + abs(ty - sy) != radius:
+                            continue
+                        cell = (tx, ty)
+                        if cell in seen:
+                            continue
+                        if cell in self.scheduler.pallets:
+                            continue
+                        if cell in self.travel_lane_cells:
+                            continue
+                        seen.add(cell)
+                        out.append(cell)
+                        if len(out) >= limit:
+                            return out
+        return out
 
     def _next_available_robot(self) -> RobotState:
         return min(self.robots, key=lambda r: (r.last_t, r.id))
@@ -1214,8 +1429,11 @@ class WarehouseSolver:
         if not pallets:
             return None
         anchor_xy = pallets[0]
+        sku_cells = self._metadata_sku_cells.get(sku, [])
+        if sku_cells:
+            anchor_xy = (sku_cells[0][0], sku_cells[0][1])
         bucket = self._closest_bucket_for_cell(anchor_xy[0], anchor_xy[1])
-        hotspot = BUCKET_TO_HOTSPOT[bucket]
+        hotspot = anchor_xy
         score = float(hits * 10)
         job = RelocationJob(sku=sku, bucket=bucket, hotspot=hotspot, score=score)
 
@@ -1223,15 +1441,24 @@ class WarehouseSolver:
         for queued in self.relocation_plan:
             if queued.preferred_target_xy is not None:
                 reserved.add(queued.preferred_target_xy)
-        offset = self._choose_unique_relocation_offset(
-            bucket=job.bucket,
-            hotspot=job.hotspot,
+        target_xy = self._choose_metadata_guided_relocation_target(
+            job=job,
             reserved_targets=reserved,
         )
-        job.placement_offset = offset
-        tx, ty = hotspot[0] + offset[0], hotspot[1] + offset[1]
-        if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
-            job.preferred_target_xy = (tx, ty)
+        if target_xy is None:
+            offset = self._choose_unique_relocation_offset(
+                bucket=job.bucket,
+                hotspot=job.hotspot,
+                reserved_targets=reserved,
+            )
+            job.placement_offset = offset
+            tx, ty = hotspot[0] + offset[0], hotspot[1] + offset[1]
+            if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
+                job.preferred_target_xy = (tx, ty)
+        else:
+            tx, ty = target_xy
+            job.preferred_target_xy = target_xy
+            job.placement_offset = (tx - hotspot[0], ty - hotspot[1])
         return job
 
     def _closest_bucket_for_cell(self, x: int, y: int) -> str:
@@ -1673,6 +1900,12 @@ class WarehouseSolver:
                     if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
                         cells.add((tx, ty))
 
+        # Reinforce lanes using metadata high-use cells (with a 1-cell Manhattan halo).
+        for x, y in self._metadata_high_use_cells:
+            cells.add((x, y))
+            for nx, ny in adjacent_cells(self.state.width, self.state.height, x, y):
+                cells.add((nx, ny))
+
         return cells
 
     def _score_relocation_target(
@@ -1739,6 +1972,9 @@ class WarehouseSolver:
 
         if job.preferred_target_xy is not None:
             push(job.preferred_target_xy)
+
+        for cell in self._metadata_candidate_targets_for_sku(job.sku):
+            push(cell)
 
         for dx, dy in self._edge_offset_candidates(job.bucket, max_depth=8, max_span=14):
             push((job.hotspot[0] + dx, job.hotspot[1] + dy))
