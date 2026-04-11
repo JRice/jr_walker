@@ -1,3 +1,24 @@
+[limits]
+# Hard stop on produced plan length. If exceeded before finishing all orders,
+# the run exits and writes partial output.
+max_makespan = 13000
+# Seconds of compute budget (10 minutes default).
+max_plan_time = 600
+
+[solver]
+# Reservation horizon (space-time planner tensor depth).
+max_time = 50000
+# Dock-trigger threshold N: only seed dock/relocate plans for SKUs that appear
+# in each of the next N jobs.
+min_jobs_for_dock = 3
+
+[lns]
+enabled = true
+iterations = 60
+window_actions = 28
+tail_fraction = 0.35
+max_shift = 2
+
 [relocation]
 lane_width = 3
 

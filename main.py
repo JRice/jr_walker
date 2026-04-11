@@ -3,6 +3,7 @@ from pathlib import Path
 import argparse
 from datetime import datetime
 import tomllib
+from dataclasses import dataclass
 
 # Allow `python main.py` from repo root without installing the package.
 ROOT = Path(__file__).resolve().parent
@@ -74,45 +75,138 @@ def _parse_robot_key(raw_key: str) -> int:
     return int(key)
 
 
-def load_run_config(config_path: Path, robot_count: int) -> tuple[dict[int, list[str]], int]:
+@dataclass
+class RunConfig:
+    role_plans_by_robot: dict[int, list[str]] | None = None
+    lane_width: int = 3
+    max_time: int = 50000
+    max_makespan: int | None = None
+    max_plan_time_seconds: float = 600.0
+    min_jobs_for_dock: int = 3
+    lns_enabled: bool = True
+    lns_iterations: int = 60
+    lns_window_actions: int = 28
+    lns_tail_fraction: float = 0.35
+    lns_max_shift: int = 2
+
+
+def _get_table(data: dict, key: str) -> dict:
+    section = data.get(key, {})
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ValueError(f"If present, [{key}] must be a table.")
+    return section
+
+
+def _require_int(value, field_name: str, *, minimum: int | None = None) -> int:
+    if not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer.")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}.")
+    return value
+
+
+def _require_number(value, field_name: str, *, minimum: float | None = None) -> float:
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a number.")
+    out = float(value)
+    if minimum is not None and out < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}.")
+    return out
+
+
+def load_run_config(config_path: Path, robot_count: int) -> RunConfig:
     with config_path.open("rb") as handle:
         data = tomllib.load(handle)
 
+    run_config = RunConfig()
+
     robots_section = data.get("robots")
-    if not isinstance(robots_section, dict):
-        raise ValueError('Dispatch config must contain a [robots] table.')
+    if robots_section is not None:
+        if not isinstance(robots_section, dict):
+            raise ValueError('If present, [robots] must be a table.')
+        plans: dict[int, list[str]] = {}
+        for raw_key, raw_roles in robots_section.items():
+            robot_id = _parse_robot_key(str(raw_key))
+            if robot_id < 0 or robot_id >= robot_count:
+                raise ValueError(
+                    f"Dispatch config references robot {robot_id}, but valid IDs are 0..{robot_count - 1}."
+                )
+            if not isinstance(raw_roles, list) or not all(isinstance(role, str) for role in raw_roles):
+                raise ValueError(
+                    f'Roles for "{raw_key}" must be an array of strings.'
+                )
+            cleaned = [role.strip().lower() for role in raw_roles if role.strip()]
+            if not cleaned:
+                raise ValueError(f'Roles for "{raw_key}" cannot be empty.')
+            plans[robot_id] = cleaned
 
-    plans: dict[int, list[str]] = {}
-    for raw_key, raw_roles in robots_section.items():
-        robot_id = _parse_robot_key(str(raw_key))
-        if robot_id < 0 or robot_id >= robot_count:
-            raise ValueError(
-                f"Dispatch config references robot {robot_id}, but valid IDs are 0..{robot_count - 1}."
-            )
-        if not isinstance(raw_roles, list) or not all(isinstance(role, str) for role in raw_roles):
-            raise ValueError(
-                f'Roles for "{raw_key}" must be an array of strings.'
-            )
-        cleaned = [role.strip().lower() for role in raw_roles if role.strip()]
-        if not cleaned:
-            raise ValueError(f'Roles for "{raw_key}" cannot be empty.')
-        plans[robot_id] = cleaned
+        missing = [rid for rid in range(robot_count) if rid not in plans]
+        if missing:
+            raise ValueError(f"Dispatch config is missing role plans for robots: {missing}")
+        run_config.role_plans_by_robot = plans
 
-    missing = [rid for rid in range(robot_count) if rid not in plans]
-    if missing:
-        raise ValueError(f"Dispatch config is missing role plans for robots: {missing}")
+    relocation_section = _get_table(data, "relocation")
+    run_config.lane_width = _require_int(
+        relocation_section.get("lane_width", run_config.lane_width),
+        "relocation.lane_width",
+        minimum=0,
+    )
 
-    relocation_section = data.get("relocation", {})
-    if relocation_section is None:
-        relocation_section = {}
-    if not isinstance(relocation_section, dict):
-        raise ValueError('If present, [relocation] must be a table.')
+    solver_section = _get_table(data, "solver")
+    run_config.max_time = _require_int(
+        solver_section.get("max_time", run_config.max_time),
+        "solver.max_time",
+        minimum=2,
+    )
+    run_config.min_jobs_for_dock = _require_int(
+        solver_section.get("min_jobs_for_dock", run_config.min_jobs_for_dock),
+        "solver.min_jobs_for_dock",
+        minimum=1,
+    )
 
-    lane_width = relocation_section.get("lane_width", 3)
-    if not isinstance(lane_width, int) or lane_width < 0:
-        raise ValueError("relocation.lane_width must be a non-negative integer.")
+    limits_section = _get_table(data, "limits")
+    raw_max_makespan = limits_section.get("max_makespan", run_config.max_makespan)
+    if raw_max_makespan is not None:
+        run_config.max_makespan = _require_int(raw_max_makespan, "limits.max_makespan", minimum=0)
 
-    return plans, lane_width
+    # `max_plan_time` is in seconds.
+    run_config.max_plan_time_seconds = _require_number(
+        limits_section.get("max_plan_time", run_config.max_plan_time_seconds),
+        "limits.max_plan_time",
+        minimum=1.0,
+    )
+
+    lns_section = _get_table(data, "lns")
+    raw_lns_enabled = lns_section.get("enabled", run_config.lns_enabled)
+    if not isinstance(raw_lns_enabled, bool):
+        raise ValueError("lns.enabled must be a boolean.")
+    run_config.lns_enabled = raw_lns_enabled
+    run_config.lns_iterations = _require_int(
+        lns_section.get("iterations", run_config.lns_iterations),
+        "lns.iterations",
+        minimum=0,
+    )
+    run_config.lns_window_actions = _require_int(
+        lns_section.get("window_actions", run_config.lns_window_actions),
+        "lns.window_actions",
+        minimum=1,
+    )
+    run_config.lns_tail_fraction = _require_number(
+        lns_section.get("tail_fraction", run_config.lns_tail_fraction),
+        "lns.tail_fraction",
+        minimum=0.0,
+    )
+    if run_config.lns_tail_fraction > 1.0:
+        raise ValueError("lns.tail_fraction must be <= 1.0.")
+    run_config.lns_max_shift = _require_int(
+        lns_section.get("max_shift", run_config.lns_max_shift),
+        "lns.max_shift",
+        minimum=1,
+    )
+
+    return run_config
 
 
 def main():
@@ -137,8 +231,8 @@ def main():
     parser.add_argument(
         "--max-time",
         type=int,
-        default=13000,
-        help="Reservation horizon in timesteps.",
+        default=None,
+        help="Optional override for solver.max_time (reservation horizon) from config.toml.",
     )
     parser.add_argument(
         "--log-path",
@@ -200,12 +294,11 @@ def main():
     if args.test:
         state.orders = state.orders[::10]
 
-    role_plans_by_robot = None
-    lane_width = 3
+    run_config = RunConfig()
     config_path = Path(args.config)
     if config_path.exists():
         try:
-            role_plans_by_robot, lane_width = load_run_config(
+            run_config = load_run_config(
                 config_path=config_path,
                 robot_count=len(state.robots),
             )
@@ -213,11 +306,18 @@ def main():
             print(f"Failed to parse config {config_path}: {exc}")
             raise SystemExit(1)
         print(
-            f"Loaded config from {config_path} for {len(role_plans_by_robot)} robots "
-            f"(lane_width={lane_width})."
+            "Loaded config from "
+            f"{config_path} "
+            f"(lane_width={run_config.lane_width}, "
+            f"max_time={run_config.max_time}, "
+            f"max_makespan={run_config.max_makespan}, "
+            f"max_plan_time={run_config.max_plan_time_seconds:.1f}s)."
         )
     else:
         print(f"Config file not found at {config_path}; using solver defaults.")
+
+    if args.max_time is not None:
+        run_config.max_time = args.max_time
 
     output_dir = Path(args.output_dir)
     output_prefix = "test_" if args.test else ""
@@ -225,12 +325,21 @@ def main():
     solver = WarehouseSolver(
         state,
         SolverConfig(
-            max_time=args.max_time,
+            max_time=run_config.max_time,
+            max_makespan=run_config.max_makespan,
+            max_plan_time_seconds=run_config.max_plan_time_seconds,
             output_path=Path(args.output) if args.output else temp_output_path,
             progress_every=50,
             log_path=Path(args.log_path),
-            role_plans_by_robot=role_plans_by_robot,
-            lane_width=lane_width,
+            role_plans_by_robot=run_config.role_plans_by_robot,
+            lane_width=run_config.lane_width,
+            min_jobs_for_dock=run_config.min_jobs_for_dock,
+            worklist_path=Path(args.input),
+            lns_enabled=run_config.lns_enabled,
+            lns_iterations=run_config.lns_iterations,
+            lns_window_actions=run_config.lns_window_actions,
+            lns_tail_fraction=run_config.lns_tail_fraction,
+            lns_max_shift=run_config.lns_max_shift,
         ),
     )
     solve_error: Exception | None = None

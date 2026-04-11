@@ -10,6 +10,7 @@ from jr_walker.planner import adjacent_cells
 from jr_walker.planner import ReservationPlanner
 from jr_walker.scheduler import GreedyScheduler
 from jr_walker.sim import ActionLog, RobotState
+from jr_walker.validator import SubmissionValidator, ValidationError
 from jr_walker.writer import write_actions
 
 ROLE_DELIVER = "deliver"
@@ -92,6 +93,8 @@ class RobotRoleCursor:
 @dataclass
 class SolverConfig:
     max_time: int = 50000
+    max_makespan: int | None = None
+    max_plan_time_seconds: float = 600.0
     progress_every: int = 50
     output_path: Path = Path("output/solution.txt")
     initial_relocate_dispatches: int = 8
@@ -107,8 +110,15 @@ class SolverConfig:
     relocation_min_lift: float = 0.08
     relocation_max_attempts_per_sku: int = 5
     lane_width: int = 3
+    min_jobs_for_dock: int = 3
     log_path: Path | None = None
     dispatch_log_every: int = 1
+    worklist_path: Path = Path("docs/BIG_ORDER.txt")
+    lns_enabled: bool = True
+    lns_iterations: int = 60
+    lns_window_actions: int = 28
+    lns_tail_fraction: float = 0.35
+    lns_max_shift: int = 2
     role_plans_by_robot: Dict[int, List[str]] | None = None
 
 
@@ -187,15 +197,60 @@ class WarehouseSolver:
         self._initial_relocate_assigned = 0
         self._dispatch_floor_t = -1
         self._warmup_barrier_applied = False
+        self._lookahead_relocation_seeded_skus: set[int] = set()
+        self._plan_started_monotonic = 0.0
         self._log_handle = None
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
         self._open_log()
+        self._plan_started_monotonic = time.monotonic()
         remaining_orders = self._build_ranked_order_queue()
         self._recalculate_order_costs(remaining_orders)
         total_orders = len(remaining_orders)
         completed = 0
         dispatch_count = 0
+        self._log_solve_start(total_orders)
+
+        try:
+            while remaining_orders:
+                self._check_global_limits_or_raise(remaining_orders)
+                self._inject_lookahead_relocation_jobs(remaining_orders)
+                robot = self._next_available_robot()
+                handled = self._execute_dispatch(
+                    robot=robot,
+                    remaining_orders=remaining_orders,
+                    completed=completed,
+                    total_orders=total_orders,
+                    dispatch_number=dispatch_count + 1,
+                )
+                if not handled:
+                    raise RuntimeError("Dispatcher could not assign a feasible next task.")
+
+                new_completed = total_orders - len(remaining_orders)
+                if new_completed != completed:
+                    completed = new_completed
+                    self._maybe_log_progress(
+                        completed=completed,
+                        total_orders=total_orders,
+                        dispatch_count=dispatch_count + 1,
+                    )
+                self._check_global_limits_or_raise(remaining_orders)
+
+                dispatch_count += 1
+
+            sorted_actions = self.actions.sorted_actions()
+            sorted_actions = self._repair_idle_wait_conflicts(sorted_actions)
+            sorted_actions = self._lns_improve_actions(sorted_actions)
+            output_path = write_actions(sorted_actions, self.config.output_path)
+            makespan = max((t for t, _, _, _, _ in sorted_actions), default=-1)
+            self._log(
+                f"solve_end actions={len(sorted_actions)} makespan={makespan} output={output_path}"
+            )
+            return output_path, sorted_actions
+        finally:
+            self._close_log()
+
+    def _log_solve_start(self, total_orders: int) -> None:
         self._log(f"solve_start total_orders={total_orders}")
         if self.relocation_plan:
             summary = ", ".join(
@@ -206,76 +261,145 @@ class WarehouseSolver:
         else:
             self._log("relocation_plan count=0")
 
-        try:
-            while remaining_orders:
-                robot = self._next_available_robot()
-                role_token, from_plan = self._dispatch_role(robot)
-                role, strategy = self._decode_role_token(role_token, robot.id)
-                if role == ROLE_DELIVER:
-                    self._ensure_warmup_barrier()
+    def _execute_dispatch(
+        self,
+        *,
+        robot: RobotState,
+        remaining_orders: Deque[int],
+        completed: int,
+        total_orders: int,
+        dispatch_number: int,
+    ) -> bool:
+        role_token, from_plan = self._dispatch_role(robot)
+        role, strategy = self._decode_role_token(role_token, robot.id)
+        if role == ROLE_DELIVER:
+            self._ensure_warmup_barrier()
 
-                if robot.last_t < self._dispatch_floor_t:
-                    robot.last_t = self._dispatch_floor_t
-                dnum = dispatch_count + 1
-                if dnum % self.config.dispatch_log_every == 0:
-                    role_label = role_token
-                    self._log(
-                        f"dispatch_start n={dnum} robot={robot.id} role={role_label} "
-                        f"robot_t={robot.last_t} completed={completed}/{total_orders} "
-                        f"remaining={len(remaining_orders)}"
-                    )
+        if robot.last_t < self._dispatch_floor_t:
+            robot.last_t = self._dispatch_floor_t
 
-                t0 = time.perf_counter()
-                if role == ROLE_DELIVER:
-                    handled = self._role_deliver(robot, remaining_orders, strategy=strategy)
-                    if handled and not from_plan:
-                        self._toggle_delivery_strategy(robot.id)
-                else:
-                    handled = self._role_relocate_pallet(robot, remaining_orders)
-                if not handled and role != ROLE_DELIVER:
-                    self._ensure_warmup_barrier()
-                    handled = self._deliver_with_robot_strategy(robot, remaining_orders)
+        self._log_dispatch_start(
+            dispatch_number=dispatch_number,
+            robot=robot,
+            role_token=role_token,
+            completed=completed,
+            total_orders=total_orders,
+            remaining=len(remaining_orders),
+        )
+        t0 = time.perf_counter()
+        handled = self._execute_role_with_fallbacks(
+            robot=robot,
+            role=role,
+            strategy=strategy,
+            from_plan=from_plan,
+            remaining_orders=remaining_orders,
+        )
+        elapsed = time.perf_counter() - t0
+        self._log_dispatch_end(
+            dispatch_number=dispatch_number,
+            robot=robot,
+            role=role,
+            handled=handled,
+            elapsed_s=elapsed,
+            completed=total_orders - len(remaining_orders),
+            total_orders=total_orders,
+            remaining=len(remaining_orders),
+        )
+        return handled
 
-                if not handled:
-                    handled = self._fallback_deliver_any_robot(remaining_orders)
+    def _execute_role_with_fallbacks(
+        self,
+        *,
+        robot: RobotState,
+        role: str,
+        strategy: str,
+        from_plan: bool,
+        remaining_orders: Deque[int],
+    ) -> bool:
+        if role == ROLE_DELIVER:
+            handled = self._role_deliver(robot, remaining_orders, strategy=strategy)
+            if handled and not from_plan:
+                self._toggle_delivery_strategy(robot.id)
+            return handled
 
-                elapsed = time.perf_counter() - t0
-                if dnum % self.config.dispatch_log_every == 0:
-                    self._log(
-                        f"dispatch_end n={dnum} robot={robot.id} role={role} success={handled} "
-                        f"elapsed_s={elapsed:.2f} completed={total_orders - len(remaining_orders)}/{total_orders} "
-                        f"remaining={len(remaining_orders)}"
-                    )
+        handled = self._role_relocate_pallet(robot, remaining_orders)
+        if not handled:
+            self._ensure_warmup_barrier()
+            handled = self._deliver_with_robot_strategy(robot, remaining_orders)
+        if not handled:
+            handled = self._fallback_deliver_any_robot(remaining_orders)
+        return handled
 
-                if not handled:
-                    raise RuntimeError("Dispatcher could not assign a feasible next task.")
+    def _log_dispatch_start(
+        self,
+        *,
+        dispatch_number: int,
+        robot: RobotState,
+        role_token: str,
+        completed: int,
+        total_orders: int,
+        remaining: int,
+    ) -> None:
+        if dispatch_number % self.config.dispatch_log_every != 0:
+            return
+        self._log(
+            f"dispatch_start n={dispatch_number} robot={robot.id} role={role_token} "
+            f"robot_t={robot.last_t} completed={completed}/{total_orders} remaining={remaining}"
+        )
 
-                new_completed = total_orders - len(remaining_orders)
-                if new_completed != completed:
-                    completed = new_completed
-                    if completed % self.config.progress_every == 0:
-                        current_makespan = max(r.last_t for r in self.robots)
-                        print(
-                            f"[solver] planned {completed}/{total_orders} orders, "
-                            f"current makespan={current_makespan}, dispatches={dispatch_count + 1}"
-                        )
-                        self._log(
-                            f"progress completed={completed}/{total_orders} "
-                            f"makespan={current_makespan} dispatches={dispatch_count + 1}"
-                        )
+    def _log_dispatch_end(
+        self,
+        *,
+        dispatch_number: int,
+        robot: RobotState,
+        role: str,
+        handled: bool,
+        elapsed_s: float,
+        completed: int,
+        total_orders: int,
+        remaining: int,
+    ) -> None:
+        if dispatch_number % self.config.dispatch_log_every != 0:
+            return
+        self._log(
+            f"dispatch_end n={dispatch_number} robot={robot.id} role={role} success={handled} "
+            f"elapsed_s={elapsed_s:.2f} completed={completed}/{total_orders} remaining={remaining}"
+        )
 
-                dispatch_count += 1
+    def _maybe_log_progress(self, *, completed: int, total_orders: int, dispatch_count: int) -> None:
+        if completed % self.config.progress_every != 0:
+            return
+        current_makespan = max(r.last_t for r in self.robots)
+        print(
+            f"[solver] planned {completed}/{total_orders} orders, "
+            f"current makespan={current_makespan}, dispatches={dispatch_count}"
+        )
+        self._log(
+            f"progress completed={completed}/{total_orders} "
+            f"makespan={current_makespan} dispatches={dispatch_count}"
+        )
 
-            sorted_actions = self.actions.sorted_actions()
-            sorted_actions = self._repair_idle_wait_conflicts(sorted_actions)
-            output_path = write_actions(sorted_actions, self.config.output_path)
-            makespan = max((t for t, _, _, _, _ in sorted_actions), default=-1)
-            self._log(
-                f"solve_end actions={len(sorted_actions)} makespan={makespan} output={output_path}"
-            )
-            return output_path, sorted_actions
-        finally:
-            self._close_log()
+    def _elapsed_plan_seconds(self) -> float:
+        if self._plan_started_monotonic <= 0:
+            return 0.0
+        return time.monotonic() - self._plan_started_monotonic
+
+    def _check_global_limits_or_raise(self, remaining_orders: Deque[int]) -> None:
+        if self.config.max_plan_time_seconds > 0:
+            elapsed = self._elapsed_plan_seconds()
+            if elapsed >= self.config.max_plan_time_seconds:
+                raise TimeoutError(
+                    "Reached max_plan_time_seconds "
+                    f"({self.config.max_plan_time_seconds:.1f}s) with {len(remaining_orders)} orders remaining."
+                )
+
+        if self.config.max_makespan is not None and self.config.max_makespan >= 0:
+            current_makespan = max((r.last_t for r in self.robots), default=-1)
+            if current_makespan > self.config.max_makespan:
+                raise RuntimeError(
+                    f"Reached max_makespan={self.config.max_makespan} at makespan={current_makespan} "
+                    f"with {len(remaining_orders)} orders remaining."
+                )
 
     def _build_ranked_order_queue(self) -> Deque[int]:
         optimizer = OrderOptimizer(self.state.pallets)
@@ -545,6 +669,79 @@ class WarehouseSolver:
                 continue
             return True
         return False
+
+    def _inject_lookahead_relocation_jobs(self, remaining_orders: Deque[int]) -> None:
+        threshold = int(self.config.min_jobs_for_dock)
+        if threshold <= 1:
+            return
+        if len(remaining_orders) < threshold:
+            return
+
+        lookahead_ids = list(remaining_orders)[:threshold]
+        sku_job_hits: collections.Counter = collections.Counter()
+        for order_idx in lookahead_ids:
+            for sku in self.orders[order_idx].items.keys():
+                sku_job_hits[sku] += 1
+
+        candidates = [
+            (hits, sku)
+            for sku, hits in sku_job_hits.items()
+            if hits >= threshold
+            and sku not in self.relocated_skus
+            and sku not in self._lookahead_relocation_seeded_skus
+            and self.scheduler.has_sku(sku)
+        ]
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda row: (-row[0], row[1]))
+        seeded = 0
+        for hits, sku in candidates:
+            if seeded >= 3:
+                break
+            job = self._build_lookahead_relocation_job(sku=sku, hits=hits)
+            if job is None:
+                continue
+            self.relocation_plan.appendleft(job)
+            self._lookahead_relocation_seeded_skus.add(sku)
+            seeded += 1
+            self._log(
+                f"lookahead_relocation_seed sku={sku} hits={hits} "
+                f"bucket={job.bucket} target={job.preferred_target_xy} score={job.score:.2f}"
+            )
+
+    def _build_lookahead_relocation_job(self, *, sku: int, hits: int) -> RelocationJob | None:
+        pallets = self.scheduler.pallet_cells_for_sku(sku)
+        if not pallets:
+            return None
+        anchor_xy = pallets[0]
+        bucket = self._closest_bucket_for_cell(anchor_xy[0], anchor_xy[1])
+        hotspot = BUCKET_TO_HOTSPOT[bucket]
+        score = float(hits * 10)
+        job = RelocationJob(sku=sku, bucket=bucket, hotspot=hotspot, score=score)
+
+        reserved = set(self.relocated_pallet_targets)
+        for queued in self.relocation_plan:
+            if queued.preferred_target_xy is not None:
+                reserved.add(queued.preferred_target_xy)
+        offset = self._choose_unique_relocation_offset(
+            bucket=job.bucket,
+            hotspot=job.hotspot,
+            reserved_targets=reserved,
+        )
+        job.placement_offset = offset
+        tx, ty = hotspot[0] + offset[0], hotspot[1] + offset[1]
+        if 0 <= tx < self.state.width and 0 <= ty < self.state.height:
+            job.preferred_target_xy = (tx, ty)
+        return job
+
+    def _closest_bucket_for_cell(self, x: int, y: int) -> str:
+        choices = list(BUCKET_TO_HOTSPOT.items())
+        _, bucket = min(
+            ((abs(hx - x) + abs(hy - y), b) for b, (hx, hy) in choices),
+            key=lambda row: (row[0], row[1]),
+        )
+        return bucket
 
     def _role_deliver(self, robot: RobotState, remaining_orders: Deque[int], strategy: str) -> bool:
         if not remaining_orders:
@@ -1075,6 +1272,122 @@ class WarehouseSolver:
             storage=collections.Counter(robot.storage),
             docks=dict(robot.docks),
         )
+
+    def _lns_improve_actions(
+        self, actions: List[Tuple[int, int, str, int, int]]
+    ) -> List[Tuple[int, int, str, int, int]]:
+        if not self.config.lns_enabled:
+            return actions
+        if self.config.lns_iterations <= 0:
+            return actions
+        if len(actions) < 4:
+            return actions
+        if self.config.max_plan_time_seconds > 0 and self._elapsed_plan_seconds() >= self.config.max_plan_time_seconds:
+            return actions
+
+        best = list(actions)
+        best_makespan = max((t for t, _, _, _, _ in best), default=-1)
+        attempts = 0
+        accepted = 0
+        for _ in range(self.config.lns_iterations):
+            if self.config.max_plan_time_seconds > 0 and self._elapsed_plan_seconds() >= self.config.max_plan_time_seconds:
+                break
+            candidate = self._lns_shift_candidate(best)
+            if candidate is None:
+                continue
+            attempts += 1
+            candidate_makespan = max((t for t, _, _, _, _ in candidate), default=-1)
+            if candidate_makespan >= best_makespan:
+                continue
+            if not self._validate_candidate_actions(candidate):
+                continue
+            best = candidate
+            best_makespan = candidate_makespan
+            accepted += 1
+
+        if attempts > 0:
+            self._log(
+                f"lns_done attempts={attempts} accepted={accepted} best_makespan={best_makespan}"
+            )
+        return best
+
+    def _lns_shift_candidate(
+        self, actions: List[Tuple[int, int, str, int, int]]
+    ) -> List[Tuple[int, int, str, int, int]] | None:
+        by_robot: Dict[int, List[int]] = collections.defaultdict(list)
+        for idx, (_, rid, _, _, _) in enumerate(actions):
+            by_robot[rid].append(idx)
+        if not by_robot:
+            return None
+
+        robot_tail_times = [
+            (actions[indexes[-1]][0], rid)
+            for rid, indexes in by_robot.items()
+            if indexes
+        ]
+        if not robot_tail_times:
+            return None
+        robot_tail_times.sort(reverse=True)
+        top_k = max(1, min(3, len(robot_tail_times)))
+        _, robot_id = self.rng.choice(robot_tail_times[:top_k])
+        robot_idxs = by_robot[robot_id]
+        if len(robot_idxs) < 2:
+            return None
+
+        tail_start = int(len(robot_idxs) * (1.0 - self.config.lns_tail_fraction))
+        tail_start = max(1, min(len(robot_idxs) - 1, tail_start))
+        end_pos = self.rng.randint(tail_start, len(robot_idxs) - 1)
+        start_pos = max(0, end_pos - max(1, self.config.lns_window_actions) + 1)
+        selected_positions = list(range(start_pos, end_pos + 1))
+        if not selected_positions:
+            return None
+
+        first_pos = selected_positions[0]
+        first_action_index = robot_idxs[first_pos]
+        first_t = actions[first_action_index][0]
+        prev_t = actions[robot_idxs[first_pos - 1]][0] if first_pos > 0 else -1
+        available_gap = first_t - prev_t - 1
+        if available_gap <= 0:
+            return None
+        max_shift = min(max(1, self.config.lns_max_shift), available_gap)
+        shift = self.rng.randint(1, max_shift)
+
+        selected_action_indexes = {robot_idxs[pos] for pos in selected_positions}
+        shifted: List[Tuple[int, int, str, int, int]] = []
+        for idx, row in enumerate(actions):
+            t, rid, action, x, y = row
+            if idx in selected_action_indexes:
+                shifted.append((t - shift, rid, action, x, y))
+            else:
+                shifted.append(row)
+
+        if not self._has_unique_robot_timestep_pairs(shifted):
+            return None
+        shifted.sort(key=lambda row: (row[0], row[1]))
+        return shifted
+
+    def _has_unique_robot_timestep_pairs(
+        self, actions: List[Tuple[int, int, str, int, int]]
+    ) -> bool:
+        seen: set[Tuple[int, int]] = set()
+        for t, rid, _, _, _ in actions:
+            key = (t, rid)
+            if key in seen:
+                return False
+            seen.add(key)
+        return True
+
+    def _validate_candidate_actions(
+        self, actions: List[Tuple[int, int, str, int, int]]
+    ) -> bool:
+        validator = SubmissionValidator(worklist_path=self.config.worklist_path)
+        try:
+            for t, rid, action, x, y in actions:
+                validator.validate_line(f"{t} {rid} {action} {x} {y}")
+            final_state = validator.finalize()
+        except ValidationError:
+            return False
+        return final_state.fulfilled_orders == final_state.total_orders
 
     def _open_log(self) -> None:
         if self.config.log_path is None:

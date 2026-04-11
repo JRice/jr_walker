@@ -296,11 +296,10 @@ def solution_analysis(
         order_fulfill_records,
         key=lambda r: (-r["duration"], -r["fulfill_t"], r["order_id"]),
     )[:100]
-    if len(order_fulfill_records) > 100
-        least_time = sorted(
-            order_fulfill_records,
-            key=lambda r: (r["duration"], r["fulfill_t"], r["order_id"]),
-        )[:100]
+    least_time = sorted(
+        order_fulfill_records,
+        key=lambda r: (r["duration"], r["fulfill_t"], r["order_id"]),
+    )[:100]
 
     lines_out.append("  Longest:")
     if not most_time:
