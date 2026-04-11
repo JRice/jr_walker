@@ -280,8 +280,7 @@ class WarehouseSolver:
     ) -> List[Tuple[int, int, str, int, int]]:
         self._open_log()
         try:
-            seeded = self._try_suffix_replan_for_hot_sku(list(actions))
-            return self._optimize_actions_core(seeded)
+            return self._optimize_actions_core(list(actions))
         finally:
             self._close_log()
 

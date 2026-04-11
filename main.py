@@ -94,6 +94,10 @@ class RunConfig:
     lns_window_actions: int = 28
     lns_tail_fraction: float = 0.35
     lns_max_shift: int = 2
+    output_dir: str = "output"
+    log_path: str = "output/run.log"
+    metadata_db_path: str = "output/solution_metadata.db"
+    force_new_solution: bool = False
 
 
 def _get_table(data: dict, key: str) -> dict:
@@ -128,6 +132,13 @@ def load_run_config(config_path: Path, robot_count: int) -> RunConfig:
 
     run_config = RunConfig()
 
+    paths_section = _get_table(data, "paths")
+    run_config.output_dir = str(paths_section.get("output_dir", run_config.output_dir))
+    run_config.log_path = str(paths_section.get("log_path", run_config.log_path))
+    run_config.metadata_db_path = str(
+        paths_section.get("metadata_db_path", run_config.metadata_db_path)
+    )
+
     relocation_section = _get_table(data, "relocation")
     run_config.lane_width = _require_int(
         relocation_section.get("lane_width", run_config.lane_width),
@@ -153,6 +164,11 @@ def load_run_config(config_path: Path, robot_count: int) -> RunConfig:
         "solver.min_jobs_for_dock",
         minimum=1,
     )
+    raw_force_new = solver_section.get("force_new_solution", run_config.force_new_solution)
+    if not isinstance(raw_force_new, bool):
+        raise ValueError("solver.force_new_solution must be a boolean.")
+    run_config.force_new_solution = raw_force_new
+
     run_config.num_allowed_relocations = _require_int(
         solver_section.get("num_allowed_relocations", run_config.num_allowed_relocations),
         "solver.num_allowed_relocations",
@@ -215,22 +231,10 @@ def main():
         default=None,
         help="Validate an existing solution file and exit on first error.",
     )
-    parser.add_argument("--output-dir", default="output", help="Directory to write solution files.")
     parser.add_argument(
         "--output",
         default=None,
         help="Optional explicit output path. If omitted, uses solution_<makespan>.txt.",
-    )
-    parser.add_argument(
-        "--max-time",
-        type=int,
-        default=None,
-        help="Optional override for solver.max_time (reservation horizon) from config.toml.",
-    )
-    parser.add_argument(
-        "--log-path",
-        default="output/run.log",
-        help="Path for live runtime log output.",
     )
     parser.add_argument(
         "--test",
@@ -240,17 +244,7 @@ def main():
     parser.add_argument(
         "--config",
         default="docs/config.toml",
-        help='TOML run config with per-robot role plans and relocation params. Default: docs/config.toml',
-    )
-    parser.add_argument(
-        "--find-solution",
-        action="store_true",
-        help="Force building a fresh base solution before optimization.",
-    )
-    parser.add_argument(
-        "--metadata-db-path",
-        default="output/solution_metadata.db",
-        help="SQLite DB path used to persist per-run solution metadata.",
+        help="TOML run config with solver and path parameters. Default: docs/config.toml",
     )
     parser.add_argument(
         "--metadata-run-id",
@@ -310,10 +304,7 @@ def main():
     else:
         print(f"Config file not found at {config_path}; using solver defaults.")
 
-    if args.max_time is not None:
-        run_config.max_time = args.max_time
-
-    output_dir = Path(args.output_dir)
+    output_dir = Path(run_config.output_dir)
     output_prefix = "test_" if args.test else ""
     temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
     solver = WarehouseSolver(
@@ -324,7 +315,7 @@ def main():
             max_plan_time_seconds=run_config.max_plan_time_seconds,
             output_path=Path(args.output) if args.output else temp_output_path,
             progress_every=50,
-            log_path=Path(args.log_path),
+            log_path=Path(run_config.log_path),
             lane_width=run_config.lane_width,
             relocation_skus_to_relocate=run_config.relocation_skus_to_relocate,
             min_jobs_for_dock=run_config.min_jobs_for_dock,
@@ -342,8 +333,8 @@ def main():
     actions: list[tuple[int, int, str, int, int]] = []
     baseline_solution_path: Path | None = None
     try:
-        if args.find_solution:
-            print("Building a fresh base solution (--find-solution enabled)...")
+        if run_config.force_new_solution:
+            print("Building a fresh base solution (force_new_solution=true in config)...")
             actions = solver.find_solution()
         else:
             baseline_solution_path = find_best_existing_solution(output_dir, test_mode=args.test)
@@ -396,7 +387,7 @@ def main():
         temp_output_path.unlink()
 
     metadata_run_id = None
-    metadata_db_path = Path(args.metadata_db_path)
+    metadata_db_path = Path(run_config.metadata_db_path)
     try:
         metadata_run_id = build_and_store_solution_metadata(
             solution_path=final_output_path,
