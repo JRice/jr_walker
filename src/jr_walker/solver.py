@@ -120,6 +120,8 @@ class SolverConfig:
     lns_window_actions: int = 28
     lns_tail_fraction: float = 0.35
     lns_max_shift: int = 2
+    forced_dock_max_attempts_per_robot_sku: int = 3
+    forced_dock_cooldown_dispatches: int = 25
     role_plans_by_robot: Dict[int, List[str]] | None = None
 
 
@@ -200,6 +202,8 @@ class WarehouseSolver:
         self._warmup_barrier_applied = False
         self._lookahead_relocation_seeded_skus: set[int] = set()
         self._plan_started_monotonic = 0.0
+        self._forced_dock_failures: Dict[Tuple[int, int], int] = collections.defaultdict(int)
+        self._forced_dock_cooldown_until_dispatch: Dict[Tuple[int, int], int] = {}
         self._log_handle = None
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
@@ -329,6 +333,7 @@ class WarehouseSolver:
             role=role,
             strategy=strategy,
             forced_reloc_sku=forced_reloc_sku,
+            dispatch_number=dispatch_number,
             from_plan=from_plan,
             remaining_orders=remaining_orders,
         )
@@ -352,6 +357,7 @@ class WarehouseSolver:
         role: str,
         strategy: str,
         forced_reloc_sku: int | None,
+        dispatch_number: int,
         from_plan: bool,
         remaining_orders: Deque[int],
     ) -> bool:
@@ -365,6 +371,7 @@ class WarehouseSolver:
             robot,
             remaining_orders,
             forced_sku=forced_reloc_sku,
+            dispatch_number=dispatch_number,
         )
         if not handled:
             self._ensure_warmup_barrier()
@@ -888,9 +895,15 @@ class WarehouseSolver:
         robot: RobotState,
         remaining_orders: Deque[int],
         forced_sku: int | None = None,
+        dispatch_number: int | None = None,
     ) -> bool:
         if forced_sku is not None:
-            return self._relocate_forced_sku(robot, remaining_orders, forced_sku)
+            return self._relocate_forced_sku(
+                robot,
+                remaining_orders,
+                forced_sku,
+                dispatch_number=dispatch_number,
+            )
 
         if not self._has_relocation_candidate():
             return False
@@ -933,7 +946,13 @@ class WarehouseSolver:
         robot: RobotState,
         remaining_orders: Deque[int],
         forced_sku: int,
+        dispatch_number: int | None = None,
     ) -> bool:
+        if (
+            dispatch_number is not None
+            and not self._should_attempt_forced_dock(robot.id, forced_sku, dispatch_number)
+        ):
+            return False
         if forced_sku in self.relocated_skus:
             return False
         if not self.scheduler.has_sku(forced_sku):
@@ -946,14 +965,41 @@ class WarehouseSolver:
             return False
         ok = self._plan_relocate_pallet_for_robot(robot=robot, job=forced_job)
         if not ok:
+            if dispatch_number is not None:
+                self._record_forced_dock_failure(robot.id, forced_sku, dispatch_number)
             return False
         self._recalculate_order_costs(remaining_orders)
         self.relocated_skus.add(forced_sku)
+        self._forced_dock_failures[(robot.id, forced_sku)] = 0
+        self._forced_dock_cooldown_until_dispatch.pop((robot.id, forced_sku), None)
         self._log(
             f"forced_relocation_done sku={forced_sku} bucket={forced_job.bucket} "
             f"target={forced_job.preferred_target_xy}"
         )
         return True
+
+    def _should_attempt_forced_dock(self, robot_id: int, sku: int, dispatch_number: int) -> bool:
+        key = (robot_id, sku)
+        cooldown_until = self._forced_dock_cooldown_until_dispatch.get(key)
+        if cooldown_until is None:
+            return True
+        return dispatch_number >= cooldown_until
+
+    def _record_forced_dock_failure(self, robot_id: int, sku: int, dispatch_number: int) -> None:
+        key = (robot_id, sku)
+        self._forced_dock_failures[key] += 1
+        failures = self._forced_dock_failures[key]
+        max_attempts = max(1, int(self.config.forced_dock_max_attempts_per_robot_sku))
+        if failures < max_attempts:
+            return
+
+        cooldown = max(1, int(self.config.forced_dock_cooldown_dispatches))
+        self._forced_dock_failures[key] = 0
+        self._forced_dock_cooldown_until_dispatch[key] = dispatch_number + cooldown
+        self._log(
+            f"forced_dock_cooldown robot={robot_id} sku={sku} "
+            f"until_dispatch={dispatch_number + cooldown}"
+        )
 
     def _plan_order_for_robot(
         self, order_idx: int, order: collections.Counter, robot: RobotState
