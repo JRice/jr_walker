@@ -48,6 +48,7 @@ def _parse_robot_key(raw_key: str) -> int:
 @dataclass
 class RunConfig:
     lane_width: int = 3
+    relocation_edge_band: int = 6
     relocation_skus_to_relocate: list[int] | None = None
     max_time: int = 50000
     min_jobs_for_dock: int = 3
@@ -56,6 +57,9 @@ class RunConfig:
     num_allowed_relocations: int = 10
     order_suggestion_gain_constant: float = 100.0
     ticks_to_full_validation: int = 500
+    astar_slow_ms: float = 40.0
+    astar_print_slow: bool = False
+    astar_log_blocked: bool = False
     lns_enabled: bool = True
     lns_iterations: int = 60
     lns_window_actions: int = 28
@@ -119,6 +123,11 @@ def load_run_config(config_path: Path) -> RunConfig:
         "relocation.lane_width",
         minimum=0,
     )
+    run_config.relocation_edge_band = _require_int(
+        relocation_section.get("edge_band_for_heatmap", run_config.relocation_edge_band),
+        "relocation.edge_band_for_heatmap",
+        minimum=0,
+    )
     solver_section = _get_table(data, "solver")
     run_config.max_time = _require_int(
         solver_section.get("max_time", run_config.max_time),
@@ -146,6 +155,19 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.order_suggestion_gain_constant",
         minimum=0.0,
     )
+    run_config.astar_slow_ms = _require_number(
+        solver_section.get("astar_slow_ms", run_config.astar_slow_ms),
+        "solver.astar_slow_ms",
+        minimum=0.0,
+    )
+    raw_astar_print_slow = solver_section.get("astar_print_slow", run_config.astar_print_slow)
+    if not isinstance(raw_astar_print_slow, bool):
+        raise ValueError("solver.astar_print_slow must be a boolean.")
+    run_config.astar_print_slow = raw_astar_print_slow
+    raw_astar_log_blocked = solver_section.get("astar_log_blocked", run_config.astar_log_blocked)
+    if not isinstance(raw_astar_log_blocked, bool):
+        raise ValueError("solver.astar_log_blocked must be a boolean.")
+    run_config.astar_log_blocked = raw_astar_log_blocked
     run_config.ticks_to_full_validation = _require_int(
         solver_section.get("ticks_to_full_validation", run_config.ticks_to_full_validation),
         "solver.ticks_to_full_validation",
@@ -212,9 +234,13 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             progress_every=50,
             log_path=Path(run_config.log_path),
             lane_width=run_config.lane_width,
+            relocation_edge_band=run_config.relocation_edge_band,
             num_allowed_relocations=run_config.num_allowed_relocations,
             order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
             dispatch_validate_every_makespan=run_config.ticks_to_full_validation,
+            astar_slow_ms=run_config.astar_slow_ms,
+            astar_print_slow=run_config.astar_print_slow,
+            astar_log_blocked=run_config.astar_log_blocked,
             worklist_path=Path(run_config.input_path),
             lns_enabled=run_config.lns_enabled,
             lns_iterations=run_config.lns_iterations,
@@ -393,10 +419,12 @@ def main():
             "Loaded config from "
             f"{config_path} "
             f"(lane_width={run_config.lane_width}, "
+            f"edge_band_for_heatmap={run_config.relocation_edge_band}, "
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "
             f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "
             f"ticks_to_full_validation={run_config.ticks_to_full_validation}, "
+            f"astar_slow_ms={run_config.astar_slow_ms}, "
             f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."
         )
 

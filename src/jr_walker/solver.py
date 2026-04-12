@@ -98,6 +98,7 @@ class SolverConfig:
     path_step_limit: int = 350
     relocate_stand_candidate_limit: int = 6
     relocate_target_candidate_limit: int = 8
+    relocation_edge_band: int = 6
     relocation_analysis_path: Path | None = None
     relocation_top_skus: int = 8
     relocation_min_lift: float = 0.08
@@ -117,6 +118,9 @@ class SolverConfig:
     lns_tail_fraction: float = 0.35
     lns_max_shift: int = 2
     dump_suggestions_path: Path | None = None
+    astar_slow_ms: float = 40.0
+    astar_print_slow: bool = False
+    astar_log_blocked: bool = False
 
 
 def _select_best_non_test_run_id(conn: sqlite3.Connection) -> int | None:
@@ -306,6 +310,11 @@ class WarehouseSolver:
         self._plan_started_monotonic = 0.0
         self._log_handle = None
         self._next_dispatch_validation_makespan = max(0, self.config.dispatch_validate_every_makespan)
+        self._astar_calls = 0
+        self._astar_slow_calls = 0
+        self._astar_blocked_calls = 0
+        self._astar_total_ms = 0.0
+        self._astar_max_ms = 0.0
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
         self._open_log()
@@ -426,6 +435,14 @@ class WarehouseSolver:
         self._log(
             f"find_solution_end actions={len(sorted_actions)} makespan={makespan}"
         )
+        if self._astar_calls > 0:
+            avg_ms = self._astar_total_ms / self._astar_calls
+            self._log(
+                "astar_summary "
+                f"calls={self._astar_calls} slow_calls={self._astar_slow_calls} "
+                f"blocked_calls={self._astar_blocked_calls} avg_ms={avg_ms:.3f} "
+                f"max_ms={self._astar_max_ms:.3f}"
+            )
         return sorted_actions
 
     def _build_suggestion_queue(self) -> List[Suggestion]:
@@ -868,6 +885,11 @@ class WarehouseSolver:
         sku_rows = self.past_analysis.sku_cells.get(sku, [])
         if not sku_rows:
             return []
+        edge_band = self.config.relocation_edge_band
+        if edge_band >= 0:
+            edge_rows = [row for row in sku_rows if self._is_within_edge_band((row[0], row[1]), edge_band)]
+            if edge_rows:
+                return edge_rows[: min(len(edge_rows), limit)]
         return sku_rows[: min(len(sku_rows), limit)]
 
     def _choose_metadata_guided_relocation_target(
@@ -886,9 +908,12 @@ class WarehouseSolver:
 
         best: Tuple[int, int] | None = None
         best_key: Tuple[int, int, int, int] | None = None
+        edge_band = self.config.relocation_edge_band
         for sx, sy, sku_count in anchor_rows:
             for tx, ty, radius in self._iter_manhattan_cells(sx, sy, max_radius=9):
                 cell = (tx, ty)
+                if edge_band >= 0 and not self._is_within_edge_band(cell, edge_band):
+                    continue
                 if not self._is_relocation_target_cell_allowed(
                     cell,
                     reserved_targets=reserved_targets,
@@ -913,6 +938,8 @@ class WarehouseSolver:
         for sx, sy, _ in anchor_rows:
             for tx, ty, _ in self._iter_manhattan_cells(sx, sy, max_radius=11):
                 cell = (tx, ty)
+                if edge_band >= 0 and not self._is_within_edge_band(cell, edge_band):
+                    continue
                 if self._is_relocation_target_cell_allowed(
                     cell,
                     reserved_targets=reserved_targets,
@@ -928,10 +955,13 @@ class WarehouseSolver:
         if not anchor_rows:
             return out
 
+        edge_band = self.config.relocation_edge_band
         for sx, sy, _ in anchor_rows:
             for tx, ty, _ in self._iter_manhattan_cells(sx, sy, max_radius=4):
                 cell = (tx, ty)
                 if cell in seen:
+                    continue
+                if edge_band >= 0 and not self._is_within_edge_band(cell, edge_band):
                     continue
                 if cell in self.scheduler.pallets:
                     continue
@@ -942,6 +972,13 @@ class WarehouseSolver:
                 if len(out) >= limit:
                     return out
         return out
+
+    def _is_within_edge_band(self, cell: Tuple[int, int], band: int) -> bool:
+        if band < 0:
+            return True
+        x, y = cell
+        edge_dist = min(x, self.state.width - 1 - x, y, self.state.height - 1 - y)
+        return edge_dist <= band
 
     def _next_available_robot(self) -> RobotState:
         return min(self.robots, key=lambda r: (r.last_t, r.id))
@@ -1482,12 +1519,42 @@ class WarehouseSolver:
         self, robot: RobotState, target_x: int, target_y: int
     ) -> List[Tuple[int, int, int]]:
         """Adapter boundary for planner pathfinding (Space-Time A* in ReservationPlanner)."""
-        return self.planner.plan_path(
+        start_x, start_y = robot.x, robot.y
+        started = time.perf_counter()
+        path = self.planner.plan_path(
             robot,
             target_x,
             target_y,
             max_path_steps=self.config.path_step_limit,
         )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._astar_calls += 1
+        self._astar_total_ms += elapsed_ms
+        if elapsed_ms > self._astar_max_ms:
+            self._astar_max_ms = elapsed_ms
+
+        blocked = not path and (start_x != target_x or start_y != target_y)
+        if blocked:
+            self._astar_blocked_calls += 1
+
+        if elapsed_ms >= self.config.astar_slow_ms:
+            self._astar_slow_calls += 1
+            msg = (
+                "astar_slow "
+                f"robot={robot.id} start=({start_x},{start_y}) target=({target_x},{target_y}) "
+                f"last_t={robot.last_t} docks={len(robot.docks)} path_len={len(path)} "
+                f"blocked={blocked} elapsed_ms={elapsed_ms:.3f}"
+            )
+            self._log(msg)
+            if self.config.astar_print_slow:
+                print(f"[solver] {msg}")
+        elif blocked and self.config.astar_log_blocked:
+            self._log(
+                "astar_blocked "
+                f"robot={robot.id} start=({start_x},{start_y}) target=({target_x},{target_y}) "
+                f"last_t={robot.last_t} docks={len(robot.docks)} elapsed_ms={elapsed_ms:.3f}"
+            )
+        return path
 
     def _can_commit_pending_actions(
         self, pending_actions: List[Tuple[int, int, str, int, int]]

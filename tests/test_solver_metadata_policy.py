@@ -50,6 +50,13 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver.scheduler = SimpleNamespace(pallets={})
         solver.travel_lane_cells = set()
         solver.past_analysis = PastRunAnalysis()
+        solver.config = SimpleNamespace(
+            relocation_edge_band=6,
+            dispatch_validate_every_makespan=500,
+            astar_slow_ms=40.0,
+            astar_print_slow=False,
+            astar_log_blocked=False,
+        )
         return solver
 
     def test_periodic_dispatch_validation_runs_at_interval(self) -> None:
@@ -144,6 +151,25 @@ class SolverMetadataPolicyTests(unittest.TestCase):
             reserved_targets=set(),
         )
         self.assertEqual(target, (1, 2))
+
+    def test_choose_metadata_guided_target_respects_edge_band(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=20, height=20)
+        solver.config = SimpleNamespace(relocation_edge_band=2)
+        solver.travel_lane_cells = set()
+        solver.past_analysis.high_use_cells = set()
+        solver.past_analysis.sku_cells = {7: [(10, 10, 50)]}
+        solver.past_analysis.use_by_cell = {(10, 10): 0}
+        job = RelocationJob(sku=7, bucket="top_x0_29", hotspot=(10, 10), score=1.0)
+
+        target = solver._choose_metadata_guided_relocation_target(
+            job=job,
+            reserved_targets=set(),
+        )
+        self.assertIsNotNone(target)
+        tx, ty = target
+        edge_dist = min(tx, solver.state.width - 1 - tx, ty, solver.state.height - 1 - ty)
+        self.assertLessEqual(edge_dist, 2)
 
     def test_build_travel_lane_cells_includes_metadata_high_use_halo(self) -> None:
         solver = self._new_solver_shell()

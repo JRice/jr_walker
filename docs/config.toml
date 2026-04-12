@@ -4,9 +4,9 @@ max_runs = 3
 [limits]
 # Hard stop on produced plan length. If exceeded before finishing all orders,
 # the run exits and writes partial output.
-max_makespan = 13000
+max_makespan = 15000
 # Seconds of compute budget:
-max_plan_time = 1800
+max_plan_time = 5000
 
 [paths]
 output_dir = "output"
@@ -21,6 +21,12 @@ max_time = 50000
 # Run full validator replay every N makespan ticks during dispatch.
 # Set to 0 to disable periodic validation.
 ticks_to_full_validation = 500
+# Log/print A* calls slower than this many milliseconds.
+astar_slow_ms = 40
+# If true, also print slow A* lines to STDOUT (always written to run.log).
+astar_print_slow = false
+# If true, log blocked A* attempts even when they are not slow.
+astar_log_blocked = false
 test_mode = false
 
 [lns]
@@ -32,6 +38,8 @@ max_shift = 2
 
 [relocation]
 lane_width = 3
+# Only scan metadata heatmap cells within this edge distance (cells).
+edge_band_for_heatmap = 6
 # Optional explicit relocation SKU order. If provided, only these SKUs are
 # used for startup relocation planning (in listed order).
 # skus_to_relocate = [1, 2, 3, 4, 5]
