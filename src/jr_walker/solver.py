@@ -17,6 +17,7 @@ from jr_walker.logic import (
     OrderSuggestion,
     RelocateSuggestion,
     Suggestion,
+    manhattan_distance,
 )
 from jr_walker.planner import adjacent_cells
 from jr_walker.planner import ReservationPlanner
@@ -132,6 +133,12 @@ class SolverConfig:
     astar_slow_ms: float = 40.0
     astar_print_slow: bool = False
     astar_log_blocked: bool = False
+    suggestion_retry_limit: int = 12
+    suggestion_backoff_base_cycles: int = 2
+    suggestion_backoff_max_cycles: int = 128
+    max_robots_per_suggestion: int = 3
+    robot_fail_streak_for_parking: int = 3
+    parking_candidate_limit: int = 96
 
 
 def _select_best_non_test_run_id(conn: sqlite3.Connection) -> int | None:
@@ -328,6 +335,11 @@ class WarehouseSolver:
         self._astar_blocked_calls = 0
         self._astar_total_ms = 0.0
         self._astar_max_ms = 0.0
+        self._dispatch_cycle = 0
+        self._suggestion_fail_counts: Dict[str, int] = {}
+        self._suggestion_backoff_until_cycle: Dict[str, int] = {}
+        self._robot_fail_streak: Dict[int, int] = collections.defaultdict(int)
+        self._parking_moves = 0
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
         self._open_log()
@@ -375,13 +387,19 @@ class WarehouseSolver:
         dispatch_count = 0
         self._log_solve_start(total_orders)
 
-        # Keep trying suggestions until all orders are done or queue is empty
+        # Keep trying suggestions until all orders are done or queue is empty.
         while suggestion_queue and len(completed_orders) < total_orders:
+            self._dispatch_cycle += 1
             self._check_global_limits_or_raise(
                 collections.deque(o for o in range(total_orders) if o not in completed_orders)
             )
 
             suggestion = suggestion_queue.popleft()
+            suggestion_key = self._suggestion_key(suggestion)
+            blocked_until = self._suggestion_backoff_until_cycle.get(suggestion_key, 0)
+            if blocked_until > self._dispatch_cycle:
+                suggestion_queue.append(suggestion)
+                continue
 
             # Skip if already handled
             if isinstance(suggestion, OrderSuggestion) and suggestion.order_idx in completed_orders:
@@ -391,48 +409,82 @@ class WarehouseSolver:
             if isinstance(suggestion, DockSuggestion) and suggestion.sku in self.docked_skus:
                 continue
 
-            # Find the best robot (earliest available) to handle this suggestion
-            robot = self._next_available_robot()
-
             handled = False
-            if isinstance(suggestion, OrderSuggestion):
-                handled = self._plan_order_for_robot(suggestion.order_idx, suggestion.order, robot)
-                if handled:
-                    completed_orders.add(suggestion.order_idx)
+            skip_without_requeue = False
+            candidate_robots = self._candidate_robots_for_suggestion(suggestion)
+            for robot in candidate_robots:
+                if isinstance(suggestion, OrderSuggestion):
+                    handled = self._plan_order_for_robot(suggestion.order_idx, suggestion.order, robot)
+                    if handled:
+                        completed_orders.add(suggestion.order_idx)
+                elif isinstance(suggestion, RelocateSuggestion):
+                    if suggestion.remaining_job_factor() <= 0:
+                        handled = True
+                        skip_without_requeue = True
+                        break
+                    handled = self._plan_relocate_pallet_for_robot(robot, suggestion.job)
+                    if handled:
+                        self.relocated_skus.add(suggestion.job.sku)
+                        self._log(
+                            f"relocation_done sku={suggestion.job.sku} bucket={suggestion.job.bucket} "
+                            f"target={suggestion.job.preferred_target_xy} score={suggestion.job.score:.3f}"
+                        )
+                        # Re-score pending delivery/order suggestions against the new pallet layout.
+                        # Keep existing non-order suggestions (relocate/dock) as-is.
+                        suggestion_queue = self._refresh_pending_order_suggestions(
+                            suggestion_queue,
+                            completed_orders,
+                        )
+                elif isinstance(suggestion, DockSuggestion):
+                    handled = self._plan_dock_pallet(robot, suggestion.sku)
+                    if handled:
+                        self.docked_skus.add(suggestion.sku)
+                        self._log(
+                            f"dock_done sku={suggestion.sku} center={suggestion.center} "
+                            f"gain={suggestion.expected_gain:.3f} score={suggestion.score():.3f}"
+                        )
                 else:
-                    # Failed, put it at the back of the queue to retry later with another robot
-                    suggestion_queue.append(suggestion)
+                    handled = True
 
-            elif isinstance(suggestion, RelocateSuggestion):
-                if suggestion.remaining_job_factor() <= 0:
-                    # No remaining order needs this SKU anymore.
+                if handled:
+                    self._robot_fail_streak[robot.id] = 0
+                    break
+                self._robot_fail_streak[robot.id] = self._robot_fail_streak.get(robot.id, 0) + 1
+
+            if handled:
+                self._suggestion_fail_counts.pop(suggestion_key, None)
+                self._suggestion_backoff_until_cycle.pop(suggestion_key, None)
+                if skip_without_requeue:
                     continue
-                handled = self._plan_relocate_pallet_for_robot(robot, suggestion.job)
-                if handled:
-                    self.relocated_skus.add(suggestion.job.sku)
+            else:
+                parked = False
+                for robot in candidate_robots:
+                    if self._robot_fail_streak.get(robot.id, 0) < self.config.robot_fail_streak_for_parking:
+                        continue
+                    if self._plan_idle_parking_move(robot):
+                        self._parking_moves += 1
+                        parked = True
+                        self._robot_fail_streak[robot.id] = 0
+                        break
+
+                failure_count = self._suggestion_fail_counts.get(suggestion_key, 0) + 1
+                self._suggestion_fail_counts[suggestion_key] = failure_count
+                if failure_count >= self.config.suggestion_retry_limit:
                     self._log(
-                        f"relocation_done sku={suggestion.job.sku} bucket={suggestion.job.bucket} "
-                        f"target={suggestion.job.preferred_target_xy} score={suggestion.job.score:.3f}"
+                        "suggestion_dropped "
+                        f"key={suggestion_key} failures={failure_count} parked={parked}"
                     )
-                    # Re-score pending delivery/order suggestions against the new pallet layout.
-                    # Keep existing non-order suggestions (relocate/dock) as-is.
-                    suggestion_queue = self._refresh_pending_order_suggestions(
-                        suggestion_queue,
-                        completed_orders,
-                    )
-                    # Don't requeue successful relocations.
+                    self._suggestion_backoff_until_cycle.pop(suggestion_key, None)
                 else:
+                    backoff_cycles = self._suggestion_backoff_cycles(failure_count)
+                    self._suggestion_backoff_until_cycle[suggestion_key] = self._dispatch_cycle + backoff_cycles
                     suggestion_queue.append(suggestion)
-            elif isinstance(suggestion, DockSuggestion):
-                handled = self._plan_dock_pallet(robot, suggestion.sku)
-                if handled:
-                    self.docked_skus.add(suggestion.sku)
-                    self._log(
-                        f"dock_done sku={suggestion.sku} center={suggestion.center} "
-                        f"gain={suggestion.expected_gain:.3f} score={suggestion.score():.3f}"
-                    )
-                else:
-                    suggestion_queue.append(suggestion)
+                    if failure_count == 1 or failure_count % 3 == 0:
+                        self._log(
+                            "suggestion_retry_scheduled "
+                            f"key={suggestion_key} failures={failure_count} "
+                            f"backoff_cycles={backoff_cycles} parked={parked}"
+                        )
 
             if handled:
                 dispatch_count += 1
@@ -474,6 +526,8 @@ class WarehouseSolver:
                 f"blocked_calls={self._astar_blocked_calls} avg_ms={avg_ms:.3f} "
                 f"max_ms={self._astar_max_ms:.3f}"
             )
+        if self._parking_moves > 0:
+            self._log(f"idle_parking_summary moves={self._parking_moves}")
         return sorted_actions
 
     def _build_suggestion_queue(self) -> List[Suggestion]:
@@ -684,6 +738,14 @@ class WarehouseSolver:
 
     def _log_solve_start(self, total_orders: int) -> None:
         self._log(f"solve_start total_orders={total_orders}")
+        self._log(
+            "dispatch_policy "
+            f"retry_limit={self.config.suggestion_retry_limit} "
+            f"backoff_base={self.config.suggestion_backoff_base_cycles} "
+            f"backoff_max={self.config.suggestion_backoff_max_cycles} "
+            f"robots_per_suggestion={self.config.max_robots_per_suggestion} "
+            f"parking_fail_streak={self.config.robot_fail_streak_for_parking}"
+        )
         if self.relocation_plan:
             summary = ", ".join(
                 f"SKU{job.sku}->{job.bucket}@{job.placement_offset}(score={job.score:.2f})"
@@ -1127,6 +1189,95 @@ class WarehouseSolver:
         x, y = cell
         edge_dist = min(x, self.state.width - 1 - x, y, self.state.height - 1 - y)
         return edge_dist <= band
+
+    def _suggestion_key(self, suggestion: Suggestion) -> str:
+        if isinstance(suggestion, OrderSuggestion):
+            return f"order:{suggestion.order_idx}"
+        if isinstance(suggestion, RelocateSuggestion):
+            return f"relocate:{suggestion.job.sku}"
+        if isinstance(suggestion, DockSuggestion):
+            return f"dock:{suggestion.sku}:{suggestion.center[0]}:{suggestion.center[1]}"
+        return f"unknown:{id(suggestion)}"
+
+    def _suggestion_backoff_cycles(self, failure_count: int) -> int:
+        base = max(1, int(self.config.suggestion_backoff_base_cycles))
+        max_backoff = max(base, int(self.config.suggestion_backoff_max_cycles))
+        exp = max(0, int(failure_count) - 1)
+        return min(max_backoff, base * (2**exp))
+
+    def _candidate_robots_for_suggestion(self, suggestion: Suggestion) -> List[RobotState]:
+        center = suggestion.center
+        ranked = sorted(
+            self.robots,
+            key=lambda r: (
+                r.last_t,
+                abs(r.x - center[0]) + abs(r.y - center[1]),
+                r.id,
+            ),
+        )
+        limit = max(1, min(int(self.config.max_robots_per_suggestion), len(ranked)))
+        return ranked[:limit]
+
+    def _parking_candidate_cells_for_robot(self, robot: RobotState) -> List[Tuple[int, int]]:
+        other_robot_cells = {(r.x, r.y) for r in self.robots if r.id != robot.id}
+        scored: List[Tuple[int, int, int, int]] = []
+        for y in range(self.state.height):
+            for x in range(self.state.width):
+                cell = (x, y)
+                if cell in self.scheduler.pallets:
+                    continue
+                if cell in self.travel_lane_cells:
+                    continue
+                if cell in other_robot_cells:
+                    continue
+                # Avoid blocking perimeter fulfillment cells.
+                if x == 0 or x == self.state.width - 1 or y == 0 or y == self.state.height - 1:
+                    continue
+                dist = abs(x - robot.x) + abs(y - robot.y)
+                if dist <= 0:
+                    continue
+                use_score = int(self.past_analysis.use_by_cell.get(cell, 0))
+                scored.append((use_score, dist, y, x))
+        scored.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
+        limit = max(1, int(self.config.parking_candidate_limit))
+        return [(x, y) for _, _, y, x in scored[:limit]]
+
+    def _plan_idle_parking_move(self, robot: RobotState) -> bool:
+        if robot.docks:
+            return False
+
+        for tx, ty in self._parking_candidate_cells_for_robot(robot):
+            path = self._safe_plan_path(robot, tx, ty)
+            if not path:
+                continue
+            if len(path) > self.config.path_step_limit:
+                continue
+
+            temp_robot = self._clone_robot_state(robot)
+            pending_actions: List[Tuple[int, int, str, int, int]] = []
+            pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+            pending_footprints: List[Tuple[RobotState, int, int, int]] = []
+
+            pending_paths.append((self._clone_robot_state(temp_robot), path))
+            pending_actions.extend(self._apply_moves_to_robot(temp_robot, path))
+            if not pending_actions:
+                continue
+            if not self._can_commit_pending_actions(pending_actions):
+                continue
+
+            self._commit_plan(
+                robot=robot,
+                temp_robot=temp_robot,
+                pending_actions=pending_actions,
+                pending_paths=pending_paths,
+                pending_footprints=pending_footprints,
+            )
+            self._log(
+                f"idle_parking_move robot={robot.id} target=({tx},{ty}) "
+                f"path_len={len(path)} last_t={robot.last_t}"
+            )
+            return True
+        return False
 
     def _next_available_robot(self) -> RobotState:
         return min(self.robots, key=lambda r: (r.last_t, r.id))

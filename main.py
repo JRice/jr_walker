@@ -21,6 +21,10 @@ from jr_walker.writer import write_actions
 from jr_walker.analysis import build_and_store_solution_metadata
 
 
+class UserInterruptError(ValidationError):
+    """Raised when planning is interrupted by Ctrl-C after saving partial state."""
+
+
 def make_unique_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -66,6 +70,12 @@ class RunConfig:
     astar_slow_ms: float = 40.0
     astar_print_slow: bool = False
     astar_log_blocked: bool = False
+    suggestion_retry_limit: int = 12
+    suggestion_backoff_base_cycles: int = 2
+    suggestion_backoff_max_cycles: int = 128
+    max_robots_per_suggestion: int = 3
+    robot_fail_streak_for_parking: int = 3
+    parking_candidate_limit: int = 96
     lns_enabled: bool = True
     lns_iterations: int = 60
     lns_window_actions: int = 28
@@ -210,6 +220,40 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.ticks_to_full_validation",
         minimum=0,
     )
+    run_config.suggestion_retry_limit = _require_int(
+        solver_section.get("suggestion_retry_limit", run_config.suggestion_retry_limit),
+        "solver.suggestion_retry_limit",
+        minimum=1,
+    )
+    run_config.suggestion_backoff_base_cycles = _require_int(
+        solver_section.get("suggestion_backoff_base_cycles", run_config.suggestion_backoff_base_cycles),
+        "solver.suggestion_backoff_base_cycles",
+        minimum=1,
+    )
+    run_config.suggestion_backoff_max_cycles = _require_int(
+        solver_section.get("suggestion_backoff_max_cycles", run_config.suggestion_backoff_max_cycles),
+        "solver.suggestion_backoff_max_cycles",
+        minimum=1,
+    )
+    if run_config.suggestion_backoff_max_cycles < run_config.suggestion_backoff_base_cycles:
+        raise ValueError(
+            "solver.suggestion_backoff_max_cycles must be >= solver.suggestion_backoff_base_cycles."
+        )
+    run_config.max_robots_per_suggestion = _require_int(
+        solver_section.get("max_robots_per_suggestion", run_config.max_robots_per_suggestion),
+        "solver.max_robots_per_suggestion",
+        minimum=1,
+    )
+    run_config.robot_fail_streak_for_parking = _require_int(
+        solver_section.get("robot_fail_streak_for_parking", run_config.robot_fail_streak_for_parking),
+        "solver.robot_fail_streak_for_parking",
+        minimum=1,
+    )
+    run_config.parking_candidate_limit = _require_int(
+        solver_section.get("parking_candidate_limit", run_config.parking_candidate_limit),
+        "solver.parking_candidate_limit",
+        minimum=1,
+    )
 
     limits_section = _get_table(data, "limits")
     raw_max_makespan = limits_section.get("max_makespan", run_config.max_makespan)
@@ -283,6 +327,12 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             astar_slow_ms=run_config.astar_slow_ms,
             astar_print_slow=run_config.astar_print_slow,
             astar_log_blocked=run_config.astar_log_blocked,
+            suggestion_retry_limit=run_config.suggestion_retry_limit,
+            suggestion_backoff_base_cycles=run_config.suggestion_backoff_base_cycles,
+            suggestion_backoff_max_cycles=run_config.suggestion_backoff_max_cycles,
+            max_robots_per_suggestion=run_config.max_robots_per_suggestion,
+            robot_fail_streak_for_parking=run_config.robot_fail_streak_for_parking,
+            parking_candidate_limit=run_config.parking_candidate_limit,
             worklist_path=Path(run_config.input_path),
             lns_enabled=run_config.lns_enabled,
             lns_iterations=run_config.lns_iterations,
@@ -319,6 +369,24 @@ def _run_pipeline(
             )
         print(f"Validation passed. Fulfilled {final_state.fulfilled_orders}/{final_state.total_orders} orders by timestep {final_state.next_timestep}.")
 
+    except KeyboardInterrupt:
+        solve_error = UserInterruptError(
+            "Validation interrupted: user pressed Ctrl-C; writing partial solution."
+        )
+        print(f"Solver/optimizer failed: {type(solve_error).__name__}: {solve_error!r}")
+        if base_actions:
+            print("Reverting to pre-LNS baseline actions...")
+            actions = list(base_actions)
+        elif actions:
+            print("Writing best-known actions from current attempt...")
+        else:
+            print("Writing partial output from actions planned so far...")
+            actions = solver.actions.sorted_actions()
+        try:
+            actions = solver._repair_idle_wait_conflicts(actions)
+        except Exception:
+            # Best-effort only; keep raw planned actions if repair fails.
+            pass
     except Exception as exc:
         solve_error = exc
         print(f"Solver/optimizer failed: {type(exc).__name__}: {exc!r}")
@@ -472,6 +540,12 @@ def main():
             f"strict_no_swap={run_config.strict_no_swap}, "
             f"ticks_to_full_validation={run_config.ticks_to_full_validation}, "
             f"astar_slow_ms={run_config.astar_slow_ms}, "
+            f"suggestion_retry_limit={run_config.suggestion_retry_limit}, "
+            f"suggestion_backoff_base_cycles={run_config.suggestion_backoff_base_cycles}, "
+            f"suggestion_backoff_max_cycles={run_config.suggestion_backoff_max_cycles}, "
+            f"max_robots_per_suggestion={run_config.max_robots_per_suggestion}, "
+            f"robot_fail_streak_for_parking={run_config.robot_fail_streak_for_parking}, "
+            f"parking_candidate_limit={run_config.parking_candidate_limit}, "
             f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."
         )
 
@@ -511,8 +585,13 @@ def main():
             any_success = True
         else:
             last_error = solve_error
+            if isinstance(solve_error, UserInterruptError):
+                print("Interrupted by Ctrl-C. Stopping after writing partial solution.")
+                break
 
     if not any_success and last_error is not None:
+        if isinstance(last_error, UserInterruptError):
+            raise SystemExit(130)
         raise SystemExit(1)
 
 
