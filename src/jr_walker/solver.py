@@ -633,16 +633,28 @@ class WarehouseSolver:
             return
 
         actions_snapshot = self.actions.sorted_actions()
-        is_valid = self._validate_candidate_actions(
-            actions_snapshot,
-            log_on_error=True,
-            require_complete=False,
-        )
-        if not is_valid:
+        validator = SubmissionValidator(worklist_text=self._worklist_text_from_state())
+        periodic_error: str | None = None
+        try:
+            for t, rid, action, x, y in actions_snapshot:
+                validator.validate_line(f"{t} {rid} {action} {x} {y}")
+            # For periodic dispatch checks we only care about legality/collisions.
+            # Incomplete fulfillment is expected mid-run and is not an error.
+            validator.finalize()
+        except ValidationError as exc:
+            periodic_error = str(exc)
+
+        if periodic_error is not None:
+            self._log(
+                "periodic_validation_error "
+                f"makespan={current_makespan} dispatches={dispatch_count} "
+                f"completed={completed}/{total_orders} error={periodic_error}"
+            )
             raise RuntimeError(
                 "Periodic dispatch validation failed at "
                 f"makespan={current_makespan}, dispatches={dispatch_count}, "
-                f"completed_orders={completed}/{total_orders}."
+                f"completed_orders={completed}/{total_orders}. "
+                f"Validator error: {periodic_error}"
             )
 
         self._log(

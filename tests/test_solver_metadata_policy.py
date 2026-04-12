@@ -31,7 +31,13 @@ class SolverMetadataPolicyTests(unittest.TestCase):
 
     def _new_solver_shell(self) -> WarehouseSolver:
         solver = WarehouseSolver.__new__(WarehouseSolver)
-        solver.state = SimpleNamespace(width=60, height=40)
+        solver.state = SimpleNamespace(
+            width=60,
+            height=40,
+            robots=[(0, 0)],
+            pallets={(5, 5): 1},
+            orders=[[1]],
+        )
         solver.scheduler = SimpleNamespace(pallets={})
         solver.travel_lane_cells = set()
         solver.past_analysis = PastRunAnalysis()
@@ -43,7 +49,6 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver._next_dispatch_validation_makespan = 500
         solver.robots = [SimpleNamespace(last_t=500)]
         solver.actions = SimpleNamespace(sorted_actions=lambda: [(0, 0, "move", 1, 0)])
-        solver._validate_candidate_actions = lambda *args, **kwargs: True
         solver._log = lambda msg: None
 
         solver._maybe_validate_dispatch_progress_or_raise(
@@ -58,8 +63,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver.config = SimpleNamespace(dispatch_validate_every_makespan=500)
         solver._next_dispatch_validation_makespan = 500
         solver.robots = [SimpleNamespace(last_t=700)]
-        solver.actions = SimpleNamespace(sorted_actions=lambda: [(0, 0, "move", 1, 0)])
-        solver._validate_candidate_actions = lambda *args, **kwargs: False
+        solver.actions = SimpleNamespace(sorted_actions=lambda: [(0, 0, "move", 2, 0)])
         solver._log = lambda msg: None
 
         with self.assertRaises(RuntimeError):
