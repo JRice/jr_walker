@@ -10,7 +10,14 @@ from typing import Deque, Dict, List, Tuple
 
 import numpy as np
 
-from jr_walker.logic import EdgeAwareOrderScorer, OrderOptimizer, OrderSuggestion, RelocateSuggestion, Suggestion
+from jr_walker.logic import (
+    DockSuggestion,
+    EdgeAwareOrderScorer,
+    OrderOptimizer,
+    OrderSuggestion,
+    RelocateSuggestion,
+    Suggestion,
+)
 from jr_walker.planner import adjacent_cells
 from jr_walker.planner import ReservationPlanner
 from jr_walker.scheduler import GreedyScheduler
@@ -106,6 +113,8 @@ class SolverConfig:
     relocation_skus_to_relocate: List[int] | None = None
     num_allowed_relocations: int = 10
     order_suggestion_gain_constant: float = 100.0
+    dock_gain_scale: float = 2.0
+    relocation_gain_scale: float = 1.5
     lane_width: int = 3
     min_jobs_for_dock: int = 3
     log_path: Path | None = None
@@ -299,6 +308,7 @@ class WarehouseSolver:
             self.pallet_initial_xy[pallet_id] = (px, py)
 
         self.relocated_skus: set[int] = set()
+        self.docked_skus: set[int] = set()
         self.relocated_pallet_targets: set[Tuple[int, int]] = set()
         self._completed_order_indices: set[int] = set()
         sku_counter: collections.Counter = collections.Counter()
@@ -375,6 +385,8 @@ class WarehouseSolver:
                 continue
             if isinstance(suggestion, RelocateSuggestion) and suggestion.job.sku in self.relocated_skus:
                 continue
+            if isinstance(suggestion, DockSuggestion) and suggestion.sku in self.docked_skus:
+                continue
 
             # Find the best robot (earliest available) to handle this suggestion
             robot = self._next_available_robot()
@@ -399,7 +411,23 @@ class WarehouseSolver:
                         f"relocation_done sku={suggestion.job.sku} bucket={suggestion.job.bucket} "
                         f"target={suggestion.job.preferred_target_xy} score={suggestion.job.score:.3f}"
                     )
+                    # Re-score pending delivery/order suggestions against the new pallet layout.
+                    # Keep existing non-order suggestions (relocate/dock) as-is.
+                    suggestion_queue = self._refresh_pending_order_suggestions(
+                        suggestion_queue,
+                        completed_orders,
+                    )
                     # Don't requeue successful relocations.
+                else:
+                    suggestion_queue.append(suggestion)
+            elif isinstance(suggestion, DockSuggestion):
+                handled = self._plan_dock_pallet(robot, suggestion.sku)
+                if handled:
+                    self.docked_skus.add(suggestion.sku)
+                    self._log(
+                        f"dock_done sku={suggestion.sku} center={suggestion.center} "
+                        f"gain={suggestion.expected_gain:.3f} score={suggestion.score():.3f}"
+                    )
                 else:
                     suggestion_queue.append(suggestion)
 
@@ -469,7 +497,9 @@ class WarehouseSolver:
             max_relocate_gain = max(s.expected_gain for s in relocate_suggestions)
             if max_relocate_gain > 0:
                 # Scale so the best relocation has a gain comparable to the order constant
-                scaling_factor = self.config.order_suggestion_gain_constant / max_relocate_gain
+                scaling_factor = (
+                    self.config.order_suggestion_gain_constant / max_relocate_gain
+                ) * self.config.relocation_gain_scale
                 self._log(f"Normalizing relocation gains by factor {scaling_factor:.3f}")
                 for s in relocate_suggestions:
                     s.scale_gain(scaling_factor)
@@ -482,32 +512,12 @@ class WarehouseSolver:
         # 2. Generate DockSuggestions from past run analysis
         if self.past_analysis.fulfills:
             dock_suggestions = self._build_dock_suggestions()
+            self._log(f"dock_suggestions count={len(dock_suggestions)} scale={self.config.dock_gain_scale:.3f}")
             all_suggestions.extend(dock_suggestions)
 
         # 2. Generate OrderSuggestions
-        optimizer = OrderOptimizer(self.state.pallets)
-        scored_orders = optimizer.sort_orders_by_cluster_efficiency([o.items for o in self.orders])
-
-        for scored_order in scored_orders:
-            order_idx = scored_order["order_idx"]
-            order = self.orders[order_idx]
-            unique_skus = list(order.items.keys())
-            cluster, bbox_score = optimizer.find_tightest_cluster(unique_skus)
-            if cluster is None:
-                self._log(f"Could not find a pallet cluster for order {order_idx}, skipping suggestion.")
-                continue
-
-            all_suggestions.append(
-                OrderSuggestion(
-                    order_idx=order_idx,
-                    order=order.items,
-                    cluster=cluster,
-                    order_gain_constant=self.config.order_suggestion_gain_constant,
-                    warehouse_width=self.state.width,
-                    warehouse_height=self.state.height,
-                    scheduler=self.scheduler,
-                )
-            )
+        all_order_indexes = list(range(len(self.orders)))
+        all_suggestions.extend(self._build_order_suggestions_for_indexes(all_order_indexes))
 
         # 3. Sort the combined list
         all_suggestions.sort(key=lambda s: s.score(), reverse=True)
@@ -541,6 +551,62 @@ class WarehouseSolver:
                 self._log("tomli_w not installed, cannot dump suggestions.")
 
         return all_suggestions
+
+    def _build_order_suggestions_for_indexes(self, order_indexes: List[int]) -> List[OrderSuggestion]:
+        suggestions: List[OrderSuggestion] = []
+        if not order_indexes:
+            return suggestions
+
+        # Use current scheduler pallet positions (includes relocations).
+        optimizer = OrderOptimizer(self.scheduler.pallets)
+        scored_orders: List[Tuple[int, int, dict]] = []
+
+        for order_idx in order_indexes:
+            order = self.orders[order_idx]
+            unique_skus = list(order.items.keys())
+            cluster, bbox_score = optimizer.find_tightest_cluster(unique_skus)
+            if cluster is None:
+                self._log(f"Could not find a pallet cluster for order {order_idx}, skipping suggestion.")
+                continue
+            scored_orders.append((int(bbox_score), int(order_idx), cluster))
+
+        scored_orders.sort(key=lambda row: (row[0], row[1]))
+        for _, order_idx, cluster in scored_orders:
+            order = self.orders[order_idx]
+            suggestions.append(
+                OrderSuggestion(
+                    order_idx=order_idx,
+                    order=order.items,
+                    cluster=cluster,
+                    order_gain_constant=self.config.order_suggestion_gain_constant,
+                    warehouse_width=self.state.width,
+                    warehouse_height=self.state.height,
+                    scheduler=self.scheduler,
+                )
+            )
+        return suggestions
+
+    def _refresh_pending_order_suggestions(
+        self,
+        suggestion_queue: collections.deque[Suggestion],
+        completed_orders: set[int],
+    ) -> collections.deque[Suggestion]:
+        pending_non_order: List[Suggestion] = [
+            s for s in suggestion_queue if not isinstance(s, OrderSuggestion)
+        ]
+        remaining_order_indexes = [
+            order.order_idx for order in self.orders if order.order_idx not in completed_orders
+        ]
+        refreshed_order_suggestions = self._build_order_suggestions_for_indexes(remaining_order_indexes)
+        merged: List[Suggestion] = pending_non_order + refreshed_order_suggestions
+        merged.sort(key=lambda s: s.score(), reverse=True)
+        self._log(
+            "order_suggestions_refreshed "
+            f"remaining_orders={len(remaining_order_indexes)} "
+            f"order_suggestions={len(refreshed_order_suggestions)} "
+            f"non_order_suggestions={len(pending_non_order)}"
+        )
+        return collections.deque(merged)
 
     def _count_remaining_orders_for_sku(self, sku: int) -> int:
         remaining = 0
@@ -593,7 +659,11 @@ class WarehouseSolver:
                                 continue
                             
                             nearest_pallet = min(pallet_locs, key=lambda p: manhattan_distance(p, order_center))
-                            gain = manhattan_distance(order_center, nearest_pallet) * len(current_streak)
+                            gain = (
+                                manhattan_distance(order_center, nearest_pallet)
+                                * len(current_streak)
+                                * self.config.dock_gain_scale
+                            )
                             suggestions.append(DockSuggestion(sku, list(current_streak), gain, nearest_pallet))
                         current_streak = []
         return suggestions

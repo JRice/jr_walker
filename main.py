@@ -54,8 +54,11 @@ class RunConfig:
     min_jobs_for_dock: int = 3
     max_makespan: int | None = None
     max_plan_time_seconds: float = 600.0
+    relocation_top_skus: int = 8
     num_allowed_relocations: int = 10
     order_suggestion_gain_constant: float = 100.0
+    dock_gain_scale: float = 2.0
+    relocation_gain_scale: float = 1.5
     ticks_to_full_validation: int = 500
     astar_slow_ms: float = 40.0
     astar_print_slow: bool = False
@@ -150,9 +153,24 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.num_allowed_relocations",
         minimum=0,
     )
+    run_config.relocation_top_skus = _require_int(
+        solver_section.get("relocation_top_skus", run_config.relocation_top_skus),
+        "solver.relocation_top_skus",
+        minimum=1,
+    )
     run_config.order_suggestion_gain_constant = _require_number(
         solver_section.get("order_suggestion_gain_constant", run_config.order_suggestion_gain_constant),
         "solver.order_suggestion_gain_constant",
+        minimum=0.0,
+    )
+    run_config.dock_gain_scale = _require_number(
+        solver_section.get("dock_gain_scale", run_config.dock_gain_scale),
+        "solver.dock_gain_scale",
+        minimum=0.0,
+    )
+    run_config.relocation_gain_scale = _require_number(
+        solver_section.get("relocation_gain_scale", run_config.relocation_gain_scale),
+        "solver.relocation_gain_scale",
         minimum=0.0,
     )
     run_config.astar_slow_ms = _require_number(
@@ -235,8 +253,11 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             log_path=Path(run_config.log_path),
             lane_width=run_config.lane_width,
             relocation_edge_band=run_config.relocation_edge_band,
+            relocation_top_skus=run_config.relocation_top_skus,
             num_allowed_relocations=run_config.num_allowed_relocations,
             order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
+            dock_gain_scale=run_config.dock_gain_scale,
+            relocation_gain_scale=run_config.relocation_gain_scale,
             dispatch_validate_every_makespan=run_config.ticks_to_full_validation,
             astar_slow_ms=run_config.astar_slow_ms,
             astar_print_slow=run_config.astar_print_slow,
@@ -423,6 +444,10 @@ def main():
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "
             f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "
+            f"relocation_top_skus={run_config.relocation_top_skus}, "
+            f"num_allowed_relocations={run_config.num_allowed_relocations}, "
+            f"dock_gain_scale={run_config.dock_gain_scale}, "
+            f"relocation_gain_scale={run_config.relocation_gain_scale}, "
             f"ticks_to_full_validation={run_config.ticks_to_full_validation}, "
             f"astar_slow_ms={run_config.astar_slow_ms}, "
             f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."

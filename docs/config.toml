@@ -18,6 +18,14 @@ input_path = "docs/BIG_ORDER.txt"
 [solver]
 # Reservation horizon (space-time planner tensor depth).
 max_time = 50000
+# Number of highest-lift SKU relocation candidates to build.
+relocation_top_skus = 16
+# Max relocation suggestions admitted into the dispatch queue.
+num_allowed_relocations = 18
+# Scales DockSuggestion expected gain (higher => more likely to do strategic docking).
+dock_gain_scale = 1.2
+# Scales normalized relocation gain after order-relative normalization.
+relocation_gain_scale = 1.5
 # Run full validator replay every N makespan ticks during dispatch.
 # Set to 0 to disable periodic validation.
 ticks_to_full_validation = 500
