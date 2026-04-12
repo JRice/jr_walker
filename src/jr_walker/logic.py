@@ -96,6 +96,25 @@ class DockSuggestion(Suggestion):
         return self._center
 
 
+class SetupSuggestion(Suggestion):
+    def __init__(self, job):
+        self.job = job
+        self._cost = 0.0
+        self._gain = 10000.0
+
+    @property
+    def expected_cost(self) -> float:
+        return self._cost
+
+    @property
+    def expected_gain(self) -> float:
+        return self._gain
+
+    @property
+    def center(self) -> Tuple[int, int]:
+        return self.job.source_xy
+
+
 class OrderSuggestion(Suggestion):
     def __init__(self, order_idx, order, cluster, order_gain_constant, warehouse_width, warehouse_height, scheduler):
         self.order_idx = order_idx

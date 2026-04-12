@@ -3,7 +3,7 @@ from pathlib import Path
 import argparse
 import tomllib
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 import sqlite3
 import uuid
@@ -55,6 +55,8 @@ class RunConfig:
     lane_width: int = 3
     relocation_edge_band: int = 6
     relocate_chunk_size: int = 1
+    setup_hotspot_radius: int = 10
+    setup_hotspots: list[tuple[int, int]] = field(default_factory=list)
     relocation_skus_to_relocate: list[int] | None = None
     max_time: int = 50000
     min_jobs_for_dock: int = 3
@@ -70,6 +72,7 @@ class RunConfig:
     astar_slow_ms: float = 40.0
     astar_print_slow: bool = False
     astar_log_blocked: bool = False
+    enable_relocation_suggestions: bool = False
     suggestion_retry_limit: int = 12
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
@@ -156,6 +159,31 @@ def load_run_config(config_path: Path) -> RunConfig:
         "relocation.relocate_chunk_size",
         minimum=1,
     )
+    run_config.setup_hotspot_radius = _require_int(
+        relocation_section.get("setup_hotspot_radius", run_config.setup_hotspot_radius),
+        "relocation.setup_hotspot_radius",
+        minimum=0,
+    )
+    raw_setup_hotspots = relocation_section.get("setup_hotspots", run_config.setup_hotspots)
+    if not isinstance(raw_setup_hotspots, list):
+        raise ValueError("relocation.setup_hotspots must be a list of [x, y] pairs.")
+    parsed_hotspots: list[tuple[int, int]] = []
+    for idx, cell in enumerate(raw_setup_hotspots):
+        if not isinstance(cell, (list, tuple)) or len(cell) != 2:
+            raise ValueError(f"relocation.setup_hotspots[{idx}] must be [x, y].")
+        x = _require_int(cell[0], f"relocation.setup_hotspots[{idx}][0]", minimum=0)
+        y = _require_int(cell[1], f"relocation.setup_hotspots[{idx}][1]", minimum=0)
+        parsed_hotspots.append((x, y))
+    run_config.setup_hotspots = parsed_hotspots
+
+    raw_reloc_skus = relocation_section.get("skus_to_relocate")
+    if raw_reloc_skus is not None:
+        if not isinstance(raw_reloc_skus, list):
+            raise ValueError("relocation.skus_to_relocate must be a list of integers.")
+        run_config.relocation_skus_to_relocate = [
+            _require_int(v, f"relocation.skus_to_relocate[{i}]", minimum=1)
+            for i, v in enumerate(raw_reloc_skus)
+        ]
     solver_section = _get_table(data, "solver")
     run_config.max_time = _require_int(
         solver_section.get("max_time", run_config.max_time),
@@ -215,6 +243,12 @@ def load_run_config(config_path: Path) -> RunConfig:
     if not isinstance(raw_astar_log_blocked, bool):
         raise ValueError("solver.astar_log_blocked must be a boolean.")
     run_config.astar_log_blocked = raw_astar_log_blocked
+    raw_enable_relocation = solver_section.get(
+        "enable_relocation_suggestions", run_config.enable_relocation_suggestions
+    )
+    if not isinstance(raw_enable_relocation, bool):
+        raise ValueError("solver.enable_relocation_suggestions must be a boolean.")
+    run_config.enable_relocation_suggestions = raw_enable_relocation
     run_config.ticks_to_full_validation = _require_int(
         solver_section.get("ticks_to_full_validation", run_config.ticks_to_full_validation),
         "solver.ticks_to_full_validation",
@@ -317,6 +351,8 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             lane_width=run_config.lane_width,
             relocation_edge_band=run_config.relocation_edge_band,
             relocate_chunk_size=run_config.relocate_chunk_size,
+            setup_hotspot_radius=run_config.setup_hotspot_radius,
+            setup_hotspots=list(run_config.setup_hotspots),
             relocation_top_skus=run_config.relocation_top_skus,
             num_allowed_relocations=run_config.num_allowed_relocations,
             order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
@@ -327,6 +363,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             astar_slow_ms=run_config.astar_slow_ms,
             astar_print_slow=run_config.astar_print_slow,
             astar_log_blocked=run_config.astar_log_blocked,
+            enable_relocation_suggestions=run_config.enable_relocation_suggestions,
             suggestion_retry_limit=run_config.suggestion_retry_limit,
             suggestion_backoff_base_cycles=run_config.suggestion_backoff_base_cycles,
             suggestion_backoff_max_cycles=run_config.suggestion_backoff_max_cycles,
@@ -530,6 +567,8 @@ def main():
             f"lane_width={run_config.lane_width}, "
             f"edge_band_for_heatmap={run_config.relocation_edge_band}, "
             f"relocate_chunk_size={run_config.relocate_chunk_size}, "
+            f"setup_hotspot_radius={run_config.setup_hotspot_radius}, "
+            f"setup_hotspots={run_config.setup_hotspots}, "
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "
             f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "
@@ -540,6 +579,7 @@ def main():
             f"strict_no_swap={run_config.strict_no_swap}, "
             f"ticks_to_full_validation={run_config.ticks_to_full_validation}, "
             f"astar_slow_ms={run_config.astar_slow_ms}, "
+            f"enable_relocation_suggestions={run_config.enable_relocation_suggestions}, "
             f"suggestion_retry_limit={run_config.suggestion_retry_limit}, "
             f"suggestion_backoff_base_cycles={run_config.suggestion_backoff_base_cycles}, "
             f"suggestion_backoff_max_cycles={run_config.suggestion_backoff_max_cycles}, "

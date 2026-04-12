@@ -16,6 +16,7 @@ from jr_walker.logic import (
     OrderOptimizer,
     OrderSuggestion,
     RelocateSuggestion,
+    SetupSuggestion,
     Suggestion,
     manhattan_distance,
 )
@@ -67,6 +68,15 @@ class RelocationJob:
     preferred_target_xy: Tuple[int, int] | None = None
     attempts: int = 0
     metadata: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class SetupJob:
+    sku: int
+    hotspot: Tuple[int, int]
+    source_pallet_id: int
+    source_xy: Tuple[int, int]
+    target_xy: Tuple[int, int]
 
 
 @dataclass
@@ -133,6 +143,9 @@ class SolverConfig:
     astar_slow_ms: float = 40.0
     astar_print_slow: bool = False
     astar_log_blocked: bool = False
+    enable_relocation_suggestions: bool = False
+    setup_hotspots: List[Tuple[int, int]] = field(default_factory=list)
+    setup_hotspot_radius: int = 10
     suggestion_retry_limit: int = 12
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
@@ -325,7 +338,12 @@ class WarehouseSolver:
         for order in self.orders:
             sku_counter.update(order.items)
         self.skus_by_demand: List[int] = [sku for sku, _ in sku_counter.most_common()]
-        self.relocation_plan: Deque[RelocationJob] = self._build_relocation_plan()
+        if self.config.enable_relocation_suggestions:
+            self.relocation_plan: Deque[RelocationJob] = self._build_relocation_plan()
+        else:
+            self.relocation_plan = collections.deque()
+        self.setup_jobs: List[SetupJob] = self._build_setup_jobs()
+        self._completed_setup_pallet_ids: set[int] = set()
 
         self._plan_started_monotonic = 0.0
         self._log_handle = None
@@ -404,6 +422,8 @@ class WarehouseSolver:
             # Skip if already handled
             if isinstance(suggestion, OrderSuggestion) and suggestion.order_idx in completed_orders:
                 continue
+            if isinstance(suggestion, SetupSuggestion) and suggestion.job.source_pallet_id in self._completed_setup_pallet_ids:
+                continue
             if isinstance(suggestion, RelocateSuggestion) and suggestion.job.sku in self.relocated_skus:
                 continue
             if isinstance(suggestion, DockSuggestion) and suggestion.sku in self.docked_skus:
@@ -417,6 +437,19 @@ class WarehouseSolver:
                     handled = self._plan_order_for_robot(suggestion.order_idx, suggestion.order, robot)
                     if handled:
                         completed_orders.add(suggestion.order_idx)
+                elif isinstance(suggestion, SetupSuggestion):
+                    handled = self._plan_setup_pallet_for_robot(robot, suggestion.job)
+                    if handled:
+                        self._completed_setup_pallet_ids.add(suggestion.job.source_pallet_id)
+                        self._log(
+                            f"setup_done sku={suggestion.job.sku} source={suggestion.job.source_xy} "
+                            f"target={suggestion.job.target_xy} hotspot={suggestion.job.hotspot}"
+                        )
+                        if len(self._completed_setup_pallet_ids) >= len(self.setup_jobs):
+                            suggestion_queue = self._refresh_pending_order_suggestions(
+                                suggestion_queue,
+                                completed_orders,
+                            )
                 elif isinstance(suggestion, RelocateSuggestion):
                     if suggestion.remaining_job_factor() <= 0:
                         handled = True
@@ -532,52 +565,59 @@ class WarehouseSolver:
 
     def _build_suggestion_queue(self) -> List[Suggestion]:
         """
-        Generates and returns a list of all suggestions (Order and Relocate),
-        sorted by their score (gain - cost).
+        Generates and returns a list of all suggestions.
+        SetupSuggestion items are forced to the front while any remain.
         """
         all_suggestions: List[Suggestion] = []
+        setup_suggestions: List[Suggestion] = self._build_setup_suggestions()
+        all_suggestions.extend(setup_suggestions)
+        non_setup_suggestions: List[Suggestion] = []
 
-        # 1. Generate RelocateSuggestions
-        relocate_suggestions: List[RelocateSuggestion] = []
-        relocation_jobs = list(self.relocation_plan)
-        for job in relocation_jobs:
-            relocate_suggestions.append(
-                RelocateSuggestion(
-                    job,
-                    self.scheduler,
-                    remaining_job_factor_fn=self._count_remaining_orders_for_sku,
+        # 1. Generate RelocateSuggestions (optional; disabled by default).
+        if self.config.enable_relocation_suggestions:
+            relocate_suggestions: List[RelocateSuggestion] = []
+            relocation_jobs = list(self.relocation_plan)
+            for job in relocation_jobs:
+                relocate_suggestions.append(
+                    RelocateSuggestion(
+                        job,
+                        self.scheduler,
+                        remaining_job_factor_fn=self._count_remaining_orders_for_sku,
+                    )
                 )
-            )
 
-        # Normalize RelocateSuggestion gains to be on a similar scale to OrderSuggestion gains.
-        if relocate_suggestions:
-            max_relocate_gain = max(s.expected_gain for s in relocate_suggestions)
-            if max_relocate_gain > 0:
-                # Scale so the best relocation has a gain comparable to the order constant
-                scaling_factor = (
-                    self.config.order_suggestion_gain_constant / max_relocate_gain
-                ) * self.config.relocation_gain_scale
-                self._log(f"Normalizing relocation gains by factor {scaling_factor:.3f}")
-                for s in relocate_suggestions:
-                    s.scale_gain(scaling_factor)
+            # Normalize RelocateSuggestion gains to be on a similar scale to OrderSuggestion gains.
+            if relocate_suggestions:
+                max_relocate_gain = max(s.expected_gain for s in relocate_suggestions)
+                if max_relocate_gain > 0:
+                    # Scale so the best relocation has a gain comparable to the order constant
+                    scaling_factor = (
+                        self.config.order_suggestion_gain_constant / max_relocate_gain
+                    ) * self.config.relocation_gain_scale
+                    self._log(f"Normalizing relocation gains by factor {scaling_factor:.3f}")
+                    for s in relocate_suggestions:
+                        s.scale_gain(scaling_factor)
 
-        # Sort and truncate RelocateSuggestions
-        relocate_suggestions.sort(key=lambda s: s.score(), reverse=True)
-        if self.config.num_allowed_relocations >= 0:
-            all_suggestions.extend(relocate_suggestions[: self.config.num_allowed_relocations])
+            # Sort and truncate RelocateSuggestions
+            relocate_suggestions.sort(key=lambda s: s.score(), reverse=True)
+            if self.config.num_allowed_relocations >= 0:
+                non_setup_suggestions.extend(relocate_suggestions[: self.config.num_allowed_relocations])
+        else:
+            self._log("RelocateSuggestion generation disabled by config.")
 
         # 2. Generate DockSuggestions from past run analysis
         if self.past_analysis.fulfills:
             dock_suggestions = self._build_dock_suggestions()
             self._log(f"dock_suggestions count={len(dock_suggestions)} scale={self.config.dock_gain_scale:.3f}")
-            all_suggestions.extend(dock_suggestions)
+            non_setup_suggestions.extend(dock_suggestions)
 
-        # 2. Generate OrderSuggestions
+        # 3. Generate OrderSuggestions
         all_order_indexes = list(range(len(self.orders)))
-        all_suggestions.extend(self._build_order_suggestions_for_indexes(all_order_indexes))
+        non_setup_suggestions.extend(self._build_order_suggestions_for_indexes(all_order_indexes))
 
-        # 3. Sort the combined list
-        all_suggestions.sort(key=lambda s: s.score(), reverse=True)
+        # 4. Sort non-setup suggestions only; setup suggestions remain at the front.
+        non_setup_suggestions.sort(key=self._suggestion_sort_key)
+        all_suggestions.extend(non_setup_suggestions)
 
         if self.config.dump_suggestions_path:
             dump_data = []
@@ -608,6 +648,183 @@ class WarehouseSolver:
                 self._log("tomli_w not installed, cannot dump suggestions.")
 
         return all_suggestions
+
+    def _suggestion_sort_key(self, suggestion: Suggestion) -> Tuple[int, float]:
+        # Setup suggestions are always ranked ahead of other suggestion types.
+        priority = 0 if isinstance(suggestion, SetupSuggestion) else 1
+        return (priority, -suggestion.score())
+
+    def _normalize_setup_hotspots(self) -> List[Tuple[int, int]]:
+        out: List[Tuple[int, int]] = []
+        seen: set[Tuple[int, int]] = set()
+        for raw in self.config.setup_hotspots:
+            if not isinstance(raw, (tuple, list)) or len(raw) != 2:
+                continue
+            try:
+                x = int(raw[0])
+                y = int(raw[1])
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= x < self.state.width and 0 <= y < self.state.height):
+                continue
+            cell = (x, y)
+            if cell in seen:
+                continue
+            seen.add(cell)
+            out.append(cell)
+        return out
+
+    def _setup_slot_candidates(self, hotspot: Tuple[int, int], limit: int = 240) -> List[Tuple[int, int]]:
+        sx, sy = hotspot
+        out: List[Tuple[int, int]] = []
+
+        # Default pattern: (x,y), (x+1,y), then keep same x/x+1 while moving toward nearest edge.
+        top_dist = sy
+        bottom_dist = self.state.height - 1 - sy
+        if top_dist <= bottom_dist:
+            step = -1
+        else:
+            step = 1
+
+        depth = 0
+        while len(out) < limit:
+            y = sy + (depth * step)
+            if y < 0 or y >= self.state.height:
+                break
+            for x in (sx, sx + 1):
+                if 0 <= x < self.state.width:
+                    out.append((x, y))
+                    if len(out) >= limit:
+                        break
+            depth += 1
+        return out
+
+    def _first_available_setup_target(
+        self,
+        hotspot: Tuple[int, int],
+        *,
+        reserved_targets: set[Tuple[int, int]],
+        source_xy: Tuple[int, int] | None = None,
+    ) -> Tuple[int, int] | None:
+        for cell in self._setup_slot_candidates(hotspot):
+            if cell in reserved_targets:
+                continue
+            if cell in self.scheduler.pallets and cell != source_xy:
+                continue
+            return cell
+        return None
+
+    def _has_sku_within_setup_radius(self, sku: int, hotspot: Tuple[int, int], radius: int) -> bool:
+        hx, hy = hotspot
+        for px, py in self.scheduler.pallet_cells_for_sku(sku):
+            if abs(px - hx) + abs(py - hy) <= radius:
+                return True
+        return False
+
+    def _nearest_pallet_for_sku_within_setup_radius(
+        self, sku: int, hotspot: Tuple[int, int], radius: int
+    ) -> Tuple[int, int] | None:
+        hx, hy = hotspot
+        choices = [
+            (px, py)
+            for px, py in self.scheduler.pallet_cells_for_sku(sku)
+            if abs(px - hx) + abs(py - hy) <= radius
+        ]
+        if not choices:
+            return None
+        return min(choices, key=lambda p: (abs(p[0] - hx) + abs(p[1] - hy), p[1], p[0]))
+
+    def _nearest_unreserved_pallet_for_sku(
+        self,
+        sku: int,
+        hotspot: Tuple[int, int],
+        reserved_pallet_ids: set[int],
+    ) -> Tuple[Tuple[int, int], int] | None:
+        hx, hy = hotspot
+        candidates: List[Tuple[int, int, int]] = []
+        for cell in self.scheduler.pallet_cells_for_sku(sku):
+            pallet_id = self.pallet_id_by_coord.get(cell)
+            if pallet_id is None or pallet_id in reserved_pallet_ids:
+                continue
+            dist = abs(cell[0] - hx) + abs(cell[1] - hy)
+            candidates.append((dist, cell[1], cell[0]))
+        if not candidates:
+            return None
+        _, y, x = min(candidates)
+        cell = (x, y)
+        pallet_id = self.pallet_id_by_coord.get(cell)
+        if pallet_id is None:
+            return None
+        return cell, pallet_id
+
+    def _build_setup_jobs(self) -> List[SetupJob]:
+        hotspots = self._normalize_setup_hotspots()
+        if not hotspots:
+            return []
+
+        radius = max(0, int(self.config.setup_hotspot_radius))
+        all_skus = sorted({int(sku) for sku in self.scheduler.pallets.values()})
+        reserved_pallet_ids: set[int] = set()
+        reserved_targets: set[Tuple[int, int]] = set()
+        jobs: List[SetupJob] = []
+
+        # First pass: reserve pallets already close enough to each hotspot/SKU.
+        for hotspot in hotspots:
+            for sku in all_skus:
+                nearby = self._nearest_pallet_for_sku_within_setup_radius(sku, hotspot, radius)
+                if nearby is None:
+                    continue
+                pallet_id = self.pallet_id_by_coord.get(nearby)
+                if pallet_id is not None:
+                    reserved_pallet_ids.add(pallet_id)
+
+        # Second pass: for missing SKU/hotspot coverage, build setup jobs.
+        for hotspot in hotspots:
+            for sku in all_skus:
+                if self._has_sku_within_setup_radius(sku, hotspot, radius):
+                    continue
+
+                source = self._nearest_unreserved_pallet_for_sku(
+                    sku,
+                    hotspot,
+                    reserved_pallet_ids=reserved_pallet_ids,
+                )
+                if source is None:
+                    continue
+                source_xy, source_pallet_id = source
+
+                target_xy = self._first_available_setup_target(
+                    hotspot,
+                    reserved_targets=reserved_targets,
+                    source_xy=source_xy,
+                )
+                if target_xy is None:
+                    self._log(
+                        f"setup_target_unavailable hotspot={hotspot} sku={sku} source={source_xy}"
+                    )
+                    continue
+
+                reserved_pallet_ids.add(source_pallet_id)
+                reserved_targets.add(target_xy)
+                jobs.append(
+                    SetupJob(
+                        sku=sku,
+                        hotspot=hotspot,
+                        source_pallet_id=source_pallet_id,
+                        source_xy=source_xy,
+                        target_xy=target_xy,
+                    )
+                )
+
+        return jobs
+
+    def _build_setup_suggestions(self) -> List[Suggestion]:
+        suggestions: List[Suggestion] = []
+        for job in self.setup_jobs:
+            suggestions.append(SetupSuggestion(job))
+        if suggestions:
+            self._log(f"setup_suggestions count={len(suggestions)}")
+        return suggestions
 
     def _build_order_suggestions_for_indexes(self, order_indexes: List[int]) -> List[OrderSuggestion]:
         suggestions: List[OrderSuggestion] = []
@@ -656,7 +873,7 @@ class WarehouseSolver:
         ]
         refreshed_order_suggestions = self._build_order_suggestions_for_indexes(remaining_order_indexes)
         merged: List[Suggestion] = pending_non_order + refreshed_order_suggestions
-        merged.sort(key=lambda s: s.score(), reverse=True)
+        merged.sort(key=self._suggestion_sort_key)
         self._log(
             "order_suggestions_refreshed "
             f"remaining_orders={len(remaining_order_indexes)} "
@@ -739,6 +956,10 @@ class WarehouseSolver:
     def _log_solve_start(self, total_orders: int) -> None:
         self._log(f"solve_start total_orders={total_orders}")
         self._log(
+            f"setup_plan count={len(self.setup_jobs)} hotspots={self._normalize_setup_hotspots()} "
+            f"radius={self.config.setup_hotspot_radius}"
+        )
+        self._log(
             "dispatch_policy "
             f"retry_limit={self.config.suggestion_retry_limit} "
             f"backoff_base={self.config.suggestion_backoff_base_cycles} "
@@ -746,6 +967,7 @@ class WarehouseSolver:
             f"robots_per_suggestion={self.config.max_robots_per_suggestion} "
             f"parking_fail_streak={self.config.robot_fail_streak_for_parking}"
         )
+        self._log(f"relocate_suggestions_enabled={self.config.enable_relocation_suggestions}")
         if self.relocation_plan:
             summary = ", ".join(
                 f"SKU{job.sku}->{job.bucket}@{job.placement_offset}(score={job.score:.2f})"
@@ -1193,6 +1415,8 @@ class WarehouseSolver:
     def _suggestion_key(self, suggestion: Suggestion) -> str:
         if isinstance(suggestion, OrderSuggestion):
             return f"order:{suggestion.order_idx}"
+        if isinstance(suggestion, SetupSuggestion):
+            return f"setup:{suggestion.job.source_pallet_id}"
         if isinstance(suggestion, RelocateSuggestion):
             return f"relocate:{suggestion.job.sku}"
         if isinstance(suggestion, DockSuggestion):
@@ -1412,6 +1636,66 @@ class WarehouseSolver:
 
         self._commit_plan(robot, temp_robot, pending_actions, pending_paths, pending_footprints)
         return True
+
+    def _setup_target_candidates(
+        self, job: SetupJob, source_xy: Tuple[int, int], limit: int = 32
+    ) -> List[Tuple[int, int]]:
+        out: List[Tuple[int, int]] = []
+        seen: set[Tuple[int, int]] = set()
+
+        def push(cell: Tuple[int, int]) -> None:
+            if cell in seen:
+                return
+            if cell in self.scheduler.pallets and cell != source_xy:
+                return
+            seen.add(cell)
+            out.append(cell)
+
+        push(job.target_xy)
+        for cell in self._setup_slot_candidates(job.hotspot, limit=240):
+            if len(out) >= limit:
+                break
+            push(cell)
+        return out
+
+    def _plan_setup_pallet_for_robot(self, robot: RobotState, job: SetupJob) -> bool:
+        pallet_info = self.pallet_by_id.get(job.source_pallet_id)
+        if pallet_info is None:
+            return False
+        source_xy = (int(pallet_info["x"]), int(pallet_info["y"]))
+        job.source_xy = source_xy
+        if source_xy == job.target_xy:
+            return True
+
+        stand_cells = self._candidate_relocation_stand_cells(robot, source_xy)
+        if not stand_cells:
+            return False
+
+        target_cells = self._setup_target_candidates(job, source_xy)
+        if not target_cells:
+            return False
+
+        for stand_xy in stand_cells:
+            outcome = self._attempt_relocation_via_stand(
+                robot=robot,
+                pallet_xy=source_xy,
+                pallet_id=job.source_pallet_id,
+                stand_xy=stand_xy,
+                target_pallet_cells=target_cells,
+            )
+            if outcome is None:
+                continue
+            new_xy, dock_t, undock_t = outcome
+            self._finalize_relocation_pallet_state(
+                pallet_id=job.source_pallet_id,
+                old_xy=source_xy,
+                new_xy=new_xy,
+                dock_t=dock_t,
+                undock_t=undock_t,
+            )
+            job.target_xy = new_xy
+            return True
+        return False
 
     def _select_relocation_source_pallet(
         self, robot: RobotState, sku: int

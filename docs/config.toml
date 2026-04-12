@@ -1,5 +1,5 @@
 [loop]
-max_runs = 3
+max_runs = 1
 
 [limits]
 # Hard stop on produced plan length. If exceeded before finishing all orders,
@@ -23,9 +23,9 @@ relocation_top_skus = 16
 # Max relocation suggestions admitted into the dispatch queue.
 num_allowed_relocations = 18
 # Scales DockSuggestion expected gain (higher => more likely to do strategic docking).
-dock_gain_scale = 2.2
+dock_gain_scale = 4.0
 # Scales normalized relocation gain after order-relative normalization.
-relocation_gain_scale = 2.5
+relocation_gain_scale = 3.0
 # If true, disallow two robots swapping positions in one timestep.
 strict_no_swap = false
 # Run full validator replay every N makespan ticks during dispatch.
@@ -37,6 +37,8 @@ astar_slow_ms = 40
 astar_print_slow = false
 # If true, log blocked A* attempts even when they are not slow.
 astar_log_blocked = false
+# Keep relocation code available, but disabled for now.
+enable_relocation_suggestions = false
 # Max retries for a suggestion before dropping it from the queue.
 suggestion_retry_limit = 12
 # Queue-cycle exponential backoff base and cap for failed suggestions.
@@ -64,6 +66,11 @@ edge_band_for_heatmap = 6
 # Group SKU-flow metadata into N x N chunks before selecting anchor cells.
 # Set to 1 to disable chunking (original exact-cell behavior).
 relocate_chunk_size = 5
+# Setup coverage radius: a hotspot is considered to already "have" a SKU
+# if at least one pallet of that SKU is within this Manhattan distance.
+setup_hotspot_radius = 7
+# Setup hotspots used by SetupSuggestion initialization phase.
+setup_hotspots = [[17, 32], [38, 5], [38, 32]]
 # Optional explicit relocation SKU order. If provided, only these SKUs are
 # used for startup relocation planning (in listed order).
 # skus_to_relocate = [1, 2, 3, 4, 5]
