@@ -276,6 +276,7 @@ class WarehouseSolver:
 
         self.relocated_skus: set[int] = set()
         self.relocated_pallet_targets: set[Tuple[int, int]] = set()
+        self._completed_order_indices: set[int] = set()
         sku_counter: collections.Counter = collections.Counter()
         for order in self.orders:
             sku_counter.update(order.items)
@@ -327,6 +328,7 @@ class WarehouseSolver:
 
         total_orders = len(self.orders)
         completed_orders: set[int] = set()
+        self._completed_order_indices = completed_orders
         dispatch_count = 0
         self._log_solve_start(total_orders)
 
@@ -357,6 +359,9 @@ class WarehouseSolver:
                     suggestion_queue.append(suggestion)
 
             elif isinstance(suggestion, RelocateSuggestion):
+                if suggestion.remaining_job_factor() <= 0:
+                    # No remaining order needs this SKU anymore.
+                    continue
                 handled = self._plan_relocate_pallet_for_robot(robot, suggestion.job)
                 if handled:
                     self.relocated_skus.add(suggestion.job.sku)
@@ -402,7 +407,13 @@ class WarehouseSolver:
         relocate_suggestions: List[RelocateSuggestion] = []
         relocation_jobs = list(self.relocation_plan)
         for job in relocation_jobs:
-            relocate_suggestions.append(RelocateSuggestion(job, self.scheduler))
+            relocate_suggestions.append(
+                RelocateSuggestion(
+                    job,
+                    self.scheduler,
+                    remaining_job_factor_fn=self._count_remaining_orders_for_sku,
+                )
+            )
 
         # Normalize RelocateSuggestion gains to be on a similar scale to OrderSuggestion gains.
         if relocate_suggestions:
@@ -481,6 +492,15 @@ class WarehouseSolver:
                 self._log("tomli_w not installed, cannot dump suggestions.")
 
         return all_suggestions
+
+    def _count_remaining_orders_for_sku(self, sku: int) -> int:
+        remaining = 0
+        for order in self.orders:
+            if order.order_idx in self._completed_order_indices:
+                continue
+            if sku in order.items:
+                remaining += 1
+        return remaining
 
     def _build_dock_suggestions(self) -> List[Suggestion]:
         """

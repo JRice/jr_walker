@@ -49,6 +49,7 @@ class RunConfig:
     lane_width: int = 3
     relocation_skus_to_relocate: list[int] | None = None
     max_time: int = 50000
+    min_jobs_for_dock: int = 3
     max_makespan: int | None = None
     max_plan_time_seconds: float = 600.0
     num_allowed_relocations: int = 10
@@ -197,6 +198,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
         state,
         SolverConfig(
             max_time=run_config.max_time,
+            min_jobs_for_dock=run_config.min_jobs_for_dock,
             max_makespan=run_config.max_makespan,
             max_plan_time_seconds=run_config.max_plan_time_seconds,
             output_path=Path(run_config.output_path) if run_config.output_path else temp_output_path,

@@ -27,9 +27,10 @@ class Suggestion(ABC):
 
 
 class RelocateSuggestion(Suggestion):
-    def __init__(self, job, scheduler):
+    def __init__(self, job, scheduler, remaining_job_factor_fn=None):
         self.job = job
         self.scheduler = scheduler
+        self.remaining_job_factor_fn = remaining_job_factor_fn
         self._cost = -1.0
         self._gain = -1.0
         self._center = (-1, -1)
@@ -53,6 +54,15 @@ class RelocateSuggestion(Suggestion):
 
     def scale_gain(self, factor: float):
         self._gain = self.expected_gain * factor
+
+    def remaining_job_factor(self) -> float:
+        if self.remaining_job_factor_fn is None:
+            return 1.0
+        return max(0.0, float(self.remaining_job_factor_fn(self.job.sku)))
+
+    def score(self) -> float:
+        # Scale relocation value by how many remaining orders still need this SKU.
+        return (self.expected_gain * self.remaining_job_factor()) - self.expected_cost
 
     @property
     def center(self) -> Tuple[int, int]:
