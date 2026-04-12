@@ -503,7 +503,11 @@ class WarehouseSolver:
 
                 failure_count = self._suggestion_fail_counts.get(suggestion_key, 0) + 1
                 self._suggestion_fail_counts[suggestion_key] = failure_count
-                if failure_count >= self.config.suggestion_retry_limit:
+                retry_limit = int(self.config.suggestion_retry_limit)
+                if isinstance(suggestion, SetupSuggestion):
+                    # Setup failures are often transient congestion; allow more retries.
+                    retry_limit = max(retry_limit, retry_limit * 4)
+                if failure_count >= retry_limit:
                     self._log(
                         "suggestion_dropped "
                         f"key={suggestion_key} failures={failure_count} parked={parked}"
@@ -1456,6 +1460,19 @@ class WarehouseSolver:
 
     def _candidate_robots_for_suggestion(self, suggestion: Suggestion) -> List[RobotState]:
         center = suggestion.center
+        if isinstance(suggestion, SetupSuggestion):
+            ranked = sorted(
+                self.robots,
+                key=lambda r: (
+                    abs(r.x - center[0]) + abs(r.y - center[1]),
+                    r.last_t,
+                    r.id,
+                ),
+            )
+            # Try a small set of nearby robots to reduce hotspot contention without
+            # getting stuck on a single unreachable robot.
+            return ranked[: min(3, len(ranked))]
+
         ranked = sorted(
             self.robots,
             key=lambda r: (
@@ -1885,9 +1902,13 @@ class WarehouseSolver:
                         staged_robot,
                         edge_side_xy[0],
                         edge_side_xy[1],
-                        max_path_steps=4,
+                        max_path_steps=3,
                     )
                     if not reposition_path and (staged_robot.x != edge_side_xy[0] or staged_robot.y != edge_side_xy[1]):
+                        continue
+                    # During this brief undocked phase, the pallet is effectively static at staged_pallet_xy.
+                    # Reject staging paths that would step through that pallet cell.
+                    if any((px, py) == staged_pallet_xy for _, px, py in reposition_path):
                         continue
                     if reposition_path:
                         staged_paths.append((self._clone_robot_state(staged_robot), reposition_path))
