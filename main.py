@@ -88,7 +88,7 @@ class RunConfig:
     log_path: str = "output/run.log"
     metadata_db_path: str = "output/solution_metadata.db"
     input_path: str = "docs/BIG_ORDER.txt"
-    test_mode: bool = False
+    every_n_orders: int = 1
     output_path: str | None = None
     metadata_run_id: int | None = None
 
@@ -196,11 +196,6 @@ def load_run_config(config_path: Path) -> RunConfig:
         minimum=1,
     )
 
-    raw_test_mode = solver_section.get("test_mode", run_config.test_mode)
-    if not isinstance(raw_test_mode, bool):
-        raise ValueError("solver.test_mode must be a boolean.")
-    run_config.test_mode = raw_test_mode
-
     run_config.num_allowed_relocations = _require_int(
         solver_section.get("num_allowed_relocations", run_config.num_allowed_relocations),
         "solver.num_allowed_relocations",
@@ -299,6 +294,11 @@ def load_run_config(config_path: Path) -> RunConfig:
         limits_section.get("max_plan_time", run_config.max_plan_time_seconds),
         "limits.max_plan_time",
         minimum=1.0,
+    )
+    run_config.every_n_orders = _require_int(
+        limits_section.get("every_n_orders", run_config.every_n_orders),
+        "limits.every_n_orders",
+        minimum=1,
     )
 
     lns_section = _get_table(data, "lns")
@@ -556,8 +556,8 @@ def main():
     ## Main logic:
 
     state = WarehouseState(run_config.input_path)
-    if run_config.test_mode:
-        state.orders = state.orders[::10]
+    if run_config.every_n_orders > 1:
+        state.orders = state.orders[:: run_config.every_n_orders]
 
     if config_path.exists():
         print(
@@ -590,7 +590,7 @@ def main():
         )
 
     output_dir = Path(run_config.output_dir)
-    output_prefix = "test_" if run_config.test_mode else ""
+    output_prefix = f"stride_{run_config.every_n_orders}_" if run_config.every_n_orders > 1 else ""
     temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
 
     db_path = Path(run_config.metadata_db_path)

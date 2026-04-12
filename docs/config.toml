@@ -6,7 +6,9 @@ max_runs = 1
 # the run exits and writes partial output.
 max_makespan = 15000
 # Seconds of compute budget:
-max_plan_time = 5000
+max_plan_time = 6000
+# Solve every Nth order from the worklist (1 = all orders).
+every_n_orders = 1
 
 [paths]
 output_dir = "output"
@@ -50,7 +52,6 @@ max_robots_per_suggestion = 3
 robot_fail_streak_for_parking = 3
 # Max low-use parking targets scanned per parking attempt.
 parking_candidate_limit = 96
-test_mode = false
 
 [lns]
 enabled = true
@@ -68,7 +69,7 @@ edge_band_for_heatmap = 6
 relocate_chunk_size = 5
 # Setup coverage radius: a hotspot is considered to already "have" a SKU
 # if at least one pallet of that SKU is within this Manhattan distance.
-setup_hotspot_radius = 7
+setup_hotspot_radius = 6
 # Setup hotspots used by SetupSuggestion initialization phase.
 setup_hotspots = [[17, 32], [38, 5], [38, 32]]
 # Optional explicit relocation SKU order. If provided, only these SKUs are

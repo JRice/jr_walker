@@ -50,6 +50,7 @@ class AnalysisMetadataTests(unittest.TestCase):
 
     def test_parse_inferred_run_id(self) -> None:
         self.assertEqual(_parse_inferred_run_id(Path("solution_11582_1.txt")), 1)
+        self.assertEqual(_parse_inferred_run_id(Path("stride_10_solution_1428_2.txt")), 2)
         self.assertEqual(_parse_inferred_run_id(Path("test_solution_1428_2.txt")), 2)
         self.assertEqual(_parse_inferred_run_id(Path("partial_solution_999_7.txt")), 7)
         self.assertIsNone(_parse_inferred_run_id(Path("solution_11582.txt")))

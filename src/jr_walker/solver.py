@@ -160,6 +160,7 @@ def _select_best_non_test_run_id(conn: sqlite3.Connection) -> int | None:
         SELECT run_id
         FROM metadata_runs
         WHERE solution_path NOT LIKE '%test_solution_%'
+          AND solution_path NOT LIKE '%stride_%_solution_%'
           AND solution_path NOT LIKE '%partial_solution_%'
         ORDER BY makespan ASC, run_id DESC
         LIMIT 1

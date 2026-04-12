@@ -48,8 +48,9 @@ def _in_bounds(x: int, y: int, width: int = 60, height: int = 40) -> bool:
 
 
 def _parse_inferred_run_id(solution_path: Path) -> int | None:
-    # Accepts stems like: solution_11582_1, test_solution_1428_2, partial_solution_100_7
-    match = re.match(r"^(?:test_)?(?:partial_)?solution_\d+_(\d+)$", solution_path.stem)
+    # Accepts stems like: solution_11582_1, stride_10_solution_1428_2, partial_solution_100_7
+    # Backward-compatible with older test_ prefix.
+    match = re.match(r"^(?:(?:test|stride_\d+)_)?(?:partial_)?solution_\d+_(\d+)$", solution_path.stem)
     if not match:
         return None
     return int(match.group(1))

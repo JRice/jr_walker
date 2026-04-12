@@ -101,7 +101,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
             conn.executemany(
                 "INSERT INTO metadata_runs (run_id, solution_path, makespan) VALUES (?, ?, ?)",
                 [
-                    (1, "output/test_solution_100.txt", 100),
+                    (1, "output/stride_10_solution_100.txt", 100),
                     (2, "output/solution_130.txt", 130),
                     (3, "output/solution_120.txt", 120),
                     (4, "output/partial_solution_90.txt", 90),
@@ -122,7 +122,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
             conn.executemany(
                 "INSERT INTO metadata_runs (run_id, solution_path, makespan) VALUES (?, ?, ?)",
                 [
-                    (1, "output/test_solution_100.txt", 100),
+                    (1, "output/stride_10_solution_100.txt", 100),
                     (2, "output/partial_solution_80.txt", 80),
                 ],
             )
