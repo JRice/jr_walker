@@ -4,6 +4,7 @@ Version: 0.1.0
 Summary: Add your description here
 Requires-Python: >=3.12
 Description-Content-Type: text/markdown
+Requires-Dist: coverage>=7.13.5
 Requires-Dist: matplotlib>=3.10.8
 Requires-Dist: numpy>=2.4.4
 Requires-Dist: pytest>=9.0.3

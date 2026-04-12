@@ -18,4 +18,6 @@ src/jr_walker.egg-info/dependency_links.txt
 src/jr_walker.egg-info/requires.txt
 src/jr_walker.egg-info/top_level.txt
 tests/test_analysis_metadata.py
+tests/test_planner_reservations.py
 tests/test_solver_metadata_policy.py
+tests/test_validator_move_shape_conflicts.py

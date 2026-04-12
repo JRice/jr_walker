@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "coverage>=7.13.5",
     "matplotlib>=3.10.8",
     "numpy>=2.4.4",
     "pytest>=9.0.3",
@@ -22,3 +23,18 @@ build-backend = "setuptools.build_meta"
 
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cpu"
+
+[tool.coverage.run]
+branch = true
+source = ["jr_walker"]
+timid = true
+relative_files = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
