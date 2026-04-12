@@ -60,6 +60,7 @@ class RunConfig:
     order_suggestion_gain_constant: float = 100.0
     dock_gain_scale: float = 2.0
     relocation_gain_scale: float = 1.5
+    strict_no_swap: bool = False
     ticks_to_full_validation: int = 500
     astar_slow_ms: float = 40.0
     astar_print_slow: bool = False
@@ -181,6 +182,10 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.relocation_gain_scale",
         minimum=0.0,
     )
+    raw_strict_no_swap = solver_section.get("strict_no_swap", run_config.strict_no_swap)
+    if not isinstance(raw_strict_no_swap, bool):
+        raise ValueError("solver.strict_no_swap must be a boolean.")
+    run_config.strict_no_swap = raw_strict_no_swap
     run_config.astar_slow_ms = _require_number(
         solver_section.get("astar_slow_ms", run_config.astar_slow_ms),
         "solver.astar_slow_ms",
@@ -266,6 +271,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
             dock_gain_scale=run_config.dock_gain_scale,
             relocation_gain_scale=run_config.relocation_gain_scale,
+            strict_no_swap=run_config.strict_no_swap,
             dispatch_validate_every_makespan=run_config.ticks_to_full_validation,
             astar_slow_ms=run_config.astar_slow_ms,
             astar_print_slow=run_config.astar_print_slow,
@@ -455,6 +461,7 @@ def main():
             f"num_allowed_relocations={run_config.num_allowed_relocations}, "
             f"dock_gain_scale={run_config.dock_gain_scale}, "
             f"relocation_gain_scale={run_config.relocation_gain_scale}, "
+            f"strict_no_swap={run_config.strict_no_swap}, "
             f"ticks_to_full_validation={run_config.ticks_to_full_validation}, "
             f"astar_slow_ms={run_config.astar_slow_ms}, "
             f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."

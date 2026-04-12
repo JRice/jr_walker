@@ -26,6 +26,8 @@ num_allowed_relocations = 18
 dock_gain_scale = 2.2
 # Scales normalized relocation gain after order-relative normalization.
 relocation_gain_scale = 2.5
+# If true, disallow two robots swapping positions in one timestep.
+strict_no_swap = false
 # Run full validator replay every N makespan ticks during dispatch.
 # Set to 0 to disable periodic validation.
 ticks_to_full_validation = 500

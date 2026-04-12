@@ -115,6 +115,7 @@ class SolverConfig:
     order_suggestion_gain_constant: float = 100.0
     dock_gain_scale: float = 2.0
     relocation_gain_scale: float = 1.5
+    strict_no_swap: bool = False
     lane_width: int = 3
     min_jobs_for_dock: int = 3
     log_path: Path | None = None
@@ -728,6 +729,9 @@ class WarehouseSolver:
             # For periodic dispatch checks we only care about legality/collisions.
             # Incomplete fulfillment is expected mid-run and is not an error.
             validator.finalize()
+            strict_conflict = self._strict_no_swap_conflict(actions_snapshot)
+            if strict_conflict is not None:
+                periodic_error = strict_conflict
         except ValidationError as exc:
             periodic_error = str(exc)
         except Exception as exc:
@@ -1824,6 +1828,11 @@ class WarehouseSolver:
             if log_on_error:
                 self._log(f"candidate_validation_error: {exc}")
             return False
+        strict_conflict = self._strict_no_swap_conflict(actions)
+        if strict_conflict is not None:
+            if log_on_error:
+                self._log(f"candidate_validation_error: {strict_conflict}")
+            return False
         if not require_complete:
             return True
         ok = final_state.fulfilled_orders == final_state.total_orders
@@ -1833,6 +1842,50 @@ class WarehouseSolver:
                 f"total={final_state.total_orders} next_t={final_state.next_timestep}"
             )
         return ok
+
+    def _strict_no_swap_conflict(
+        self, actions: List[Tuple[int, int, str, int, int]]
+    ) -> str | None:
+        if not self.config.strict_no_swap:
+            return None
+        if not actions:
+            return None
+
+        by_t: Dict[int, Dict[int, Tuple[str, int, int]]] = collections.defaultdict(dict)
+        for t, rid, action, x, y in actions:
+            by_t[t][rid] = (action, x, y)
+
+        positions = {rid: (x, y) for rid, (x, y) in enumerate(self.state.robots)}
+        max_t = max(by_t) if by_t else -1
+        for t in range(max_t + 1):
+            acts = by_t.get(t, {})
+            start_positions = dict(positions)
+            moving_targets: Dict[int, Tuple[int, int]] = {
+                rid: (x, y)
+                for rid, (action, x, y) in acts.items()
+                if action == "move"
+            }
+            if moving_targets:
+                rids = sorted(moving_targets.keys())
+                for idx, rid in enumerate(rids):
+                    my_start = start_positions.get(rid)
+                    my_target = moving_targets[rid]
+                    if my_start is None:
+                        continue
+                    for other in rids[idx + 1 :]:
+                        other_start = start_positions.get(other)
+                        other_target = moving_targets[other]
+                        if other_start is None:
+                            continue
+                        if my_target == other_start and other_target == my_start:
+                            return (
+                                f"timestep {t}: strict_no_swap violation: robots {rid} and {other} "
+                                f"would swap ({my_start[0]}, {my_start[1]}) <-> ({other_start[0]}, {other_start[1]})"
+                            )
+            for rid, (action, x, y) in acts.items():
+                if action == "move":
+                    positions[rid] = (x, y)
+        return None
 
     def _worklist_text_from_state(self) -> str:
         lines: List[str] = []

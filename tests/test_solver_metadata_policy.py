@@ -53,6 +53,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver.config = SimpleNamespace(
             relocation_edge_band=6,
             dispatch_validate_every_makespan=500,
+            strict_no_swap=False,
             astar_slow_ms=40.0,
             astar_print_slow=False,
             astar_log_blocked=False,
@@ -61,7 +62,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
 
     def test_periodic_dispatch_validation_runs_at_interval(self) -> None:
         solver = self._new_solver_shell()
-        solver.config = SimpleNamespace(dispatch_validate_every_makespan=500)
+        solver.config = SimpleNamespace(dispatch_validate_every_makespan=500, strict_no_swap=False)
         solver._next_dispatch_validation_makespan = 500
         solver.robots = [SimpleNamespace(last_t=500)]
         solver.actions = SimpleNamespace(sorted_actions=lambda: [(0, 0, "move", 1, 0)])
@@ -76,7 +77,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
 
     def test_periodic_dispatch_validation_raises_on_invalid_prefix(self) -> None:
         solver = self._new_solver_shell()
-        solver.config = SimpleNamespace(dispatch_validate_every_makespan=500)
+        solver.config = SimpleNamespace(dispatch_validate_every_makespan=500, strict_no_swap=False)
         solver._next_dispatch_validation_makespan = 500
         solver.robots = [SimpleNamespace(last_t=700)]
         solver.actions = SimpleNamespace(sorted_actions=lambda: [(0, 0, "move", 2, 0)])
@@ -179,6 +180,24 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertIn((15, 15), lanes)
         self.assertIn((15, 14), lanes)
         self.assertIn((16, 15), lanes)
+
+    def test_strict_no_swap_rejects_robot_position_swap(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(
+            width=60,
+            height=40,
+            robots=[(0, 0), (1, 0)],
+            pallets={(5, 5): 1},
+            orders=[[1]],
+        )
+        solver.config = SimpleNamespace(strict_no_swap=True)
+
+        actions = [
+            (0, 0, "move", 1, 0),
+            (0, 1, "move", 0, 0),
+        ]
+        ok = solver._validate_candidate_actions(actions, require_complete=False)
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":
