@@ -51,7 +51,6 @@ class RunConfig:
     max_time: int = 50000
     max_makespan: int | None = None
     max_plan_time_seconds: float = 600.0
-    min_jobs_for_dock: int = 3
     num_allowed_relocations: int = 10
     order_suggestion_gain_constant: float = 100.0
     lns_enabled: bool = True
@@ -62,10 +61,12 @@ class RunConfig:
     output_dir: str = "output"
     log_path: str = "output/run.log"
     metadata_db_path: str = "output/solution_metadata.db"
+    input_path: str = "docs/BIG_ORDER.txt"
     test_mode: bool = False
     output_path: str | None = None
     metadata_run_id: int | None = None
-    max_runs: int = 1
+
+
 def _get_table(data: dict, key: str) -> dict:
     section = data.get(key, {})
     if section is None:
@@ -104,6 +105,7 @@ def load_run_config(config_path: Path) -> RunConfig:
     run_config.metadata_db_path = str(
         paths_section.get("metadata_db_path", run_config.metadata_db_path)
     )
+    run_config.input_path = str(paths_section.get("input_path", run_config.input_path))
     raw_output_path = paths_section.get("output_path")
     if raw_output_path is not None:
         run_config.output_path = str(raw_output_path)
@@ -114,12 +116,16 @@ def load_run_config(config_path: Path) -> RunConfig:
         "relocation.lane_width",
         minimum=0,
     )
-
     solver_section = _get_table(data, "solver")
     run_config.max_time = _require_int(
         solver_section.get("max_time", run_config.max_time),
         "solver.max_time",
         minimum=2,
+    )
+    run_config.min_jobs_for_dock = _require_int(
+        solver_section.get("min_jobs_for_dock", run_config.min_jobs_for_dock),
+        "solver.min_jobs_for_dock",
+        minimum=1,
     )
 
     raw_test_mode = solver_section.get("test_mode", run_config.test_mode)
@@ -183,13 +189,6 @@ def load_run_config(config_path: Path) -> RunConfig:
     if raw_run_id is not None:
         run_config.metadata_run_id = _require_int(raw_run_id, "metadata.run_id", minimum=1)
 
-    loop_section = _get_table(data, "loop")
-    run_config.max_runs = _require_int(
-        loop_section.get("max_runs", run_config.max_runs),
-        "loop.max_runs",
-        minimum=1,
-    )
-
     return run_config
 
 
@@ -206,6 +205,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             lane_width=run_config.lane_width,
             num_allowed_relocations=run_config.num_allowed_relocations,
             order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
+            worklist_path=Path(run_config.input_path),
             lns_enabled=run_config.lns_enabled,
             lns_iterations=run_config.lns_iterations,
             lns_window_actions=run_config.lns_window_actions,
@@ -222,7 +222,22 @@ def _run_pipeline(
     solve_error: Exception | None = None
     actions: list[tuple[int, int, str, int, int]] = []
     try:
+        print("Building a fresh base solution guided by past analysis...")
         actions = solver.find_solution()
+
+        print(f"Running LNS optimization on {len(actions)} base actions...")
+        actions = solver.optimize_actions(actions)
+
+        print("Validating generated actions...")
+        validator = SubmissionValidator(worklist_path=run_config.input_path)
+        for t, rid, action, x, y in actions:
+            validator.validate_line(f"{t} {rid} {action} {x} {y}")
+        final_state = validator.finalize()
+        if final_state.fulfilled_orders != final_state.total_orders:
+            raise ValidationError(
+                f"Validation incomplete: fulfilled {final_state.fulfilled_orders}/{final_state.total_orders} orders."
+            )
+        print(f"Validation passed. Fulfilled {final_state.fulfilled_orders}/{final_state.total_orders} orders by timestep {final_state.next_timestep}.")
 
     except Exception as exc:
         solve_error = exc
@@ -353,7 +368,7 @@ def main():
 
     ## Main logic:
 
-    state = WarehouseState(ROOT / "docs/BIG_ORDER.txt")
+    state = WarehouseState(run_config.input_path)
     if run_config.test_mode:
         state.orders = state.orders[::10]
 
@@ -364,68 +379,34 @@ def main():
             f"(lane_width={run_config.lane_width}, "
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "
-            f"max_plan_time={run_config.max_plan_time_seconds:.1f}s)."
+            f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "
+            f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."
         )
 
     output_dir = Path(run_config.output_dir)
     output_prefix = "test_" if run_config.test_mode else ""
+    temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
 
-    best_actions = []
-    best_makespan = float('inf')
+    past_analysis = PastRunAnalysis()
+    db_path = Path(run_config.metadata_db_path)
+    if db_path.exists():
+        print("Loading analysis of the best existing solution from SQL database...")
+        past_analysis = load_best_past_analysis(db_path, state.width, state.height, state.pallets)
+        if past_analysis.run_id >= 0:
+            print(f"Loaded analysis for Run #{past_analysis.run_id}: found {len(past_analysis.high_use_cells)} high-traffic cells to avoid.")
 
-    for i in range(run_config.max_runs):
-        print("-" * 80)
-        print(f"Starting iterative run {i+1}/{run_config.max_runs}...")
-
-        past_analysis = PastRunAnalysis()
-        db_path = Path(run_config.metadata_db_path)
-        if db_path.exists():
-            print("Loading analysis of best available solution from SQL database...")
-            past_analysis = load_best_past_analysis(db_path, state.width, state.height, state.pallets)
-            if past_analysis.run_id >= 0:
-                print(f"  -> Loaded analysis for Run #{past_analysis.run_id}")
-
-        temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
-        solver = _build_solver(state, run_config, temp_output_path, past_analysis)
-
-        # On the last run, dump the suggestions for analysis
-        if i == run_config.max_runs - 1:
-            suggestion_dump_path = output_dir / f"suggestions_run_{i+1}.toml"
-            print(f"This is the last run, will dump suggestions to {suggestion_dump_path}")
-            solver.config.dump_suggestions_path = suggestion_dump_path
-
-        actions, solve_error = _run_pipeline(solver, run_config, output_dir)
-
-        if solve_error:
-            print(f"Run {i+1} failed with error: {solve_error}")
-            if not best_actions:
-                _save_and_report(actions, state, run_config, output_dir, output_prefix, temp_output_path, solve_error)
-            continue
-
-        current_makespan = max((t for t, _, _, _, _ in actions), default=-1)
-        print(f"Run {i+1} finished with makespan: {current_makespan}")
-
-        if current_makespan < best_makespan:
-            print(f"  -> New best makespan found! ({current_makespan} < {best_makespan})")
-            best_makespan = current_makespan
-            best_actions = actions
-
-        _save_and_report(actions, state, run_config, output_dir, output_prefix, temp_output_path, solve_error)
-
-    print("-" * 80)
-    print(f"Iterative improvement finished. Best makespan found: {best_makespan}")
-    print(f"Running final LNS optimization on best solution...")
-    final_solver = _build_solver(state, run_config, Path(), PastRunAnalysis()) # LNS doesn't need analysis
-    optimized_actions = final_solver.optimize_actions(best_actions)
-
-    print("Final validation and save...")
-    final_validator = SubmissionValidator(worklist_text=WarehouseSolver._worklist_text_from_state(state))
-    for t, rid, action, x, y in optimized_actions:
-        final_validator.validate_line(f"{t} {rid} {action} {x} {y}")
-    final_validator.finalize()
-    print("Final validation passed.")
-
-    _save_and_report(optimized_actions, state, run_config, output_dir, output_prefix, Path(), None)
+    print("Generating new Suggestions based on this analysis...")
+    solver = _build_solver(state, run_config, temp_output_path, past_analysis)
+    actions, solve_error = _run_pipeline(solver, run_config, output_dir)
+    _save_and_report(
+        actions,
+        state,
+        run_config,
+        output_dir,
+        output_prefix,
+        temp_output_path,
+        solve_error,
+    )
 
 
 if __name__ == "__main__":

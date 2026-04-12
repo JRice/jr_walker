@@ -83,6 +83,7 @@ class PastRunAnalysis:
     high_use_cells: set[Tuple[int, int]] = field(default_factory=set)
     bucket_items: Dict[str, int] = field(default_factory=dict)
     bucket_sku_counts: Dict[str, collections.Counter] = field(default_factory=dict)
+    fulfills: List[Dict] = field(default_factory=list)
 
 @dataclass
 class SolverConfig:
@@ -188,7 +189,10 @@ def load_best_past_analysis(db_path: Path, width: int, height: int, pallets: Dic
                 if use_score >= cutoff and (x, y) not in pallets:
                     analysis.high_use_cells.add((x, y))
 
-        fulfill_rows = conn.execute("SELECT x, y, skus_json FROM fulfills WHERE run_id = ?", (run_id,)).fetchall()
+        fulfill_rows = conn.execute(
+            "SELECT robot_id, timestep, order_id, skus_json FROM fulfills WHERE run_id = ? ORDER BY robot_id, timestep ASC",
+            (run_id,),
+        ).fetchall()
         for x, y, skus_json in fulfill_rows:
             bucket = _bucket_for_edge(int(x), int(y), width, height)
             bucket_counter = analysis.bucket_sku_counts.setdefault(bucket, collections.Counter())
@@ -205,6 +209,17 @@ def load_best_past_analysis(db_path: Path, width: int, height: int, pallets: Dic
                     continue
                 bucket_counter[sku] += 1
                 analysis.bucket_items[bucket] = analysis.bucket_items.get(bucket, 0) + 1
+
+        for robot_id, timestep, order_id, skus_json in fulfill_rows:
+            analysis.fulfills.append(
+                {
+                    "robot_id": robot_id,
+                    "timestep": timestep,
+                    "order_id": order_id,
+                    "skus": json.loads(skus_json),
+                }
+            )
+
     except sqlite3.Error:
         pass
     finally:
@@ -404,6 +419,11 @@ class WarehouseSolver:
         if self.config.num_allowed_relocations >= 0:
             all_suggestions.extend(relocate_suggestions[: self.config.num_allowed_relocations])
 
+        # 2. Generate DockSuggestions from past run analysis
+        if self.past_analysis.fulfills:
+            dock_suggestions = self._build_dock_suggestions()
+            all_suggestions.extend(dock_suggestions)
+
         # 2. Generate OrderSuggestions
         optimizer = OrderOptimizer(self.state.pallets)
         scored_orders = optimizer.sort_orders_by_cluster_efficiency([o.items for o in self.orders])
@@ -461,6 +481,53 @@ class WarehouseSolver:
                 self._log("tomli_w not installed, cannot dump suggestions.")
 
         return all_suggestions
+
+    def _build_dock_suggestions(self) -> List[Suggestion]:
+        """
+        Analyzes past fulfillment data to find "runs" of orders for a single robot
+        that share a common, high-demand SKU.
+        """
+        suggestions: List[Suggestion] = []
+        fulfills_by_robot: Dict[int, List[Dict]] = collections.defaultdict(list)
+        for f in self.past_analysis.fulfills:
+            fulfills_by_robot[f["robot_id"]].append(f)
+
+        optimizer = OrderOptimizer(self.state.pallets)
+
+        for robot_id, fulfills in fulfills_by_robot.items():
+            # For each high-demand SKU, look for streaks
+            for sku in self.skus_by_demand[:10]:
+                current_streak: List[int] = []
+                for fulfill in fulfills:
+                    order_id = fulfill.get("order_id")
+                    if order_id is None or order_id < 0:
+                        continue
+
+                    if sku in fulfill["skus"]:
+                        current_streak.append(order_id)
+                    else:
+                        if len(current_streak) > 1:
+                            # Found a streak, create a suggestion
+                            first_order_idx = current_streak[0]
+                            order_items = self.orders[first_order_idx].items
+                            cluster, _ = optimizer.find_tightest_cluster(list(order_items.keys()))
+                            if not cluster:
+                                continue
+
+                            # Simplified center calculation for speed
+                            xs = [pos[0] for pos in cluster.values()]
+                            ys = [pos[1] for pos in cluster.values()]
+                            order_center = (int(sum(xs) / len(xs)), int(sum(ys) / len(ys)))
+
+                            pallet_locs = self.scheduler.pallet_cells_for_sku(sku)
+                            if not pallet_locs:
+                                continue
+                            
+                            nearest_pallet = min(pallet_locs, key=lambda p: manhattan_distance(p, order_center))
+                            gain = manhattan_distance(order_center, nearest_pallet) * len(current_streak)
+                            suggestions.append(DockSuggestion(sku, list(current_streak), gain, nearest_pallet))
+                        current_streak = []
+        return suggestions
 
     def _optimize_actions_core(
         self, actions: List[Tuple[int, int, str, int, int]]
@@ -856,6 +923,54 @@ class WarehouseSolver:
             pending_paths=pending_paths,
             pending_footprints=pending_footprints,
         )
+        return True
+
+    def _plan_dock_pallet(self, robot: RobotState, sku: int) -> bool:
+        """Plans the actions for a robot to find, travel to, and dock a pallet with a given SKU."""
+        source = self._select_relocation_source_pallet(robot, sku)
+        if source is None:
+            self._log(f"dock_suggestion_fail robot={robot.id} sku={sku} reason=no_source_pallet")
+            return False
+        pallet_xy, pallet_id = source
+
+        stand_cells = self._candidate_relocation_stand_cells(robot, pallet_xy)
+        if not stand_cells:
+            self._log(f"dock_suggestion_fail robot={robot.id} sku={sku} reason=no_stand_cells")
+            return False
+
+        # Find the first reachable stand cell
+        path_to_stand = None
+        stand_xy = None
+        for cell in stand_cells:
+            path = self._safe_plan_path(robot, cell[0], cell[1])
+            if path or (robot.x == cell[0] and robot.y == cell[1]):
+                path_to_stand = path
+                stand_xy = cell
+                break
+
+        if stand_xy is None:
+            self._log(f"dock_suggestion_fail robot={robot.id} sku={sku} reason=no_path_to_stand")
+            return False
+
+        temp_robot = self._clone_robot_state(robot)
+        pending_actions: List[Tuple[int, int, str, int, int]] = []
+        pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+        pending_footprints: List[Tuple[RobotState, int, int, int]] = []
+
+        if path_to_stand:
+            pending_paths.append((self._clone_robot_state(temp_robot), path_to_stand))
+        pending_actions.extend(self._apply_moves_to_robot(temp_robot, path_to_stand))
+
+        dx = pallet_xy[0] - temp_robot.x
+        dy = pallet_xy[1] - temp_robot.y
+
+        dock_t = temp_robot.last_t + 1
+        pending_actions.append((dock_t, temp_robot.id, "dock", pallet_xy[0], pallet_xy[1]))
+        pending_footprints.append((self._clone_robot_state(temp_robot), dock_t, temp_robot.x, temp_robot.y))
+        temp_robot.last_t = dock_t
+        temp_robot.docks[(dx, dy)] = pallet_id
+
+        self._commit_plan(robot, temp_robot, pending_actions, pending_paths, pending_footprints)
         return True
 
     def _select_relocation_source_pallet(

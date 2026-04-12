@@ -90,6 +90,7 @@ def _build_solution_metadata(
     num_robots: int,
     robot_starts: List[Tuple[int, int]],
     pallet_defs: List[Tuple[int, int, int]],
+    order_defs: List[collections.Counter],
     actions_by_timestep: Dict[int, List[Tuple[int, str, int, int]]],
     max_timestep: int,
 ):
@@ -118,6 +119,9 @@ def _build_solution_metadata(
     robot_idle_ticks = [0 for _ in range(num_robots)]
     robot_empty_moves = [0 for _ in range(num_robots)]
     robot_order_times: List[List[int]] = [[] for _ in range(num_robots)]
+    local_orders: list[OrderState] = [
+        OrderState(order_id=oid, items=Counter(items)) for oid, items in enumerate(order_defs)
+    ]
 
     pallets: List[dict] = []
     pallet_at: Dict[int, int] = {}
@@ -228,6 +232,14 @@ def _build_solution_metadata(
             if action != "fulfill":
                 continue
 
+            bag = storage[rid]
+            matched_order_id = -1
+            for order in local_orders:
+                if not order.fulfilled and order.items == bag:
+                    order.fulfilled = True
+                    matched_order_id = order.order_id
+                    break
+
             sku_list = _counter_to_sku_list(storage[rid])
             metadata.fulfills.append(
                 {
@@ -236,6 +248,7 @@ def _build_solution_metadata(
                     "skus": sku_list,
                     "robot": rid,
                     "timestep": t,
+                    "order_id": matched_order_id,
                 }
             )
             if robot_bundle_start[rid] is not None:
@@ -302,6 +315,7 @@ def _ensure_metadata_schema(conn: sqlite3.Connection) -> None:
             fulfill_index INTEGER NOT NULL,
             timestep INTEGER NOT NULL,
             robot_id INTEGER NOT NULL,
+            order_id INTEGER,
             x INTEGER NOT NULL,
             y INTEGER NOT NULL,
             skus_json TEXT NOT NULL,
@@ -437,8 +451,8 @@ def store_solution_metadata(
             if fulfill_rows:
                 conn.executemany(
                     """
-                    INSERT INTO fulfills (run_id, fulfill_index, timestep, robot_id, x, y, skus_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO fulfills (run_id, fulfill_index, timestep, robot_id, order_id, x, y, skus_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     fulfill_rows,
                 )
@@ -508,6 +522,7 @@ def build_and_store_solution_metadata(
         num_robots=num_robots,
         robot_starts=robot_starts,
         pallet_defs=pallet_defs,
+        order_defs=order_defs,
         actions_by_timestep=actions_by_timestep,
         max_timestep=max_timestep,
     )

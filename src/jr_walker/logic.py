@@ -64,6 +64,27 @@ class RelocateSuggestion(Suggestion):
                 self._center = min(source_pallets, key=lambda p: manhattan_distance(p, self.job.hotspot))
         return self._center
 
+class DockSuggestion(Suggestion):
+    def __init__(self, sku: int, plan: List[int], gain: float, pallet_xy: Tuple[int, int]):
+        self.sku = sku
+        self.plan = plan
+        self._gain = gain
+        self._center = pallet_xy
+
+    @property
+    def expected_cost(self) -> float:
+        # The cost is to travel to the pallet and dock it. For now, we treat this as
+        # a high-priority strategic move, so the cost is negligible.
+        return 0.0
+
+    @property
+    def expected_gain(self) -> float:
+        return self._gain
+
+    @property
+    def center(self) -> Tuple[int, int]:
+        return self._center
+
 
 class OrderSuggestion(Suggestion):
     def __init__(self, order_idx, order, cluster, order_gain_constant, warehouse_width, warehouse_height, scheduler):
