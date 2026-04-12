@@ -37,6 +37,38 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver.past_analysis = PastRunAnalysis()
         return solver
 
+    def test_periodic_dispatch_validation_runs_at_interval(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(dispatch_validate_every_makespan=500)
+        solver._next_dispatch_validation_makespan = 500
+        solver.robots = [SimpleNamespace(last_t=500)]
+        solver.actions = SimpleNamespace(sorted_actions=lambda: [(0, 0, "move", 1, 0)])
+        solver._validate_candidate_actions = lambda *args, **kwargs: True
+        solver._log = lambda msg: None
+
+        solver._maybe_validate_dispatch_progress_or_raise(
+            completed=10,
+            total_orders=100,
+            dispatch_count=25,
+        )
+        self.assertEqual(solver._next_dispatch_validation_makespan, 1000)
+
+    def test_periodic_dispatch_validation_raises_on_invalid_prefix(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(dispatch_validate_every_makespan=500)
+        solver._next_dispatch_validation_makespan = 500
+        solver.robots = [SimpleNamespace(last_t=700)]
+        solver.actions = SimpleNamespace(sorted_actions=lambda: [(0, 0, "move", 1, 0)])
+        solver._validate_candidate_actions = lambda *args, **kwargs: False
+        solver._log = lambda msg: None
+
+        with self.assertRaises(RuntimeError):
+            solver._maybe_validate_dispatch_progress_or_raise(
+                completed=12,
+                total_orders=100,
+                dispatch_count=30,
+            )
+
     def test_select_best_non_test_run_id_prefers_best_non_test(self) -> None:
         db_path = self._workspace_case_dir() / "meta.db"
         conn = sqlite3.connect(db_path)

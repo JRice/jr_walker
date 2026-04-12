@@ -54,6 +54,7 @@ class RunConfig:
     max_plan_time_seconds: float = 600.0
     num_allowed_relocations: int = 10
     order_suggestion_gain_constant: float = 100.0
+    ticks_to_full_validation: int = 500
     lns_enabled: bool = True
     lns_iterations: int = 60
     lns_window_actions: int = 28
@@ -144,6 +145,11 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.order_suggestion_gain_constant",
         minimum=0.0,
     )
+    run_config.ticks_to_full_validation = _require_int(
+        solver_section.get("ticks_to_full_validation", run_config.ticks_to_full_validation),
+        "solver.ticks_to_full_validation",
+        minimum=0,
+    )
 
     limits_section = _get_table(data, "limits")
     raw_max_makespan = limits_section.get("max_makespan", run_config.max_makespan)
@@ -207,6 +213,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             lane_width=run_config.lane_width,
             num_allowed_relocations=run_config.num_allowed_relocations,
             order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
+            dispatch_validate_every_makespan=run_config.ticks_to_full_validation,
             worklist_path=Path(run_config.input_path),
             lns_enabled=run_config.lns_enabled,
             lns_iterations=run_config.lns_iterations,
@@ -387,6 +394,7 @@ def main():
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "
             f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "
+            f"ticks_to_full_validation={run_config.ticks_to_full_validation}, "
             f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."
         )
 

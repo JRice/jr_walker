@@ -109,6 +109,7 @@ class SolverConfig:
     min_jobs_for_dock: int = 3
     log_path: Path | None = None
     dispatch_log_every: int = 1
+    dispatch_validate_every_makespan: int = 500
     worklist_path: Path = Path("docs/BIG_ORDER.txt")
     lns_enabled: bool = True
     lns_iterations: int = 60
@@ -304,6 +305,7 @@ class WarehouseSolver:
 
         self._plan_started_monotonic = 0.0
         self._log_handle = None
+        self._next_dispatch_validation_makespan = max(0, self.config.dispatch_validate_every_makespan)
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
         self._open_log()
@@ -399,6 +401,11 @@ class WarehouseSolver:
                     total_orders=total_orders,
                     dispatch_count=dispatch_count,
                 )
+                self._maybe_validate_dispatch_progress_or_raise(
+                    completed=len(completed_orders),
+                    total_orders=total_orders,
+                    dispatch_count=dispatch_count,
+                )
 
             if dispatch_count > (total_orders + self.config.num_allowed_relocations) * 5:  # circuit breaker
                 self._log("Dispatcher seems to be stuck in a loop. Breaking.")
@@ -408,7 +415,13 @@ class WarehouseSolver:
             self._log(f"Warning: Only {len(completed_orders)}/{total_orders} orders were completed from suggestion queue.")
 
         sorted_actions = self.actions.sorted_actions()
-        sorted_actions = self._repair_idle_wait_conflicts(sorted_actions)
+        repaired_actions = self._repair_idle_wait_conflicts(sorted_actions)
+        if repaired_actions != sorted_actions and not self._validate_candidate_actions(
+            repaired_actions, log_on_error=True
+        ):
+            self._log("repair_idle_wait_conflicts produced invalid actions; reverting to unrepaired actions")
+        else:
+            sorted_actions = repaired_actions
         makespan = max((t for t, _, _, _, _ in sorted_actions), default=-1)
         self._log(
             f"find_solution_end actions={len(sorted_actions)} makespan={makespan}"
@@ -607,6 +620,38 @@ class WarehouseSolver:
         if self._plan_started_monotonic <= 0:
             return 0.0
         return time.monotonic() - self._plan_started_monotonic
+
+    def _maybe_validate_dispatch_progress_or_raise(
+        self, *, completed: int, total_orders: int, dispatch_count: int
+    ) -> None:
+        interval = self.config.dispatch_validate_every_makespan
+        if interval <= 0:
+            return
+
+        current_makespan = max((r.last_t for r in self.robots), default=-1)
+        if current_makespan < self._next_dispatch_validation_makespan:
+            return
+
+        actions_snapshot = self.actions.sorted_actions()
+        is_valid = self._validate_candidate_actions(
+            actions_snapshot,
+            log_on_error=True,
+            require_complete=False,
+        )
+        if not is_valid:
+            raise RuntimeError(
+                "Periodic dispatch validation failed at "
+                f"makespan={current_makespan}, dispatches={dispatch_count}, "
+                f"completed_orders={completed}/{total_orders}."
+            )
+
+        self._log(
+            "periodic_validation_ok "
+            f"makespan={current_makespan} dispatches={dispatch_count} "
+            f"completed={completed}/{total_orders} actions={len(actions_snapshot)}"
+        )
+        while self._next_dispatch_validation_makespan <= current_makespan:
+            self._next_dispatch_validation_makespan += interval
 
     def _check_global_limits_or_raise(self, remaining_orders: Deque[int]) -> None:
         if self.config.max_plan_time_seconds > 0:
@@ -1580,6 +1625,7 @@ class WarehouseSolver:
         self,
         actions: List[Tuple[int, int, str, int, int]],
         log_on_error: bool = False,
+        require_complete: bool = True,
     ) -> bool:
         validator = SubmissionValidator(worklist_text=self._worklist_text_from_state())
         try:
@@ -1590,6 +1636,8 @@ class WarehouseSolver:
             if log_on_error:
                 self._log(f"candidate_validation_error: {exc}")
             return False
+        if not require_complete:
+            return True
         ok = final_state.fulfilled_orders == final_state.total_orders
         if log_on_error and not ok:
             self._log(
@@ -1649,6 +1697,19 @@ class WarehouseSolver:
         repaired = list(actions)
         static_blocked = (self.state.grid == 2)
         max_repairs = 20
+        pallet_cell_cache: Dict[int, set[Tuple[int, int]]] = {}
+
+        def static_pallet_cells_at(t: int) -> set[Tuple[int, int]]:
+            cached = pallet_cell_cache.get(t)
+            if cached is not None:
+                return cached
+            cells: set[Tuple[int, int]] = set()
+            for pallet_id in self.pallet_by_id.keys():
+                xy = self._pallet_static_xy_at(pallet_id, t)
+                if xy is not None:
+                    cells.add(xy)
+            pallet_cell_cache[t] = cells
+            return cells
 
         def footprint_at(x: int, y: int, dock_offsets: set[Tuple[int, int]]) -> set[Tuple[int, int]]:
             fp = {(x, y)}
@@ -1675,6 +1736,7 @@ class WarehouseSolver:
                 acts = by_t.get(t, {})
                 start_positions = dict(positions)
                 start_docks = {rid: set(offsets) for rid, offsets in docks.items()}
+                static_pallet_cells = static_pallet_cells_at(t)
                 start_footprints = {
                     rid: footprint_at(pos[0], pos[1], start_docks.get(rid, set()))
                     for rid, pos in start_positions.items()
@@ -1724,6 +1786,8 @@ class WarehouseSolver:
                             if not in_bounds:
                                 continue
                             if any(static_blocked[fy, fx] for fx, fy in candidate_fp):
+                                continue
+                            if candidate_fp.intersection(static_pallet_cells):
                                 continue
 
                             occupied_without_blocker = occupied_start - start_footprints[blocker]

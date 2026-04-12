@@ -18,6 +18,9 @@ input_path = "docs/BIG_ORDER.txt"
 [solver]
 # Reservation horizon (space-time planner tensor depth).
 max_time = 50000
+# Run full validator replay every N makespan ticks during dispatch.
+# Set to 0 to disable periodic validation.
+ticks_to_full_validation = 500
 test_mode = false
 
 [lns]
