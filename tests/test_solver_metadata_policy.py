@@ -1,7 +1,7 @@
 import sqlite3
 import sys
+import tempfile
 import unittest
-import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,11 +22,20 @@ except Exception:  # pragma: no cover - environment-dependent optional import
 
 @unittest.skipIf(WarehouseSolver is None or RelocationJob is None, "solver dependencies unavailable")
 class SolverMetadataPolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp_roots: list[tempfile.TemporaryDirectory[str]] = []
+
+    def tearDown(self) -> None:
+        for tmp in self._tmp_roots:
+            tmp.cleanup()
+        self._tmp_roots.clear()
+
     def _workspace_case_dir(self) -> Path:
         base = ROOT / "output"
         base.mkdir(parents=True, exist_ok=True)
-        case_dir = base / f"test_case_{uuid.uuid4().hex}"
-        case_dir.mkdir(parents=True, exist_ok=False)
+        tmp = tempfile.TemporaryDirectory(prefix="test_case_", dir=base)
+        self._tmp_roots.append(tmp)
+        case_dir = Path(tmp.name)
         return case_dir
 
     def _new_solver_shell(self) -> WarehouseSolver:

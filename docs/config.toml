@@ -5,8 +5,8 @@ max_runs = 3
 # Hard stop on produced plan length. If exceeded before finishing all orders,
 # the run exits and writes partial output.
 max_makespan = 13000
-# Seconds of compute budget (15 minutes default).
-max_plan_time = 900
+# Seconds of compute budget:
+max_plan_time = 1800
 
 [paths]
 output_dir = "output"
