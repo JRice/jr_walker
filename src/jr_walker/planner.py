@@ -117,3 +117,18 @@ class ReservationPlanner:
             return
         cell_slice = self.reservation_table[timestep:, y, x]
         cell_slice[cell_slice < 2] = 2
+
+    def can_add_static_obstacle_from(self, timestep: int, x: int, y: int) -> bool:
+        """
+        Returns True if a cell can become static-blocked from `timestep` onward
+        without conflicting with already-reserved dynamic occupancy.
+        """
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            return False
+        if timestep < 0:
+            timestep = 0
+        if timestep >= self.max_time:
+            return True
+        cell_slice = self.reservation_table[timestep:, y, x]
+        # 3 is dynamic robot footprint reservation.
+        return bool(np.all(cell_slice < 3))

@@ -535,6 +535,9 @@ class SubmissionValidator:
             )
             if moved_dock_conflict is not None:
                 raise ValidationError(f"timestep {timestep}: {moved_dock_conflict}")
+        projected_shape_conflict = self._validate_projected_move_shape_conflicts(moving_actions)
+        if projected_shape_conflict is not None:
+            raise ValidationError(f"timestep {timestep}: {projected_shape_conflict}")
 
         for action in actions:
             if action.action_type == "undock":
@@ -545,9 +548,7 @@ class SubmissionValidator:
         for action in actions:
             if action.action_type == "dock":
                 self._apply_dock(action)
-        for action in actions:
-            if action.action_type == "move":
-                self._apply_move(action)
+        self._apply_moves(moving_actions)
         self._robot_by_pos = {(r.x, r.y): r for r in self.robots}
         for action in actions:
             if action.action_type == "fulfill":
@@ -709,6 +710,40 @@ class SubmissionValidator:
                 )
         return None
 
+    def _validate_projected_move_shape_conflicts(self, moving_actions: list[Action]) -> str | None:
+        if not moving_actions:
+            return None
+
+        robot_targets: dict[int, int] = {_key(move.x, move.y): move.robot_id for move in moving_actions}
+        docked_targets: dict[int, tuple[int, int]] = {}
+
+        for move in moving_actions:
+            robot = self.robots[move.robot_id]
+            dx = move.x - robot.x
+            dy = move.y - robot.y
+            for pallet_id in robot.docked_pallets:
+                pallet = self.pallets[pallet_id]
+                nx = pallet.x + dx
+                ny = pallet.y + dy
+                target_key = _key(nx, ny)
+
+                other_robot = robot_targets.get(target_key)
+                if other_robot is not None and other_robot != robot.robot_id:
+                    return (
+                        f"error G2: robot {robot.robot_id}'s docked pallet {pallet_id} "
+                        f"would collide with robot {other_robot} moving to ({nx}, {ny})"
+                    )
+
+                other_docked = docked_targets.get(target_key)
+                if other_docked is not None:
+                    other_robot_id, other_pallet_id = other_docked
+                    return (
+                        f"error H2: robot {robot.robot_id}'s docked pallet {pallet_id} and "
+                        f"robot {other_robot_id}'s docked pallet {other_pallet_id} would both move to ({nx}, {ny})"
+                    )
+                docked_targets[target_key] = (robot.robot_id, pallet_id)
+        return None
+
     def _apply_undock(self, action: Action) -> None:
         robot = self.robots[action.robot_id]
         pallet = self._pallet_at(action.x, action.y)
@@ -732,20 +767,65 @@ class SubmissionValidator:
         pallet.docked_to_robot = robot.robot_id
         robot.docked_pallets.append(pallet.pallet_id)
 
-    def _apply_move(self, action: Action) -> None:
-        robot = self.robots[action.robot_id]
-        dx = action.x - robot.x
-        dy = action.y - robot.y
+    def _apply_moves(self, moving_actions: list[Action]) -> None:
+        if not moving_actions:
+            return
 
-        robot.x = action.x
-        robot.y = action.y
+        move_by_robot: dict[int, tuple[int, int]] = {}
+        pallet_updates: list[tuple[PalletState, int, int, int, int, int, int]] = []
+        old_keys: list[tuple[int, int, int, int, int]] = []
 
-        for pallet_id in robot.docked_pallets:
-            pallet = self.pallets[pallet_id]
-            del self._pallet_by_pos[_key(pallet.x, pallet.y)]
-            pallet.x += dx
-            pallet.y += dy
-            self._pallet_by_pos[_key(pallet.x, pallet.y)] = pallet
+        for action in moving_actions:
+            robot = self.robots[action.robot_id]
+            dx = action.x - robot.x
+            dy = action.y - robot.y
+            move_by_robot[action.robot_id] = (action.x, action.y)
+
+            for pallet_id in robot.docked_pallets:
+                pallet = self.pallets[pallet_id]
+                old_key = _key(pallet.x, pallet.y)
+                old_keys.append((old_key, robot.robot_id, pallet_id, pallet.x, pallet.y))
+                pallet_updates.append(
+                    (
+                        pallet,
+                        pallet.x,
+                        pallet.y,
+                        pallet.x + dx,
+                        pallet.y + dy,
+                        robot.robot_id,
+                        pallet_id,
+                    )
+                )
+
+        # Phase 1: remove all old docked-pallet cells before inserting new cells.
+        # This prevents swap/cycle moves from deleting another pallet's newly inserted key.
+        for old_key, robot_id, pallet_id, px, py in old_keys:
+            mapped = self._pallet_by_pos.get(old_key)
+            if mapped is None or mapped.pallet_id != pallet_id:
+                raise ValidationError(
+                    f"error ST4: pallet map mismatch while moving robot {robot_id} "
+                    f"for docked pallet {pallet_id} from ({px}, {py})"
+                )
+            del self._pallet_by_pos[old_key]
+
+        # Move robots.
+        for robot_id, (nx, ny) in move_by_robot.items():
+            robot = self.robots[robot_id]
+            robot.x = nx
+            robot.y = ny
+
+        # Phase 2: add all new docked-pallet cells.
+        for pallet, _, _, nx, ny, robot_id, pallet_id in pallet_updates:
+            target_key = _key(nx, ny)
+            if target_key in self._pallet_by_pos:
+                existing = self._pallet_by_pos[target_key]
+                raise ValidationError(
+                    f"error ST5: pallet map overlap while moving robot {robot_id} "
+                    f"docked pallet {pallet_id} to ({nx}, {ny}) with pallet {existing.pallet_id}"
+                )
+            pallet.x = nx
+            pallet.y = ny
+            self._pallet_by_pos[target_key] = pallet
 
     def _apply_fulfill(self, action: Action) -> None:
         robot = self.robots[action.robot_id]

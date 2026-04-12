@@ -643,6 +643,8 @@ class WarehouseSolver:
             validator.finalize()
         except ValidationError as exc:
             periodic_error = str(exc)
+        except Exception as exc:
+            periodic_error = f"unexpected validator failure {type(exc).__name__}: {exc!r}"
 
         if periodic_error is not None:
             self._log(
@@ -1012,6 +1014,9 @@ class WarehouseSolver:
         temp_robot.last_t = fulfill_t
         temp_robot.storage.clear()
 
+        if not self._can_commit_pending_actions(pending_actions):
+            return False
+
         self._commit_plan(
             robot=robot,
             temp_robot=temp_robot,
@@ -1065,6 +1070,9 @@ class WarehouseSolver:
         pending_footprints.append((self._clone_robot_state(temp_robot), dock_t, temp_robot.x, temp_robot.y))
         temp_robot.last_t = dock_t
         temp_robot.docks[(dx, dy)] = pallet_id
+
+        if not self._can_commit_pending_actions(pending_actions):
+            return False
 
         self._commit_plan(robot, temp_robot, pending_actions, pending_paths, pending_footprints)
         return True
@@ -1145,7 +1153,7 @@ class WarehouseSolver:
         temp_robot.last_t = dock_t
         temp_robot.docks[(dx, dy)] = pallet_id
 
-        chosen_target: Tuple[int, int, List[Tuple[int, int, int]]] | None = None
+        chosen_target: Tuple[int, int, List[Tuple[int, int, int]], int] | None = None
         for tx, ty in target_pallet_cells:
             if (tx, ty) in self.scheduler.pallets and (tx, ty) != pallet_xy:
                 continue
@@ -1163,13 +1171,19 @@ class WarehouseSolver:
             if not carry_path and (temp_robot.x != target_robot_x or temp_robot.y != target_robot_y):
                 continue
 
-            chosen_target = (tx, ty, carry_path)
+            candidate_arrival_t = carry_path[-1][0] if carry_path else temp_robot.last_t
+            candidate_undock_t = candidate_arrival_t + 1
+            candidate_static_from_t = candidate_undock_t + 1
+            if not self.planner.can_add_static_obstacle_from(candidate_static_from_t, tx, ty):
+                continue
+
+            chosen_target = (tx, ty, carry_path, candidate_undock_t)
             break
 
         if chosen_target is None:
             return None
 
-        target_pallet_x, target_pallet_y, carry_path = chosen_target
+        target_pallet_x, target_pallet_y, carry_path, _ = chosen_target
         if carry_path:
             pending_paths.append((self._clone_robot_state(temp_robot), carry_path))
         pending_actions.extend(self._apply_moves_to_robot(temp_robot, carry_path))
@@ -1183,6 +1197,8 @@ class WarehouseSolver:
         del temp_robot.docks[(dx, dy)]
 
         pending_static_additions.append((undock_t + 1, target_pallet_x, target_pallet_y))
+        if not self._can_commit_pending_actions(pending_actions):
+            return None
         self._commit_plan(
             robot=robot,
             temp_robot=temp_robot,
@@ -1230,24 +1246,32 @@ class WarehouseSolver:
         target_pallet_cells = self._ranked_relocation_target_cells(job, pallet_xy)
 
         for stand_xy in stand_cells:
-            outcome = self._attempt_relocation_via_stand(
-                robot=robot,
-                pallet_xy=pallet_xy,
-                pallet_id=pallet_id,
-                stand_xy=stand_xy,
-                target_pallet_cells=target_pallet_cells,
-            )
-            if outcome is None:
+            try:
+                outcome = self._attempt_relocation_via_stand(
+                    robot=robot,
+                    pallet_xy=pallet_xy,
+                    pallet_id=pallet_id,
+                    stand_xy=stand_xy,
+                    target_pallet_cells=target_pallet_cells,
+                )
+                if outcome is None:
+                    continue
+                new_xy, dock_t, undock_t = outcome
+                self._finalize_relocation_pallet_state(
+                    pallet_id=pallet_id,
+                    old_xy=pallet_xy,
+                    new_xy=new_xy,
+                    dock_t=dock_t,
+                    undock_t=undock_t,
+                )
+                return True
+            except Exception as exc:
+                self._log(
+                    "relocation_attempt_error "
+                    f"robot={robot.id} sku={job.sku} pallet_id={pallet_id} "
+                    f"stand={stand_xy} source={pallet_xy} error={type(exc).__name__}: {exc!r}"
+                )
                 continue
-            new_xy, dock_t, undock_t = outcome
-            self._finalize_relocation_pallet_state(
-                pallet_id=pallet_id,
-                old_xy=pallet_xy,
-                new_xy=new_xy,
-                dock_t=dock_t,
-                undock_t=undock_t,
-            )
-            return True
 
         return False
 
@@ -1463,6 +1487,21 @@ class WarehouseSolver:
             target_x,
             target_y,
             max_path_steps=self.config.path_step_limit,
+        )
+
+    def _can_commit_pending_actions(
+        self, pending_actions: List[Tuple[int, int, str, int, int]]
+    ) -> bool:
+        if not pending_actions:
+            return True
+        candidate = self.actions.sorted_actions() + list(pending_actions)
+        candidate.sort(key=lambda row: (row[0], row[1]))
+        if not self._has_unique_robot_timestep_pairs(candidate):
+            return False
+        return self._validate_candidate_actions(
+            candidate,
+            log_on_error=True,
+            require_complete=False,
         )
 
     def _commit_plan(

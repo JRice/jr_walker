@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 import argparse
 import tomllib
+import traceback
 from dataclasses import dataclass
 import re
 import sqlite3
@@ -252,7 +253,8 @@ def _run_pipeline(
 
     except Exception as exc:
         solve_error = exc
-        print(f"Solver/optimizer failed: {exc}")
+        print(f"Solver/optimizer failed: {type(exc).__name__}: {exc!r}")
+        print(traceback.format_exc())
         if base_actions:
             print("Reverting to pre-LNS baseline actions...")
             actions = list(base_actions)
