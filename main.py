@@ -47,6 +47,7 @@ def _parse_robot_key(raw_key: str) -> int:
 
 @dataclass
 class RunConfig:
+    max_runs: int = 1
     lane_width: int = 3
     relocation_edge_band: int = 6
     relocation_skus_to_relocate: list[int] | None = None
@@ -108,6 +109,13 @@ def load_run_config(config_path: Path) -> RunConfig:
         data = tomllib.load(handle)
 
     run_config = RunConfig()
+
+    loop_section = _get_table(data, "loop")
+    run_config.max_runs = _require_int(
+        loop_section.get("max_runs", run_config.max_runs),
+        "loop.max_runs",
+        minimum=1,
+    )
 
     paths_section = _get_table(data, "paths")
     run_config.output_dir = str(paths_section.get("output_dir", run_config.output_dir))
@@ -405,8 +413,6 @@ def _save_and_report(
     print(f"Orders used: {len(state.orders)}")
     if metadata_run_id is not None:
         print(f"Wrote metadata to {metadata_db_path} (run_id={metadata_run_id})")
-    if solve_error is not None:
-        raise SystemExit(1)
 
 
 def main():
@@ -439,7 +445,8 @@ def main():
         print(
             "Loaded config from "
             f"{config_path} "
-            f"(lane_width={run_config.lane_width}, "
+            f"(max_runs={run_config.max_runs}, "
+            f"lane_width={run_config.lane_width}, "
             f"edge_band_for_heatmap={run_config.relocation_edge_band}, "
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "
@@ -457,26 +464,41 @@ def main():
     output_prefix = "test_" if run_config.test_mode else ""
     temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
 
-    past_analysis = PastRunAnalysis()
     db_path = Path(run_config.metadata_db_path)
-    if db_path.exists():
-        print("Loading analysis of the best existing solution from SQL database...")
-        past_analysis = load_best_past_analysis(db_path, state.width, state.height, state.pallets)
-        if past_analysis.run_id >= 0:
-            print(f"Loaded analysis for Run #{past_analysis.run_id}: found {len(past_analysis.high_use_cells)} high-traffic cells to avoid.")
+    any_success = False
+    last_error: Exception | None = None
 
-    print("Generating new Suggestions based on this analysis...")
-    solver = _build_solver(state, run_config, temp_output_path, past_analysis)
-    actions, solve_error = _run_pipeline(solver, run_config, output_dir)
-    _save_and_report(
-        actions,
-        state,
-        run_config,
-        output_dir,
-        output_prefix,
-        temp_output_path,
-        solve_error,
-    )
+    for iteration in range(1, run_config.max_runs + 1):
+        print(f"\n=== Iteration {iteration}/{run_config.max_runs} ===")
+        past_analysis = PastRunAnalysis()
+        if db_path.exists():
+            print("Loading analysis of the best existing solution from SQL database...")
+            past_analysis = load_best_past_analysis(db_path, state.width, state.height, state.pallets)
+            if past_analysis.run_id >= 0:
+                print(
+                    f"Loaded analysis for Run #{past_analysis.run_id}: "
+                    f"found {len(past_analysis.high_use_cells)} high-traffic cells to avoid."
+                )
+
+        print("Generating new Suggestions based on this analysis...")
+        solver = _build_solver(state, run_config, temp_output_path, past_analysis)
+        actions, solve_error = _run_pipeline(solver, run_config, output_dir)
+        _save_and_report(
+            actions,
+            state,
+            run_config,
+            output_dir,
+            output_prefix,
+            temp_output_path,
+            solve_error,
+        )
+        if solve_error is None:
+            any_success = True
+        else:
+            last_error = solve_error
+
+    if not any_success and last_error is not None:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

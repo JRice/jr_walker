@@ -1861,7 +1861,8 @@ class WarehouseSolver:
             return
         log_path = Path(self.config.log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log_handle = log_path.open("w", encoding="utf-8", buffering=1)
+        # Append so solve + optimize phases and multi-run iterations keep a full trace.
+        self._log_handle = log_path.open("a", encoding="utf-8", buffering=1)
 
     def _close_log(self) -> None:
         if self._log_handle is not None:
