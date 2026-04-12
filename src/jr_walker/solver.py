@@ -189,11 +189,30 @@ def load_best_past_analysis(db_path: Path, width: int, height: int, pallets: Dic
                 if use_score >= cutoff and (x, y) not in pallets:
                     analysis.high_use_cells.add((x, y))
 
-        fulfill_rows = conn.execute(
-            "SELECT robot_id, timestep, order_id, skus_json FROM fulfills WHERE run_id = ? ORDER BY robot_id, timestep ASC",
-            (run_id,),
-        ).fetchall()
-        for x, y, skus_json in fulfill_rows:
+        try:
+            fulfill_rows = conn.execute(
+                """
+                SELECT robot_id, timestep, order_id, x, y, skus_json
+                FROM fulfills
+                WHERE run_id = ?
+                ORDER BY robot_id, timestep ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        except sqlite3.Error:
+            # Backward-compat for older schemas without order_id.
+            legacy_rows = conn.execute(
+                """
+                SELECT robot_id, timestep, x, y, skus_json
+                FROM fulfills
+                WHERE run_id = ?
+                ORDER BY robot_id, timestep ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            fulfill_rows = [(rid, t, None, x, y, skus_json) for rid, t, x, y, skus_json in legacy_rows]
+
+        for _, _, _, x, y, skus_json in fulfill_rows:
             bucket = _bucket_for_edge(int(x), int(y), width, height)
             bucket_counter = analysis.bucket_sku_counts.setdefault(bucket, collections.Counter())
             try:
@@ -210,7 +229,7 @@ def load_best_past_analysis(db_path: Path, width: int, height: int, pallets: Dic
                 bucket_counter[sku] += 1
                 analysis.bucket_items[bucket] = analysis.bucket_items.get(bucket, 0) + 1
 
-        for robot_id, timestep, order_id, skus_json in fulfill_rows:
+        for robot_id, timestep, order_id, _, _, skus_json in fulfill_rows:
             analysis.fulfills.append(
                 {
                     "robot_id": robot_id,

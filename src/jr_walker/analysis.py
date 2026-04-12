@@ -85,12 +85,19 @@ class SolutionMetadata:
         return self.cells[y * self.width + x]
 
 
+@dataclass(slots=True)
+class OrderState:
+    order_id: int
+    items: collections.Counter
+    fulfilled: bool = False
+
+
 def _build_solution_metadata(
     *,
     num_robots: int,
     robot_starts: List[Tuple[int, int]],
     pallet_defs: List[Tuple[int, int, int]],
-    order_defs: List[collections.Counter],
+    order_defs: List[collections.Counter] | None = None,
     actions_by_timestep: Dict[int, List[Tuple[int, str, int, int]]],
     max_timestep: int,
 ):
@@ -119,9 +126,9 @@ def _build_solution_metadata(
     robot_idle_ticks = [0 for _ in range(num_robots)]
     robot_empty_moves = [0 for _ in range(num_robots)]
     robot_order_times: List[List[int]] = [[] for _ in range(num_robots)]
-    local_orders: list[OrderState] = [
-        OrderState(order_id=oid, items=Counter(items)) for oid, items in enumerate(order_defs)
-    ]
+    local_orders: list[OrderState] = []
+    for oid, items in enumerate(order_defs or []):
+        local_orders.append(OrderState(order_id=oid, items=collections.Counter(items)))
 
     pallets: List[dict] = []
     pallet_at: Dict[int, int] = {}
@@ -335,6 +342,15 @@ def _ensure_metadata_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
+    # Backward-compatible migration: older databases may not include order_id.
+    fulfill_cols = {
+        str(row[1]).lower()
+        for row in conn.execute("PRAGMA table_info(fulfills)").fetchall()
+        if len(row) > 1
+    }
+    if "order_id" not in fulfill_cols:
+        conn.execute("ALTER TABLE fulfills ADD COLUMN order_id INTEGER")
+
 
 def _choose_run_id(
     conn: sqlite3.Connection,
@@ -437,12 +453,15 @@ def store_solution_metadata(
 
             fulfill_rows = []
             for idx, fulfill in enumerate(metadata.fulfills):
+                order_id_raw = fulfill.get("order_id", None)
+                order_id = int(order_id_raw) if order_id_raw is not None else None
                 fulfill_rows.append(
                     (
                         selected_run_id,
                         idx,
                         int(fulfill.get("timestep", -1)),
                         int(fulfill["robot"]),
+                        order_id,
                         int(fulfill["x"]),
                         int(fulfill["y"]),
                         json.dumps(fulfill["skus"]),
