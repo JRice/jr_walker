@@ -3,12 +3,12 @@ max_runs = 1
 
 [limits]
 # Hard stop on produced plan length. If exceeded before finishing all orders,
-# the run exits and writes partial output.
-max_makespan = 15000
-# Seconds of compute budget:
+# the run exits and writes partial output. For a full run, you want this to be 16000 or so.
+max_makespan = 1000
+# Seconds of compute budget: One run has been taking 30-60 minutes, so you want this high:
 max_plan_time = 6000
-# Solve every Nth order from the worklist (1 = all orders).
-every_n_orders = 1
+# Solve every Nth order from the worklist (1 = all orders). THIS SHOULD BE 1 for a full run.
+every_n_orders = 10
 
 [paths]
 output_dir = "output"
@@ -25,7 +25,7 @@ relocation_top_skus = 16
 # Max relocation suggestions admitted into the dispatch queue.
 num_allowed_relocations = 18
 # Scales DockSuggestion expected gain (higher => more likely to do strategic docking).
-dock_gain_scale = 4.0
+dock_gain_scale = 8.0
 # Scales normalized relocation gain after order-relative normalization.
 relocation_gain_scale = 3.0
 # If true, disallow two robots swapping positions in one timestep.

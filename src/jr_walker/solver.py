@@ -680,12 +680,7 @@ class WarehouseSolver:
         out: List[Tuple[int, int]] = []
 
         # Default pattern: (x,y), (x+1,y), then keep same x/x+1 while moving toward nearest edge.
-        top_dist = sy
-        bottom_dist = self.state.height - 1 - sy
-        if top_dist <= bottom_dist:
-            step = -1
-        else:
-            step = 1
+        step = self._setup_inward_step(hotspot)
 
         depth = 0
         while len(out) < limit:
@@ -699,6 +694,35 @@ class WarehouseSolver:
                         break
             depth += 1
         return out
+
+    def _setup_inward_step(self, hotspot: Tuple[int, int]) -> int:
+        _, sy = hotspot
+        top_dist = sy
+        bottom_dist = self.state.height - 1 - sy
+        return -1 if top_dist <= bottom_dist else 1
+
+    def _setup_pull_directions(
+        self,
+        from_xy: Tuple[int, int],
+        target_xy: Tuple[int, int],
+    ) -> List[Tuple[int, int]]:
+        fx, fy = from_xy
+        tx, ty = target_xy
+        dx = tx - fx
+        dy = ty - fy
+        dirs: List[Tuple[int, int]] = []
+
+        if abs(dx) >= abs(dy):
+            if dx != 0:
+                dirs.append((1 if dx > 0 else -1, 0))
+            if dy != 0:
+                dirs.append((0, 1 if dy > 0 else -1))
+        else:
+            if dy != 0:
+                dirs.append((0, 1 if dy > 0 else -1))
+            if dx != 0:
+                dirs.append((1 if dx > 0 else -1, 0))
+        return dirs
 
     def _first_available_setup_target(
         self,
@@ -1639,7 +1663,7 @@ class WarehouseSolver:
         return True
 
     def _setup_target_candidates(
-        self, job: SetupJob, source_xy: Tuple[int, int], limit: int = 32
+        self, job: SetupJob, source_xy: Tuple[int, int], limit: int = 12
     ) -> List[Tuple[int, int]]:
         out: List[Tuple[int, int]] = []
         seen: set[Tuple[int, int]] = set()
@@ -1683,6 +1707,7 @@ class WarehouseSolver:
                 pallet_id=job.source_pallet_id,
                 stand_xy=stand_xy,
                 target_pallet_cells=target_cells,
+                setup_redock_edge_step=self._setup_inward_step(job.hotspot),
             )
             if outcome is None:
                 continue
@@ -1746,6 +1771,7 @@ class WarehouseSolver:
         pallet_id: int,
         stand_xy: Tuple[int, int],
         target_pallet_cells: List[Tuple[int, int]],
+        setup_redock_edge_step: int | None = None,
     ) -> Tuple[Tuple[int, int], int, int] | None:
         stand_x, stand_y = stand_xy
         temp_robot = self._clone_robot_state(robot)
@@ -1779,25 +1805,146 @@ class WarehouseSolver:
             if (tx, ty) in self.scheduler.pallets and (tx, ty) != pallet_xy:
                 continue
 
-            target_robot_x = tx - dx
-            target_robot_y = ty - dy
+            candidate_robot = self._clone_robot_state(temp_robot)
+            candidate_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+            candidate_actions: List[Tuple[int, int, str, int, int]] = []
+            candidate_footprints: List[Tuple[RobotState, int, int, int]] = []
+            candidate_offset = (dx, dy)
+            candidate_pallet_xy = pallet_xy
+
+            if setup_redock_edge_step is not None:
+                # Retry redock staging by pulling farther toward target before trying edge-side orientation.
+                # This avoids getting stuck when the first reorientation point is blocked.
+                redock_done = False
+                max_pull_rounds = 3
+                base_robot = self._clone_robot_state(candidate_robot)
+                base_offset = candidate_offset
+                base_pallet_xy = candidate_pallet_xy
+
+                for pull_steps in range(1, max_pull_rounds + 1):
+                    staged_robot = self._clone_robot_state(base_robot)
+                    staged_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+                    staged_actions: List[Tuple[int, int, str, int, int]] = []
+                    staged_footprints: List[Tuple[RobotState, int, int, int]] = []
+                    staged_offset = base_offset
+                    staged_pallet_xy = base_pallet_xy
+
+                    staged_ok = True
+                    for _ in range(pull_steps):
+                        step_moved = False
+                        for move_dx, move_dy in self._setup_pull_directions(staged_pallet_xy, (tx, ty)):
+                            pull_robot_x = staged_robot.x + move_dx
+                            pull_robot_y = staged_robot.y + move_dy
+                            pull_pallet_x = staged_pallet_xy[0] + move_dx
+                            pull_pallet_y = staged_pallet_xy[1] + move_dy
+                            if not (0 <= pull_robot_x < self.state.width and 0 <= pull_robot_y < self.state.height):
+                                continue
+                            if not (0 <= pull_pallet_x < self.state.width and 0 <= pull_pallet_y < self.state.height):
+                                continue
+                            pulled_xy = (pull_pallet_x, pull_pallet_y)
+                            if pulled_xy in self.scheduler.pallets and pulled_xy != staged_pallet_xy:
+                                continue
+
+                            pull_path = self._safe_plan_path_with_step_cap(
+                                staged_robot,
+                                pull_robot_x,
+                                pull_robot_y,
+                                max_path_steps=1,
+                            )
+                            if not pull_path and (staged_robot.x != pull_robot_x or staged_robot.y != pull_robot_y):
+                                continue
+                            if pull_path:
+                                staged_paths.append((self._clone_robot_state(staged_robot), pull_path))
+                            staged_actions.extend(self._apply_moves_to_robot(staged_robot, pull_path))
+                            staged_pallet_xy = pulled_xy
+                            step_moved = True
+                            break
+                        if not step_moved:
+                            staged_ok = False
+                            break
+
+                    if not staged_ok:
+                        continue
+
+                    undock_pull_t = staged_robot.last_t + 1
+                    if not self.planner.can_occupy(staged_robot, undock_pull_t, staged_robot.x, staged_robot.y):
+                        continue
+                    staged_actions.append(
+                        (undock_pull_t, staged_robot.id, "undock", staged_pallet_xy[0], staged_pallet_xy[1])
+                    )
+                    staged_footprints.append(
+                        (self._clone_robot_state(staged_robot), undock_pull_t, staged_robot.x, staged_robot.y)
+                    )
+                    staged_robot.last_t = undock_pull_t
+                    staged_robot.docks.pop(staged_offset, None)
+
+                    edge_side_xy = (staged_pallet_xy[0], staged_pallet_xy[1] + setup_redock_edge_step)
+                    if not (0 <= edge_side_xy[0] < self.state.width and 0 <= edge_side_xy[1] < self.state.height):
+                        continue
+                    reposition_path = self._safe_plan_path_with_step_cap(
+                        staged_robot,
+                        edge_side_xy[0],
+                        edge_side_xy[1],
+                        max_path_steps=4,
+                    )
+                    if not reposition_path and (staged_robot.x != edge_side_xy[0] or staged_robot.y != edge_side_xy[1]):
+                        continue
+                    if reposition_path:
+                        staged_paths.append((self._clone_robot_state(staged_robot), reposition_path))
+                    staged_actions.extend(self._apply_moves_to_robot(staged_robot, reposition_path))
+
+                    redock_dx = staged_pallet_xy[0] - staged_robot.x
+                    redock_dy = staged_pallet_xy[1] - staged_robot.y
+                    if abs(redock_dx) + abs(redock_dy) != 1:
+                        continue
+
+                    redock_t = staged_robot.last_t + 1
+                    if not self.planner.can_occupy(staged_robot, redock_t, staged_robot.x, staged_robot.y):
+                        continue
+                    staged_actions.append((redock_t, staged_robot.id, "dock", staged_pallet_xy[0], staged_pallet_xy[1]))
+                    staged_footprints.append(
+                        (self._clone_robot_state(staged_robot), redock_t, staged_robot.x, staged_robot.y)
+                    )
+                    staged_robot.last_t = redock_t
+                    staged_robot.docks[(redock_dx, redock_dy)] = pallet_id
+                    staged_offset = (redock_dx, redock_dy)
+
+                    candidate_robot = staged_robot
+                    candidate_paths.extend(staged_paths)
+                    candidate_actions.extend(staged_actions)
+                    candidate_footprints.extend(staged_footprints)
+                    candidate_offset = staged_offset
+                    candidate_pallet_xy = staged_pallet_xy
+                    redock_done = True
+                    break
+
+                if not redock_done:
+                    continue
+
+            target_robot_x = tx - candidate_offset[0]
+            target_robot_y = ty - candidate_offset[1]
             if not (0 <= target_robot_x < self.state.width and 0 <= target_robot_y < self.state.height):
                 continue
             if (target_robot_x, target_robot_y) in self.scheduler.pallets and (
                 target_robot_x, target_robot_y
-            ) != pallet_xy:
+            ) != candidate_pallet_xy:
                 continue
 
-            carry_path = self._safe_plan_path(temp_robot, target_robot_x, target_robot_y)
-            if not carry_path and (temp_robot.x != target_robot_x or temp_robot.y != target_robot_y):
+            carry_path = self._safe_plan_path(candidate_robot, target_robot_x, target_robot_y)
+            if not carry_path and (candidate_robot.x != target_robot_x or candidate_robot.y != target_robot_y):
                 continue
 
-            candidate_arrival_t = carry_path[-1][0] if carry_path else temp_robot.last_t
+            candidate_arrival_t = carry_path[-1][0] if carry_path else candidate_robot.last_t
             candidate_undock_t = candidate_arrival_t + 1
             candidate_static_from_t = candidate_undock_t + 1
             if not self.planner.can_add_static_obstacle_from(candidate_static_from_t, tx, ty):
                 continue
 
+            pending_paths.extend(candidate_paths)
+            pending_actions.extend(candidate_actions)
+            pending_footprints.extend(candidate_footprints)
+            temp_robot = candidate_robot
+            dx, dy = candidate_offset
             chosen_target = (tx, ty, carry_path, candidate_undock_t)
             break
 
@@ -1815,7 +1962,7 @@ class WarehouseSolver:
         pending_actions.append((undock_t, temp_robot.id, "undock", target_pallet_x, target_pallet_y))
         pending_footprints.append((self._clone_robot_state(temp_robot), undock_t, temp_robot.x, temp_robot.y))
         temp_robot.last_t = undock_t
-        del temp_robot.docks[(dx, dy)]
+        temp_robot.docks.pop((dx, dy), None)
 
         pending_static_additions.append((undock_t + 1, target_pallet_x, target_pallet_y))
         if not self._can_commit_pending_actions(pending_actions):
@@ -2110,6 +2257,55 @@ class WarehouseSolver:
             target_x,
             target_y,
             max_path_steps=self.config.path_step_limit,
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._astar_calls += 1
+        self._astar_total_ms += elapsed_ms
+        if elapsed_ms > self._astar_max_ms:
+            self._astar_max_ms = elapsed_ms
+
+        blocked = not path and (start_x != target_x or start_y != target_y)
+        if blocked:
+            self._astar_blocked_calls += 1
+
+        if elapsed_ms >= self.config.astar_slow_ms:
+            self._astar_slow_calls += 1
+            msg = (
+                "astar_slow "
+                f"robot={robot.id} start=({start_x},{start_y}) target=({target_x},{target_y}) "
+                f"last_t={robot.last_t} docks={len(robot.docks)} path_len={len(path)} "
+                f"blocked={blocked} elapsed_ms={elapsed_ms:.3f}"
+            )
+            self._log(msg)
+            if self.config.astar_print_slow:
+                print(f"[solver] {msg}")
+        elif blocked and self.config.astar_log_blocked:
+            self._log(
+                "astar_blocked "
+                f"robot={robot.id} start=({start_x},{start_y}) target=({target_x},{target_y}) "
+                f"last_t={robot.last_t} docks={len(robot.docks)} elapsed_ms={elapsed_ms:.3f}"
+            )
+        return path
+
+    def _safe_plan_path_with_step_cap(
+        self,
+        robot: RobotState,
+        target_x: int,
+        target_y: int,
+        *,
+        max_path_steps: int,
+    ) -> List[Tuple[int, int, int]]:
+        """
+        Fast bounded path query for short staging maneuvers.
+        Keeps setup redock attempts from spending long A* searches on impossible micro-moves.
+        """
+        start_x, start_y = robot.x, robot.y
+        started = time.perf_counter()
+        path = self.planner.plan_path(
+            robot,
+            target_x,
+            target_y,
+            max_path_steps=max(0, int(max_path_steps)),
         )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self._astar_calls += 1

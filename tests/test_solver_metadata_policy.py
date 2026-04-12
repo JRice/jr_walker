@@ -182,6 +182,25 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertIn((15, 14), lanes)
         self.assertIn((16, 15), lanes)
 
+    def test_setup_inward_step_prefers_nearest_edge_direction(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+
+        self.assertEqual(solver._setup_inward_step((20, 5)), -1)
+        self.assertEqual(solver._setup_inward_step((20, 35)), 1)
+
+    def test_setup_pull_directions_prioritize_larger_axis(self) -> None:
+        solver = self._new_solver_shell()
+
+        self.assertEqual(
+            solver._setup_pull_directions((10, 10), (14, 11)),
+            [(1, 0), (0, 1)],
+        )
+        self.assertEqual(
+            solver._setup_pull_directions((10, 10), (9, 4)),
+            [(0, -1), (-1, 0)],
+        )
+
     def test_iter_sku_anchor_rows_groups_counts_by_chunk(self) -> None:
         solver = self._new_solver_shell()
         solver.state = SimpleNamespace(width=12, height=12)
