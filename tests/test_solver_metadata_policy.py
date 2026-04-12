@@ -52,6 +52,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver.past_analysis = PastRunAnalysis()
         solver.config = SimpleNamespace(
             relocation_edge_band=6,
+            relocate_chunk_size=1,
             dispatch_validate_every_makespan=500,
             strict_no_swap=False,
             astar_slow_ms=40.0,
@@ -180,6 +181,25 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertIn((15, 15), lanes)
         self.assertIn((15, 14), lanes)
         self.assertIn((16, 15), lanes)
+
+    def test_iter_sku_anchor_rows_groups_counts_by_chunk(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=12, height=12)
+        solver.config = SimpleNamespace(relocation_edge_band=20, relocate_chunk_size=3)
+        solver.past_analysis.sku_cells = {
+            7: [
+                (0, 0, 10),
+                (2, 1, 5),
+                (5, 5, 4),
+            ]
+        }
+        solver.past_analysis.use_by_cell = {}
+
+        rows = solver._iter_sku_anchor_rows(7, limit=5)
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertEqual(rows[0][2], 15)
+        self.assertLessEqual(rows[0][0], 2)
+        self.assertLessEqual(rows[0][1], 2)
 
     def test_strict_no_swap_rejects_robot_position_swap(self) -> None:
         solver = self._new_solver_shell()

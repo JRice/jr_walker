@@ -106,6 +106,7 @@ class SolverConfig:
     relocate_stand_candidate_limit: int = 6
     relocate_target_candidate_limit: int = 8
     relocation_edge_band: int = 6
+    relocate_chunk_size: int = 1
     relocation_analysis_path: Path | None = None
     relocation_top_skus: int = 8
     relocation_min_lift: float = 0.08
@@ -268,6 +269,7 @@ class WarehouseSolver:
         self.config = config or SolverConfig()
         self.rng = random.Random(self.config.random_seed)
         self.past_analysis = past_analysis or PastRunAnalysis()
+        self._sku_anchor_rows_cache: Dict[int, List[Tuple[int, int, int]]] = {}
 
         self.robots: List[RobotState] = [
             RobotState(id=rid, x=x, y=y) for rid, (x, y) in enumerate(self.state.robots)
@@ -828,9 +830,9 @@ class WarehouseSolver:
 
             score, lift, bucket, count = best
             hotspot = BUCKET_TO_HOTSPOT[bucket]
-            sku_cells = self.past_analysis.sku_cells.get(sku, [])
-            if sku_cells:
-                hotspot = (sku_cells[0][0], sku_cells[0][1])
+            preferred_hotspot = self._primary_sku_anchor_cell(sku)
+            if preferred_hotspot is not None:
+                hotspot = preferred_hotspot
             jobs.append(
                 RelocationJob(
                     sku=sku,
@@ -861,9 +863,9 @@ class WarehouseSolver:
                 continue
             bucket = self._choose_bucket_for_sku(sku, bucket_sku_counts)
             hotspot = BUCKET_TO_HOTSPOT[bucket]
-            sku_cells = self.past_analysis.sku_cells.get(sku, [])
-            if sku_cells:
-                hotspot = (sku_cells[0][0], sku_cells[0][1])
+            preferred_hotspot = self._primary_sku_anchor_cell(sku)
+            if preferred_hotspot is not None:
+                hotspot = preferred_hotspot
             jobs.append(
                 RelocationJob(
                     sku=sku,
@@ -956,7 +958,7 @@ class WarehouseSolver:
                     yield tx, ty, radius
 
     def _iter_sku_anchor_rows(self, sku: int, *, limit: int) -> List[Tuple[int, int, int]]:
-        sku_rows = self.past_analysis.sku_cells.get(sku, [])
+        sku_rows = self._sku_anchor_rows(sku)
         if not sku_rows:
             return []
         edge_band = self.config.relocation_edge_band
@@ -965,6 +967,78 @@ class WarehouseSolver:
             if edge_rows:
                 return edge_rows[: min(len(edge_rows), limit)]
         return sku_rows[: min(len(sku_rows), limit)]
+
+    def _relocate_chunk_size(self) -> int:
+        raw = getattr(self.config, "relocate_chunk_size", 1)
+        try:
+            size = int(raw)
+        except (TypeError, ValueError):
+            return 1
+        return max(1, size)
+
+    def _sku_anchor_rows(self, sku: int) -> List[Tuple[int, int, int]]:
+        cache = getattr(self, "_sku_anchor_rows_cache", None)
+        if cache is None:
+            cache = {}
+            self._sku_anchor_rows_cache = cache
+        cached = cache.get(sku)
+        if cached is not None:
+            return cached
+
+        sku_rows = list(self.past_analysis.sku_cells.get(sku, []))
+        if not sku_rows:
+            cache[sku] = []
+            return []
+
+        chunk_size = self._relocate_chunk_size()
+        if chunk_size <= 1:
+            cache[sku] = sku_rows
+            return sku_rows
+
+        chunk_accumulator: Dict[Tuple[int, int], List[float]] = {}
+        for x, y, count in sku_rows:
+            use_count = int(count)
+            if use_count <= 0:
+                continue
+            key = (int(x) // chunk_size, int(y) // chunk_size)
+            current = chunk_accumulator.get(key)
+            if current is None:
+                current = [0.0, 0.0, 0.0]
+            current[0] += use_count
+            current[1] += int(x) * use_count
+            current[2] += int(y) * use_count
+            chunk_accumulator[key] = current
+
+        aggregated_rows: List[Tuple[int, int, int]] = []
+        for (chunk_x, chunk_y), (count_sum, weighted_x, weighted_y) in chunk_accumulator.items():
+            if count_sum <= 0:
+                continue
+            anchor_x = int(round(weighted_x / count_sum))
+            anchor_y = int(round(weighted_y / count_sum))
+            min_x = chunk_x * chunk_size
+            min_y = chunk_y * chunk_size
+            max_x = min(self.state.width - 1, min_x + chunk_size - 1)
+            max_y = min(self.state.height - 1, min_y + chunk_size - 1)
+            anchor_x = min(max(anchor_x, min_x), max_x)
+            anchor_y = min(max(anchor_y, min_y), max_y)
+            aggregated_rows.append((anchor_x, anchor_y, int(count_sum)))
+
+        aggregated_rows.sort(
+            key=lambda row: (
+                -row[2],
+                self.past_analysis.use_by_cell.get((row[0], row[1]), 0),
+                row[1],
+                row[0],
+            )
+        )
+        cache[sku] = aggregated_rows
+        return aggregated_rows
+
+    def _primary_sku_anchor_cell(self, sku: int) -> Tuple[int, int] | None:
+        rows = self._sku_anchor_rows(sku)
+        if not rows:
+            return None
+        return rows[0][0], rows[0][1]
 
     def _choose_metadata_guided_relocation_target(
         self,

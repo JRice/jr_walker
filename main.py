@@ -50,6 +50,7 @@ class RunConfig:
     max_runs: int = 1
     lane_width: int = 3
     relocation_edge_band: int = 6
+    relocate_chunk_size: int = 1
     relocation_skus_to_relocate: list[int] | None = None
     max_time: int = 50000
     min_jobs_for_dock: int = 3
@@ -139,6 +140,11 @@ def load_run_config(config_path: Path) -> RunConfig:
         relocation_section.get("edge_band_for_heatmap", run_config.relocation_edge_band),
         "relocation.edge_band_for_heatmap",
         minimum=0,
+    )
+    run_config.relocate_chunk_size = _require_int(
+        relocation_section.get("relocate_chunk_size", run_config.relocate_chunk_size),
+        "relocation.relocate_chunk_size",
+        minimum=1,
     )
     solver_section = _get_table(data, "solver")
     run_config.max_time = _require_int(
@@ -266,6 +272,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             log_path=Path(run_config.log_path),
             lane_width=run_config.lane_width,
             relocation_edge_band=run_config.relocation_edge_band,
+            relocate_chunk_size=run_config.relocate_chunk_size,
             relocation_top_skus=run_config.relocation_top_skus,
             num_allowed_relocations=run_config.num_allowed_relocations,
             order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
@@ -454,6 +461,7 @@ def main():
             f"(max_runs={run_config.max_runs}, "
             f"lane_width={run_config.lane_width}, "
             f"edge_band_for_heatmap={run_config.relocation_edge_band}, "
+            f"relocate_chunk_size={run_config.relocate_chunk_size}, "
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "
             f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "

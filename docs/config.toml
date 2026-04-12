@@ -50,6 +50,9 @@ max_shift = 2
 lane_width = 3
 # Only scan metadata heatmap cells within this edge distance (cells).
 edge_band_for_heatmap = 6
+# Group SKU-flow metadata into N x N chunks before selecting anchor cells.
+# Set to 1 to disable chunking (original exact-cell behavior).
+relocate_chunk_size = 5
 # Optional explicit relocation SKU order. If provided, only these SKUs are
 # used for startup relocation planning (in listed order).
 # skus_to_relocate = [1, 2, 3, 4, 5]
