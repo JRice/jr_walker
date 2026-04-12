@@ -1463,15 +1463,10 @@ class WarehouseSolver:
         if isinstance(suggestion, SetupSuggestion):
             ranked = sorted(
                 self.robots,
-                key=lambda r: (
-                    abs(r.x - center[0]) + abs(r.y - center[1]),
-                    r.last_t,
-                    r.id,
-                ),
+                key=lambda r: self._setup_probe_robot_for_job(r, suggestion.job),
             )
-            # Try a small set of nearby robots to reduce hotspot contention without
-            # getting stuck on a single unreachable robot.
-            return ranked[: min(3, len(ranked))]
+            limit = max(1, min(int(self.config.max_robots_per_suggestion), len(ranked)))
+            return ranked[:limit]
 
         ranked = sorted(
             self.robots,
@@ -1483,6 +1478,47 @@ class WarehouseSolver:
         )
         limit = max(1, min(int(self.config.max_robots_per_suggestion), len(ranked)))
         return ranked[:limit]
+
+    def _setup_probe_robot_for_job(
+        self,
+        robot: RobotState,
+        job: SetupJob,
+    ) -> Tuple[int, int, int, int]:
+        """
+        Reachability-first ranking key for Setup jobs.
+        Returns a tuple ordered as:
+        (unreachable_flag, stand_path_len_or_fallback, robot_last_t, robot_id)
+        """
+        pallet_info = self.pallet_by_id.get(job.source_pallet_id)
+        if pallet_info is None:
+            dist = abs(robot.x - job.source_xy[0]) + abs(robot.y - job.source_xy[1])
+            return (1, dist, robot.last_t, robot.id)
+
+        source_xy = (int(pallet_info["x"]), int(pallet_info["y"]))
+        stand_cells = self.scheduler.pick_cells_for_pallet(source_xy)
+        if not stand_cells:
+            dist = abs(robot.x - source_xy[0]) + abs(robot.y - source_xy[1])
+            return (1, dist, robot.last_t, robot.id)
+
+        probe_limit = max(8, min(int(self.config.path_step_limit), 96))
+        best_len: int | None = None
+        for sx, sy in stand_cells:
+            path = self.planner.plan_path(
+                robot,
+                sx,
+                sy,
+                max_path_steps=probe_limit,
+            )
+            if path or (robot.x == sx and robot.y == sy):
+                path_len = len(path)
+                if best_len is None or path_len < best_len:
+                    best_len = path_len
+
+        if best_len is not None:
+            return (0, best_len, robot.last_t, robot.id)
+
+        dist = min(abs(robot.x - sx) + abs(robot.y - sy) for sx, sy in stand_cells)
+        return (1, dist, robot.last_t, robot.id)
 
     def _parking_candidate_cells_for_robot(self, robot: RobotState) -> List[Tuple[int, int]]:
         other_robot_cells = {(r.x, r.y) for r in self.robots if r.id != robot.id}
@@ -1693,10 +1729,18 @@ class WarehouseSolver:
             seen.add(cell)
             out.append(cell)
 
+        preferred_x = int(job.target_xy[0])
+        target_y = int(job.target_xy[1])
+        step = self._setup_inward_step(job.hotspot)
+
         push(job.target_xy)
         for cell in self._setup_slot_candidates(job.hotspot, limit=240):
             if len(out) >= limit:
                 break
+            if cell[0] != preferred_x:
+                continue
+            if (cell[1] - target_y) * step < 0:
+                continue
             push(cell)
         return out
 

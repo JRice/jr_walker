@@ -12,15 +12,21 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 try:
-    from jr_walker.solver import RelocationJob, WarehouseSolver, PastRunAnalysis, _select_best_non_test_run_id  # noqa: E402
+    from jr_walker.solver import RelocationJob, SetupJob, WarehouseSolver, PastRunAnalysis, _select_best_non_test_run_id  # noqa: E402
+    from jr_walker.logic import SetupSuggestion  # noqa: E402
 except Exception:  # pragma: no cover - environment-dependent optional import
     RelocationJob = None
+    SetupJob = None
+    SetupSuggestion = None
     WarehouseSolver = None
     PastRunAnalysis = None
     _select_best_non_test_run_id = None
 
 
-@unittest.skipIf(WarehouseSolver is None or RelocationJob is None, "solver dependencies unavailable")
+@unittest.skipIf(
+    WarehouseSolver is None or RelocationJob is None or SetupJob is None or SetupSuggestion is None,
+    "solver dependencies unavailable",
+)
 class SolverMetadataPolicyTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp_roots: list[tempfile.TemporaryDirectory[str]] = []
@@ -200,6 +206,45 @@ class SolverMetadataPolicyTests(unittest.TestCase):
             solver._setup_pull_directions((10, 10), (9, 4)),
             [(0, -1), (-1, 0)],
         )
+
+    def test_setup_target_candidates_same_column_frontier_only(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=20, height=20)
+        solver.scheduler = SimpleNamespace(pallets={})
+        job = SetupJob(
+            sku=1,
+            hotspot=(10, 5),
+            source_pallet_id=7,
+            source_xy=(3, 3),
+            target_xy=(10, 5),
+        )
+
+        cells = solver._setup_target_candidates(job, source_xy=(3, 3), limit=6)
+        self.assertTrue(cells)
+        self.assertTrue(all(x == 10 for x, _ in cells))
+        self.assertTrue(all(y <= 5 for _, y in cells))
+
+    def test_candidate_robots_for_setup_prefers_reachable_probe(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)
+        solver.robots = [
+            SimpleNamespace(id=0, x=50, y=50, last_t=0),
+            SimpleNamespace(id=1, x=1, y=1, last_t=0),
+        ]
+        job = SetupJob(
+            sku=1,
+            hotspot=(10, 5),
+            source_pallet_id=7,
+            source_xy=(3, 3),
+            target_xy=(10, 5),
+        )
+        suggestion = SetupSuggestion(job)
+
+        # Make robot 0 unreachable and robot 1 reachable regardless of distance.
+        solver._setup_probe_robot_for_job = lambda robot, _job: (1, 99, robot.last_t, robot.id) if robot.id == 0 else (0, 5, robot.last_t, robot.id)
+
+        ranked = solver._candidate_robots_for_suggestion(suggestion)
+        self.assertEqual(ranked[0].id, 1)
 
     def test_iter_sku_anchor_rows_groups_counts_by_chunk(self) -> None:
         solver = self._new_solver_shell()
