@@ -223,9 +223,11 @@ def _run_pipeline(
 ) -> tuple[list[tuple[int, int, str, int, int]], Exception | None]:
     solve_error: Exception | None = None
     actions: list[tuple[int, int, str, int, int]] = []
+    base_actions: list[tuple[int, int, str, int, int]] = []
     try:
         print("Building a fresh base solution guided by past analysis...")
-        actions = solver.find_solution()
+        base_actions = solver.find_solution()
+        actions = list(base_actions)
 
         print(f"Running LNS optimization on {len(actions)} base actions...")
         actions = solver.optimize_actions(actions)
@@ -244,8 +246,11 @@ def _run_pipeline(
     except Exception as exc:
         solve_error = exc
         print(f"Solver/optimizer failed: {exc}")
-        if actions:
-            print("Writing best-known actions from current baseline...")
+        if base_actions:
+            print("Reverting to pre-LNS baseline actions...")
+            actions = list(base_actions)
+        elif actions:
+            print("Writing best-known actions from current attempt...")
         else:
             print("Writing partial output from actions planned so far...")
             actions = solver.actions.sorted_actions()
