@@ -514,6 +514,62 @@ class SolverMetadataPolicyTests(unittest.TestCase):
             solver._find_solution_actions_core()
         self.assertGreaterEqual(retire_calls["count"], 1)
 
+    def test_dock_suggestion_reserve_footprint_conflict_is_skipped(self) -> None:
+        solver = self._new_solver_shell()
+        solver.orders = [SimpleNamespace(order_idx=0, order=collections.Counter({1: 1}))]
+        solver.robots = [SimpleNamespace(id=0, x=0, y=0, last_t=0)]
+        solver.setup_jobs = []
+        solver._completed_setup_pallet_ids = set()
+        solver._dropped_setup_pallet_ids = set()
+        solver.relocated_skus = set()
+        solver.docked_skus = set()
+        solver._suggestion_fail_counts = {}
+        solver._suggestion_backoff_until_cycle = {}
+        solver._setup_retry_not_before_timestep = {}
+        solver._setup_wait_logged_cycle = {}
+        solver._robot_fail_streak = collections.defaultdict(int)
+        solver._dispatch_cycle = 0
+        solver._parking_moves = 0
+        solver.actions = SimpleNamespace(sorted_actions=lambda: [])
+        solver._astar_calls = 0
+        solver._active_suggestion = None
+        solver._active_robot_id = None
+        solver.config = SimpleNamespace(
+            num_allowed_relocations=0,
+            robot_fail_streak_for_parking=999,
+            suggestion_retry_limit=2,
+            suggestion_backoff_base_cycles=1,
+            suggestion_backoff_max_cycles=2,
+            setup_retry_wait_ticks=0,
+            max_robots_per_suggestion=1,
+            progress_every=1000,
+            realistic_fail_mode=False,
+            order_stagnation_cycle_limit=8,
+        )
+
+        from jr_walker.logic import DockSuggestion
+
+        real_dock_suggestion = DockSuggestion(sku=1, plan=[], gain=1.0, pallet_xy=(0, 0))
+        solver._build_suggestion_queue = lambda: [real_dock_suggestion]
+        solver._check_global_limits_or_raise = lambda _: None
+        solver._log_solve_start = lambda _: None
+        solver._suggestion_key = lambda _: "dock:1:0:0"
+        solver._candidate_robots_for_suggestion = lambda _: list(solver.robots)
+        solver._plan_idle_parking_move = lambda _: False
+        solver._suggestion_backoff_cycles = lambda _: 1
+        solver._repair_idle_wait_conflicts = lambda actions: actions
+        solver._validate_candidate_actions = lambda _a, log_on_error=False: True
+        solver._plan_dock_pallet = lambda _robot, _sku: (_ for _ in ()).throw(
+            ValueError("Cannot reserve footprint for robot=3 at t=711, x=16, y=1")
+        )
+
+        captured_logs: list[str] = []
+        solver._log = lambda msg: captured_logs.append(str(msg))
+
+        out = solver._find_solution_actions_core()
+        self.assertIsInstance(out, list)
+        self.assertTrue(any("dock_suggestion_skipped" in msg for msg in captured_logs))
+
     def test_build_setup_jobs_left_edge_orders_odds_then_evens_inward(self) -> None:
         solver = self._new_solver_shell()
         solver.state = SimpleNamespace(width=60, height=40)

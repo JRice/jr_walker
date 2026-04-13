@@ -886,7 +886,20 @@ class WarehouseSolver:
                             completed_orders,
                         )
                 elif isinstance(suggestion, DockSuggestion):
-                    handled = self._plan_dock_pallet(robot, suggestion.sku)
+                    try:
+                        handled = self._plan_dock_pallet(robot, suggestion.sku)
+                    except ValueError as exc:
+                        msg = str(exc)
+                        if "Cannot reserve footprint for robot=" in msg:
+                            self._log(
+                                "dock_suggestion_skipped "
+                                f"robot={robot.id} sku={suggestion.sku} center={suggestion.center} "
+                                f"reason=reserve_footprint_conflict error={msg!r}"
+                            )
+                            handled = True
+                            skip_without_requeue = True
+                            break
+                        raise
                     if handled:
                         self.docked_skus.add(suggestion.sku)
                         self._log(
