@@ -9,6 +9,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from jr_walker.hierarchical import MiniBoxMotionPlanner, SetupTaskPlanner  # noqa: E402
+from jr_walker.logic import DockSuggestion, OrderSuggestion, RelocateSuggestion, SetupSuggestion  # noqa: E402
+from types import SimpleNamespace
+import collections
 
 
 class HierarchicalPlannerTests(unittest.TestCase):
@@ -63,6 +66,48 @@ class HierarchicalPlannerTests(unittest.TestCase):
         assert path is not None
         self.assertNotIn((6, 5), path)
         self.assertEqual(path[-1], (6, 4))
+
+    def test_suggestion_string_formats(self) -> None:
+        setup = SetupSuggestion(
+            SimpleNamespace(
+                source_xy=(1, 2),
+                target_xy=(3, 4),
+            )
+        )
+        setup.assigned_robot_id = 7
+        self.assertEqual(
+            str(setup),
+            "SetupSuggestion: source (1,2) to dest (3,4) for robot 7",
+        )
+
+        reloc_job = SimpleNamespace(
+            hotspot=(10, 10),
+            placement_offset=(0, 0),
+            preferred_target_xy=(12, 13),
+        )
+        reloc = RelocateSuggestion(reloc_job, scheduler=SimpleNamespace(pallet_cells_for_sku=lambda _sku: []))
+        reloc.job.sku = 1
+        self.assertEqual(
+            str(reloc),
+            "RelocateSuggestion: source (10,10) to dest (12,13)",
+        )
+
+        order = OrderSuggestion(
+            order_idx=0,
+            order=collections.Counter({3: 1, 1: 2}),
+            cluster={1: (1, 1), 3: (2, 2)},
+            order_gain_constant=100.0,
+            warehouse_width=60,
+            warehouse_height=40,
+            scheduler=SimpleNamespace(pallets={}),
+        )
+        self.assertEqual(str(order), "OrderSuggestion: order (2x1 1x3)")
+
+        dock = DockSuggestion(sku=5, plan=[4, 8, 9], gain=1.0, pallet_xy=(0, 0))
+        self.assertEqual(
+            str(dock),
+            "DockSuggestion: robot <R> plans 3 orders with SKU 5: (4 8 9)",
+        )
 
 
 if __name__ == "__main__":

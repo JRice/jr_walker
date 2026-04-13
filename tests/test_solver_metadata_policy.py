@@ -404,8 +404,14 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver._build_suggestion_queue = lambda: [real_dock_suggestion]
         solver._plan_dock_pallet = lambda _robot, _sku: False
 
+        captured_logs: list[str] = []
+        solver._log = lambda msg: captured_logs.append(str(msg))
+
         with self.assertRaises(RuntimeError):
             solver._find_solution_actions_core()
+
+        self.assertTrue(any("dispatcher_stall_robots" in msg for msg in captured_logs))
+        self.assertTrue(any("dispatcher_stall_queue[0] DockSuggestion:" in msg for msg in captured_logs))
 
     def test_build_setup_jobs_left_edge_orders_odds_then_evens_inward(self) -> None:
         solver = self._new_solver_shell()

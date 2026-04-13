@@ -445,6 +445,39 @@ class WarehouseSolver:
                 return
         suggestion_queue.append(suggestion)
 
+    def _log_dispatch_stall_state(
+        self,
+        *,
+        current_suggestion: Suggestion,
+        suggestion_queue: collections.deque[Suggestion],
+        attempts: int,
+        queue_size: int,
+        completed_orders: int,
+        total_orders: int,
+        dispatch_count: int,
+    ) -> None:
+        robot_rows = []
+        for robot in self.robots:
+            dock_count = len(getattr(robot, "docks", {}) or {})
+            storage = getattr(robot, "storage", collections.Counter())
+            storage_count = int(sum(storage.values())) if hasattr(storage, "values") else 0
+            robot_rows.append(
+                f"robot={robot.id} cell=({robot.x},{robot.y}) last_t={robot.last_t} "
+                f"docks={dock_count} storage={storage_count}"
+            )
+        if robot_rows:
+            self._log("dispatcher_stall_robots " + " | ".join(robot_rows))
+
+        queue_snapshot: List[Suggestion] = [current_suggestion] + list(suggestion_queue)
+        self._log(
+            "dispatcher_stall_summary "
+            f"attempts={attempts} queue_size={queue_size} "
+            f"completed_orders={completed_orders}/{total_orders} dispatches={dispatch_count} "
+            f"queue_snapshot_size={len(queue_snapshot)}"
+        )
+        for idx, queued in enumerate(queue_snapshot):
+            self._log(f"dispatcher_stall_queue[{idx}] {queued}")
+
     def _setup_frontier_blocking_pallet_id(self, job: SetupJob) -> int | None:
         hotspot = (int(job.hotspot[0]), int(job.hotspot[1]))
         current_pid = int(job.source_pallet_id)
@@ -626,6 +659,15 @@ class WarehouseSolver:
                     f"queue_size={queue_len_snapshot} "
                     f"completed_orders={len(completed_orders)}/{total_orders} "
                     f"dispatches={dispatch_count}"
+                )
+                self._log_dispatch_stall_state(
+                    current_suggestion=suggestion,
+                    suggestion_queue=suggestion_queue,
+                    attempts=no_progress_attempts,
+                    queue_size=queue_len_snapshot,
+                    completed_orders=len(completed_orders),
+                    total_orders=total_orders,
+                    dispatch_count=dispatch_count,
                 )
                 self._log(msg)
                 raise RuntimeError(msg)
@@ -1309,7 +1351,11 @@ class WarehouseSolver:
     def _build_setup_suggestions(self) -> List[Suggestion]:
         suggestions: List[Suggestion] = []
         for job in self.setup_jobs:
-            suggestions.append(SetupSuggestion(job))
+            suggestion = SetupSuggestion(job)
+            hotspot_key = (int(job.hotspot[0]), int(job.hotspot[1]))
+            assigned_robot_id = self._setup_robot_by_hotspot.get(hotspot_key)
+            setattr(suggestion, "assigned_robot_id", assigned_robot_id)
+            suggestions.append(suggestion)
         if suggestions:
             self._log(f"setup_suggestions count={len(suggestions)}")
         return suggestions

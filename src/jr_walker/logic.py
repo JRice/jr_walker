@@ -74,6 +74,19 @@ class RelocateSuggestion(Suggestion):
                 self._center = min(source_pallets, key=lambda p: manhattan_distance(p, self.job.hotspot))
         return self._center
 
+    def __str__(self) -> str:
+        source_xy = self.center
+        dest_xy = self.job.preferred_target_xy
+        if dest_xy is None:
+            dest_xy = (
+                int(self.job.hotspot[0] + self.job.placement_offset[0]),
+                int(self.job.hotspot[1] + self.job.placement_offset[1]),
+            )
+        return (
+            "RelocateSuggestion: "
+            f"source ({source_xy[0]},{source_xy[1]}) to dest ({dest_xy[0]},{dest_xy[1]})"
+        )
+
 class DockSuggestion(Suggestion):
     def __init__(self, sku: int, plan: List[int], gain: float, pallet_xy: Tuple[int, int]):
         self.sku = sku
@@ -95,6 +108,13 @@ class DockSuggestion(Suggestion):
     def center(self) -> Tuple[int, int]:
         return self._center
 
+    def __str__(self) -> str:
+        order_stream = " ".join(str(int(order_id)) for order_id in self.plan)
+        return (
+            "DockSuggestion: "
+            f"robot <R> plans {len(self.plan)} orders with SKU {self.sku}: ({order_stream})"
+        )
+
 
 class SetupSuggestion(Suggestion):
     def __init__(self, job):
@@ -113,6 +133,16 @@ class SetupSuggestion(Suggestion):
     @property
     def center(self) -> Tuple[int, int]:
         return self.job.source_xy
+
+    def __str__(self) -> str:
+        assigned_robot_id = getattr(self, "assigned_robot_id", None)
+        robot_label = "?" if assigned_robot_id is None else str(int(assigned_robot_id))
+        sx, sy = self.job.source_xy
+        tx, ty = self.job.target_xy
+        return (
+            "SetupSuggestion: "
+            f"source ({sx},{sy}) to dest ({tx},{ty}) for robot {robot_label}"
+        )
 
 
 class OrderSuggestion(Suggestion):
@@ -169,6 +199,12 @@ class OrderSuggestion(Suggestion):
             span_y = max(ys) - min(ys)
             self._center = (int(min(xs) + span_x / 2), int(min(ys) + span_y / 2))
         return self._center
+
+    def __str__(self) -> str:
+        sku_parts = " ".join(
+            f"{int(qty)}x{int(sku)}" for sku, qty in sorted(self.order.items(), key=lambda row: int(row[0]))
+        )
+        return f"OrderSuggestion: order ({sku_parts})"
 
 
 class EdgeAwareOrderScorer:
