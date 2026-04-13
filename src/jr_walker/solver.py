@@ -604,14 +604,31 @@ class WarehouseSolver:
         completed_orders: set[int] = set()
         self._completed_order_indices = completed_orders
         dispatch_count = 0
+        no_progress_attempts = 0
         self._log_solve_start(total_orders)
 
         # Keep trying suggestions until all orders are done or queue is empty.
         while suggestion_queue and len(completed_orders) < total_orders:
+            queue_len_snapshot = max(1, len(suggestion_queue))
             self._dispatch_cycle += 1
             self._check_global_limits_or_raise(
                 collections.deque(o for o in range(total_orders) if o not in completed_orders)
             )
+
+            def record_no_progress_and_maybe_raise() -> None:
+                nonlocal no_progress_attempts
+                no_progress_attempts += 1
+                if no_progress_attempts < queue_len_snapshot:
+                    return
+                msg = (
+                    "Dispatcher made no progress after scanning the full suggestion queue: "
+                    f"attempts={no_progress_attempts} "
+                    f"queue_size={queue_len_snapshot} "
+                    f"completed_orders={len(completed_orders)}/{total_orders} "
+                    f"dispatches={dispatch_count}"
+                )
+                self._log(msg)
+                raise RuntimeError(msg)
 
             suggestion = suggestion_queue.popleft()
             suggestion_key = self._suggestion_key(suggestion)
@@ -621,6 +638,7 @@ class WarehouseSolver:
                     self._requeue_setup_suggestion(suggestion_queue, suggestion)
                 else:
                     suggestion_queue.append(suggestion)
+                record_no_progress_and_maybe_raise()
                 continue
 
             # Skip if already handled
@@ -649,6 +667,7 @@ class WarehouseSolver:
                         f"waiting_target={(blocker_job.target_xy if blocker_job is not None else None)}"
                     )
                 self._requeue_setup_suggestion(suggestion_queue, suggestion)
+                record_no_progress_and_maybe_raise()
                 continue
 
             handled = False
@@ -714,6 +733,7 @@ class WarehouseSolver:
             if handled:
                 self._suggestion_fail_counts.pop(suggestion_key, None)
                 self._suggestion_backoff_until_cycle.pop(suggestion_key, None)
+                no_progress_attempts = 0
                 if skip_without_requeue:
                     continue
             else:
@@ -766,8 +786,10 @@ class WarehouseSolver:
                             f"key={suggestion_key} failures={failure_count} "
                             f"backoff_cycles={backoff_cycles} parked={parked}"
                         )
+                record_no_progress_and_maybe_raise()
 
             if handled:
+                no_progress_attempts = 0
                 dispatch_count += 1
                 self._maybe_log_progress(
                     completed=len(completed_orders),
