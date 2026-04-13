@@ -6,6 +6,7 @@ import traceback
 from dataclasses import dataclass, field
 import re
 import sqlite3
+import time
 import uuid
 
 # Allow `python main.py` from repo root without installing the package.
@@ -534,6 +535,7 @@ def _save_and_report(
 
 
 def main():
+    started_at = time.perf_counter()
     parser = argparse.ArgumentParser(description="Build a warehouse action plan.")
     parser.add_argument(
         "--config",
@@ -630,9 +632,14 @@ def main():
                 break
 
     if not any_success and last_error is not None:
+        elapsed = time.perf_counter() - started_at
+        print(f"Total runtime: {elapsed:.2f}s")
         if isinstance(last_error, UserInterruptError):
             raise SystemExit(130)
         raise SystemExit(1)
+
+    elapsed = time.perf_counter() - started_at
+    print(f"Total runtime: {elapsed:.2f}s")
 
 
 if __name__ == "__main__":

@@ -246,6 +246,50 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         ranked = solver._candidate_robots_for_suggestion(suggestion)
         self.assertEqual(ranked[0].id, 1)
 
+    def test_candidate_robots_for_setup_uses_assigned_hotspot_robot(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)
+        solver.robots = [
+            SimpleNamespace(id=0, x=10, y=10, last_t=0),
+            SimpleNamespace(id=1, x=20, y=20, last_t=0),
+            SimpleNamespace(id=2, x=30, y=30, last_t=0),
+        ]
+        solver.setup_jobs = [object()]
+        solver._completed_setup_pallet_ids = set()
+        solver._setup_robot_by_hotspot = {(10, 5): 2}
+        solver._setup_robot_ids = {2}
+
+        job = SetupJob(
+            sku=1,
+            hotspot=(10, 5),
+            source_pallet_id=7,
+            source_xy=(3, 3),
+            target_xy=(10, 5),
+        )
+        suggestion = SetupSuggestion(job)
+
+        ranked = solver._candidate_robots_for_suggestion(suggestion)
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0].id, 2)
+
+    def test_non_setup_suggestions_exclude_setup_robots_during_setup_phase(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)
+        solver.robots = [
+            SimpleNamespace(id=0, x=0, y=0, last_t=0),
+            SimpleNamespace(id=1, x=5, y=5, last_t=0),
+            SimpleNamespace(id=2, x=9, y=9, last_t=0),
+        ]
+        solver.setup_jobs = [object()]
+        solver._completed_setup_pallet_ids = set()
+        solver._setup_robot_ids = {0, 1}
+
+        suggestion = SimpleNamespace(center=(8, 8))
+        ranked = solver._candidate_robots_for_suggestion(suggestion)
+
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0].id, 2)
+
     def test_iter_sku_anchor_rows_groups_counts_by_chunk(self) -> None:
         solver = self._new_solver_shell()
         solver.state = SimpleNamespace(width=12, height=12)

@@ -344,6 +344,8 @@ class WarehouseSolver:
         else:
             self.relocation_plan = collections.deque()
         self.setup_jobs: List[SetupJob] = self._build_setup_jobs()
+        self._setup_robot_by_hotspot: Dict[Tuple[int, int], int] = self._assign_setup_robots_by_hotspot()
+        self._setup_robot_ids: set[int] = set(self._setup_robot_by_hotspot.values())
         self._completed_setup_pallet_ids: set[int] = set()
 
         self._plan_started_monotonic = 0.0
@@ -359,6 +361,36 @@ class WarehouseSolver:
         self._suggestion_backoff_until_cycle: Dict[str, int] = {}
         self._robot_fail_streak: Dict[int, int] = collections.defaultdict(int)
         self._parking_moves = 0
+
+    def _assign_setup_robots_by_hotspot(self) -> Dict[Tuple[int, int], int]:
+        hotspots: List[Tuple[int, int]] = []
+        seen: set[Tuple[int, int]] = set()
+        for job in self.setup_jobs:
+            hs = (int(job.hotspot[0]), int(job.hotspot[1]))
+            if hs in seen:
+                continue
+            seen.add(hs)
+            hotspots.append(hs)
+
+        if not hotspots:
+            return {}
+
+        available = list(self.robots)
+        mapping: Dict[Tuple[int, int], int] = {}
+        for hx, hy in hotspots:
+            if not available:
+                break
+            best = min(
+                available,
+                key=lambda r: (
+                    abs(r.x - hx) + abs(r.y - hy),
+                    r.last_t,
+                    r.id,
+                ),
+            )
+            mapping[(hx, hy)] = best.id
+            available.remove(best)
+        return mapping
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
         self._open_log()
@@ -988,6 +1020,15 @@ class WarehouseSolver:
             f"setup_plan count={len(self.setup_jobs)} hotspots={self._normalize_setup_hotspots()} "
             f"radius={self.config.setup_hotspot_radius}"
         )
+        if self._setup_robot_by_hotspot:
+            mapping_summary = ", ".join(
+                f"{hotspot}->R{rid}"
+                for hotspot, rid in sorted(
+                    self._setup_robot_by_hotspot.items(),
+                    key=lambda item: (item[0][1], item[0][0], item[1]),
+                )
+            )
+            self._log(f"setup_robot_assignment [{mapping_summary}]")
         self._log(
             "dispatch_policy "
             f"retry_limit={self.config.suggestion_retry_limit} "
@@ -1460,7 +1501,19 @@ class WarehouseSolver:
 
     def _candidate_robots_for_suggestion(self, suggestion: Suggestion) -> List[RobotState]:
         center = suggestion.center
+        setup_jobs = getattr(self, "setup_jobs", [])
+        completed_setup = getattr(self, "_completed_setup_pallet_ids", set())
+        setup_phase_active = bool(setup_jobs) and len(completed_setup) < len(setup_jobs)
+
         if isinstance(suggestion, SetupSuggestion):
+            setup_robot_by_hotspot = getattr(self, "_setup_robot_by_hotspot", {})
+            assigned_robot_id = setup_robot_by_hotspot.get(
+                (int(suggestion.job.hotspot[0]), int(suggestion.job.hotspot[1]))
+            )
+            if assigned_robot_id is not None:
+                for robot in self.robots:
+                    if robot.id == assigned_robot_id:
+                        return [robot]
             ranked = sorted(
                 self.robots,
                 key=lambda r: self._setup_probe_robot_for_job(r, suggestion.job),
@@ -1468,8 +1521,15 @@ class WarehouseSolver:
             limit = max(1, min(int(self.config.max_robots_per_suggestion), len(ranked)))
             return ranked[:limit]
 
+        robot_pool = list(self.robots)
+        if setup_phase_active:
+            setup_robot_ids = getattr(self, "_setup_robot_ids", set())
+            non_setup_robots = [r for r in self.robots if r.id not in setup_robot_ids]
+            if non_setup_robots:
+                robot_pool = non_setup_robots
+
         ranked = sorted(
-            self.robots,
+            robot_pool,
             key=lambda r: (
                 r.last_t,
                 abs(r.x - center[0]) + abs(r.y - center[1]),
