@@ -473,6 +473,34 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         )
         self.assertEqual([job.target_xy for job in jobs], expected_targets)
 
+    def test_build_setup_jobs_projects_non_edge_hotspot_to_edge_template(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+        solver.config = SimpleNamespace(setup_hotspots=[(22, 10)])
+        solver._log = lambda msg: None
+
+        pallets = {}
+        for sku in range(1, 21):
+            pallets[(10 + ((sku - 1) % 5), 5 + ((sku - 1) // 5))] = sku
+        sku_cells = collections.defaultdict(list)
+        for cell, sku in pallets.items():
+            sku_cells[int(sku)].append(cell)
+        solver.scheduler = SimpleNamespace(
+            pallets=pallets,
+            pallet_cells_for_sku=lambda sku: list(sku_cells.get(int(sku), [])),
+        )
+        solver.pallet_id_by_coord = {cell: idx for idx, cell in enumerate(pallets.keys())}
+
+        jobs = solver._build_setup_jobs()
+        self.assertEqual(len(jobs), 20)
+        # (22,10) projects to the nearest edge anchor (22,0).
+        self.assertTrue(all(job.hotspot == (22, 0) for job in jobs))
+        expected_targets = (
+            [(22 + i, 0) for i in range(10)]
+            + [(22 + i, 2) for i in range(10)]
+        )
+        self.assertEqual([job.target_xy for job in jobs], expected_targets)
+
 
 if __name__ == "__main__":
     unittest.main()

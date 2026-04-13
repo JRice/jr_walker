@@ -986,15 +986,34 @@ class WarehouseSolver:
                 continue
             if not (0 <= x < self.state.width and 0 <= y < self.state.height):
                 continue
-            cell = (x, y)
+            # Setup placement strategy is edge-anchored. Non-edge hotspots are
+            # projected to their nearest perimeter anchor.
+            cell = self._nearest_edge_anchor((x, y))
             if cell in seen:
                 continue
             seen.add(cell)
             out.append(cell)
         return out
 
+    def _nearest_edge_anchor(self, cell: Tuple[int, int]) -> Tuple[int, int]:
+        x, y = int(cell[0]), int(cell[1])
+        candidates = [
+            (x, 0),  # top
+            (x, self.state.height - 1),  # bottom
+            (0, y),  # left
+            (self.state.width - 1, y),  # right
+        ]
+        return min(
+            candidates,
+            key=lambda p: (
+                abs(p[0] - x) + abs(p[1] - y),
+                p[1],
+                p[0],
+            ),
+        )
+
     def _setup_slot_candidates(self, hotspot: Tuple[int, int], limit: int = 240) -> List[Tuple[int, int]]:
-        sx, sy = hotspot
+        sx, sy = self._nearest_edge_anchor(hotspot)
         out: List[Tuple[int, int]] = []
 
         # Edge-hotspot template:
@@ -1051,20 +1070,6 @@ class WarehouseSolver:
                     if len(out) >= limit:
                         return out
             return out
-
-        # Fallback for non-edge hotspots: keep legacy pattern.
-        step = self._setup_inward_step(hotspot)
-        depth = 0
-        while len(out) < limit:
-            y = sy + (depth * step)
-            if y < 0 or y >= self.state.height:
-                break
-            for x in (sx, sx + 1):
-                if 0 <= x < self.state.width:
-                    out.append((x, y))
-                    if len(out) >= limit:
-                        break
-            depth += 1
         return out
 
     def _setup_target_for_hotspot_sku(
@@ -1074,7 +1079,7 @@ class WarehouseSolver:
         odd_index: Dict[int, int],
         even_index: Dict[int, int],
     ) -> Tuple[int, int] | None:
-        hx, hy = hotspot
+        hx, hy = self._nearest_edge_anchor(hotspot)
 
         if sku % 2 == 1:
             idx = odd_index.get(sku)
@@ -1082,10 +1087,8 @@ class WarehouseSolver:
                 return None
             if hy == 0 or hy == self.state.height - 1:
                 tx, ty = hx + idx, hy
-            elif hx == 0 or hx == self.state.width - 1:
-                tx, ty = hx, hy + idx
             else:
-                return None
+                tx, ty = hx, hy + idx
         else:
             idx = even_index.get(sku)
             if idx is None:
@@ -1096,10 +1099,8 @@ class WarehouseSolver:
                 tx, ty = hx + idx, hy - 2
             elif hx == 0:
                 tx, ty = hx + 2, hy + idx
-            elif hx == self.state.width - 1:
-                tx, ty = hx - 2, hy + idx
             else:
-                return None
+                tx, ty = hx - 2, hy + idx
 
         if not (0 <= tx < self.state.width and 0 <= ty < self.state.height):
             return None
@@ -1293,32 +1294,19 @@ class WarehouseSolver:
 
         # Second pass: build setup jobs from reserved hotspot/SKU sources.
         for hotspot in hotspots:
-            edge_hotspot = (
-                hotspot[0] == 0
-                or hotspot[0] == self.state.width - 1
-                or hotspot[1] == 0
-                or hotspot[1] == self.state.height - 1
-            )
-            ordered_skus = odd_skus + even_skus if edge_hotspot else all_skus
+            ordered_skus = odd_skus + even_skus
             for sku in ordered_skus:
                 source = reserved_sources_by_hotspot_sku.get((hotspot, sku))
                 if source is None:
                     continue
                 source_xy, source_pallet_id = source
 
-                if edge_hotspot:
-                    target_xy = self._setup_target_for_hotspot_sku(
-                        hotspot,
-                        sku,
-                        odd_index=odd_index,
-                        even_index=even_index,
-                    )
-                else:
-                    target_xy = self._first_available_setup_target(
-                        hotspot,
-                        reserved_targets=reserved_targets,
-                        source_xy=source_xy,
-                    )
+                target_xy = self._setup_target_for_hotspot_sku(
+                    hotspot,
+                    sku,
+                    odd_index=odd_index,
+                    even_index=even_index,
+                )
                 if target_xy is None:
                     self._log(
                         f"setup_target_unavailable hotspot={hotspot} sku={sku} source={source_xy}"
