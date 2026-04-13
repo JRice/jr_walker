@@ -56,7 +56,6 @@ class RunConfig:
     lane_width: int = 3
     relocation_edge_band: int = 6
     relocate_chunk_size: int = 1
-    setup_hotspot_radius: int = 10
     setup_hotspots: list[tuple[int, int]] = field(default_factory=list)
     relocation_skus_to_relocate: list[int] | None = None
     max_time: int = 50000
@@ -159,11 +158,6 @@ def load_run_config(config_path: Path) -> RunConfig:
         relocation_section.get("relocate_chunk_size", run_config.relocate_chunk_size),
         "relocation.relocate_chunk_size",
         minimum=1,
-    )
-    run_config.setup_hotspot_radius = _require_int(
-        relocation_section.get("setup_hotspot_radius", run_config.setup_hotspot_radius),
-        "relocation.setup_hotspot_radius",
-        minimum=0,
     )
     raw_setup_hotspots = relocation_section.get("setup_hotspots", run_config.setup_hotspots)
     if not isinstance(raw_setup_hotspots, list):
@@ -352,7 +346,6 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             lane_width=run_config.lane_width,
             relocation_edge_band=run_config.relocation_edge_band,
             relocate_chunk_size=run_config.relocate_chunk_size,
-            setup_hotspot_radius=run_config.setup_hotspot_radius,
             setup_hotspots=list(run_config.setup_hotspots),
             relocation_top_skus=run_config.relocation_top_skus,
             num_allowed_relocations=run_config.num_allowed_relocations,
@@ -569,7 +562,6 @@ def main():
             f"lane_width={run_config.lane_width}, "
             f"edge_band_for_heatmap={run_config.relocation_edge_band}, "
             f"relocate_chunk_size={run_config.relocate_chunk_size}, "
-            f"setup_hotspot_radius={run_config.setup_hotspot_radius}, "
             f"setup_hotspots={run_config.setup_hotspots}, "
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "

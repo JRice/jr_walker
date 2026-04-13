@@ -2,6 +2,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import collections
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -357,6 +358,66 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         ]
         ok = solver._validate_candidate_actions(actions, require_complete=False)
         self.assertFalse(ok)
+
+    def test_build_setup_jobs_left_edge_orders_odds_then_evens_inward(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+        solver.config = SimpleNamespace(setup_hotspots=[(0, 15)])
+        solver._log = lambda msg: None
+
+        pallets = {}
+        for sku in range(1, 21):
+            pallets[(10 + ((sku - 1) % 5), 5 + ((sku - 1) // 5))] = sku
+        sku_cells = collections.defaultdict(list)
+        for cell, sku in pallets.items():
+            sku_cells[int(sku)].append(cell)
+        solver.scheduler = SimpleNamespace(
+            pallets=pallets,
+            pallet_cells_for_sku=lambda sku: list(sku_cells.get(int(sku), [])),
+        )
+        solver.pallet_id_by_coord = {cell: idx for idx, cell in enumerate(pallets.keys())}
+
+        jobs = solver._build_setup_jobs()
+        self.assertEqual(len(jobs), 20)
+
+        expected_skus = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+        self.assertEqual([job.sku for job in jobs], expected_skus)
+
+        expected_targets = (
+            [(0, 15 + i) for i in range(10)]
+            + [(2, 15 + i) for i in range(10)]
+        )
+        self.assertEqual([job.target_xy for job in jobs], expected_targets)
+
+    def test_build_setup_jobs_top_edge_orders_odds_then_evens_inward(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+        solver.config = SimpleNamespace(setup_hotspots=[(20, 0)])
+        solver._log = lambda msg: None
+
+        pallets = {}
+        for sku in range(1, 21):
+            pallets[(10 + ((sku - 1) % 5), 5 + ((sku - 1) // 5))] = sku
+        sku_cells = collections.defaultdict(list)
+        for cell, sku in pallets.items():
+            sku_cells[int(sku)].append(cell)
+        solver.scheduler = SimpleNamespace(
+            pallets=pallets,
+            pallet_cells_for_sku=lambda sku: list(sku_cells.get(int(sku), [])),
+        )
+        solver.pallet_id_by_coord = {cell: idx for idx, cell in enumerate(pallets.keys())}
+
+        jobs = solver._build_setup_jobs()
+        self.assertEqual(len(jobs), 20)
+
+        expected_skus = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+        self.assertEqual([job.sku for job in jobs], expected_skus)
+
+        expected_targets = (
+            [(20 + i, 0) for i in range(10)]
+            + [(20 + i, 2) for i in range(10)]
+        )
+        self.assertEqual([job.target_xy for job in jobs], expected_targets)
 
 
 if __name__ == "__main__":

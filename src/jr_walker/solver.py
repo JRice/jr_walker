@@ -145,7 +145,6 @@ class SolverConfig:
     astar_log_blocked: bool = False
     enable_relocation_suggestions: bool = False
     setup_hotspots: List[Tuple[int, int]] = field(default_factory=list)
-    setup_hotspot_radius: int = 10
     suggestion_retry_limit: int = 12
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
@@ -926,9 +925,63 @@ class WarehouseSolver:
         sx, sy = hotspot
         out: List[Tuple[int, int]] = []
 
-        # Default pattern: (x,y), (x+1,y), then keep same x/x+1 while moving toward nearest edge.
-        step = self._setup_inward_step(hotspot)
+        # Edge-hotspot template:
+        # 1) Along-edge line starting at the hotspot cell.
+        # 2) Second line two cells inward from the same hotspot.
+        if sy == 0:
+            for x in range(sx, self.state.width):
+                out.append((x, sy))
+                if len(out) >= limit:
+                    return out
+            inward_y = sy + 2
+            if inward_y < self.state.height:
+                for x in range(sx, self.state.width):
+                    out.append((x, inward_y))
+                    if len(out) >= limit:
+                        return out
+            return out
 
+        if sy == self.state.height - 1:
+            for x in range(sx, self.state.width):
+                out.append((x, sy))
+                if len(out) >= limit:
+                    return out
+            inward_y = sy - 2
+            if inward_y >= 0:
+                for x in range(sx, self.state.width):
+                    out.append((x, inward_y))
+                    if len(out) >= limit:
+                        return out
+            return out
+
+        if sx == 0:
+            for y in range(sy, self.state.height):
+                out.append((sx, y))
+                if len(out) >= limit:
+                    return out
+            inward_x = sx + 2
+            if inward_x < self.state.width:
+                for y in range(sy, self.state.height):
+                    out.append((inward_x, y))
+                    if len(out) >= limit:
+                        return out
+            return out
+
+        if sx == self.state.width - 1:
+            for y in range(sy, self.state.height):
+                out.append((sx, y))
+                if len(out) >= limit:
+                    return out
+            inward_x = sx - 2
+            if inward_x >= 0:
+                for y in range(sy, self.state.height):
+                    out.append((inward_x, y))
+                    if len(out) >= limit:
+                        return out
+            return out
+
+        # Fallback for non-edge hotspots: keep legacy pattern.
+        step = self._setup_inward_step(hotspot)
         depth = 0
         while len(out) < limit:
             y = sy + (depth * step)
@@ -941,6 +994,44 @@ class WarehouseSolver:
                         break
             depth += 1
         return out
+
+    def _setup_target_for_hotspot_sku(
+        self,
+        hotspot: Tuple[int, int],
+        sku: int,
+        odd_index: Dict[int, int],
+        even_index: Dict[int, int],
+    ) -> Tuple[int, int] | None:
+        hx, hy = hotspot
+
+        if sku % 2 == 1:
+            idx = odd_index.get(sku)
+            if idx is None:
+                return None
+            if hy == 0 or hy == self.state.height - 1:
+                tx, ty = hx + idx, hy
+            elif hx == 0 or hx == self.state.width - 1:
+                tx, ty = hx, hy + idx
+            else:
+                return None
+        else:
+            idx = even_index.get(sku)
+            if idx is None:
+                return None
+            if hy == 0:
+                tx, ty = hx + idx, hy + 2
+            elif hy == self.state.height - 1:
+                tx, ty = hx + idx, hy - 2
+            elif hx == 0:
+                tx, ty = hx + 2, hy + idx
+            elif hx == self.state.width - 1:
+                tx, ty = hx - 2, hy + idx
+            else:
+                return None
+
+        if not (0 <= tx < self.state.width and 0 <= ty < self.state.height):
+            return None
+        return (tx, ty)
 
     def _setup_inward_step(self, hotspot: Tuple[int, int]) -> int:
         _, sy = hotspot
@@ -986,26 +1077,6 @@ class WarehouseSolver:
             return cell
         return None
 
-    def _has_sku_within_setup_radius(self, sku: int, hotspot: Tuple[int, int], radius: int) -> bool:
-        hx, hy = hotspot
-        for px, py in self.scheduler.pallet_cells_for_sku(sku):
-            if abs(px - hx) + abs(py - hy) <= radius:
-                return True
-        return False
-
-    def _nearest_pallet_for_sku_within_setup_radius(
-        self, sku: int, hotspot: Tuple[int, int], radius: int
-    ) -> Tuple[int, int] | None:
-        hx, hy = hotspot
-        choices = [
-            (px, py)
-            for px, py in self.scheduler.pallet_cells_for_sku(sku)
-            if abs(px - hx) + abs(py - hy) <= radius
-        ]
-        if not choices:
-            return None
-        return min(choices, key=lambda p: (abs(p[0] - hx) + abs(p[1] - hy), p[1], p[0]))
-
     def _nearest_unreserved_pallet_for_sku(
         self,
         sku: int,
@@ -1034,28 +1105,19 @@ class WarehouseSolver:
         if not hotspots:
             return []
 
-        radius = max(0, int(self.config.setup_hotspot_radius))
         all_skus = sorted({int(sku) for sku in self.scheduler.pallets.values()})
+        odd_skus = [sku for sku in all_skus if sku % 2 == 1]
+        even_skus = [sku for sku in all_skus if sku % 2 == 0]
+        odd_index = {sku: idx for idx, sku in enumerate(odd_skus)}
+        even_index = {sku: idx for idx, sku in enumerate(even_skus)}
         reserved_pallet_ids: set[int] = set()
         reserved_targets: set[Tuple[int, int]] = set()
+        reserved_sources_by_hotspot_sku: Dict[Tuple[Tuple[int, int], int], Tuple[Tuple[int, int], int]] = {}
         jobs: List[SetupJob] = []
 
-        # First pass: reserve pallets already close enough to each hotspot/SKU.
+        # First pass: reserve the nearest unreserved pallet for each hotspot/SKU.
         for hotspot in hotspots:
             for sku in all_skus:
-                nearby = self._nearest_pallet_for_sku_within_setup_radius(sku, hotspot, radius)
-                if nearby is None:
-                    continue
-                pallet_id = self.pallet_id_by_coord.get(nearby)
-                if pallet_id is not None:
-                    reserved_pallet_ids.add(pallet_id)
-
-        # Second pass: for missing SKU/hotspot coverage, build setup jobs.
-        for hotspot in hotspots:
-            for sku in all_skus:
-                if self._has_sku_within_setup_radius(sku, hotspot, radius):
-                    continue
-
                 source = self._nearest_unreserved_pallet_for_sku(
                     sku,
                     hotspot,
@@ -1064,19 +1126,53 @@ class WarehouseSolver:
                 if source is None:
                     continue
                 source_xy, source_pallet_id = source
+                reserved_pallet_ids.add(source_pallet_id)
+                reserved_sources_by_hotspot_sku[(hotspot, sku)] = (source_xy, source_pallet_id)
 
-                target_xy = self._first_available_setup_target(
-                    hotspot,
-                    reserved_targets=reserved_targets,
-                    source_xy=source_xy,
-                )
+        # Second pass: build setup jobs from reserved hotspot/SKU sources.
+        for hotspot in hotspots:
+            edge_hotspot = (
+                hotspot[0] == 0
+                or hotspot[0] == self.state.width - 1
+                or hotspot[1] == 0
+                or hotspot[1] == self.state.height - 1
+            )
+            ordered_skus = odd_skus + even_skus if edge_hotspot else all_skus
+            for sku in ordered_skus:
+                source = reserved_sources_by_hotspot_sku.get((hotspot, sku))
+                if source is None:
+                    continue
+                source_xy, source_pallet_id = source
+
+                if edge_hotspot:
+                    target_xy = self._setup_target_for_hotspot_sku(
+                        hotspot,
+                        sku,
+                        odd_index=odd_index,
+                        even_index=even_index,
+                    )
+                else:
+                    target_xy = self._first_available_setup_target(
+                        hotspot,
+                        reserved_targets=reserved_targets,
+                        source_xy=source_xy,
+                    )
                 if target_xy is None:
                     self._log(
                         f"setup_target_unavailable hotspot={hotspot} sku={sku} source={source_xy}"
                     )
                     continue
+                if target_xy in reserved_targets and target_xy != source_xy:
+                    self._log(
+                        f"setup_target_reserved hotspot={hotspot} sku={sku} source={source_xy} target={target_xy}"
+                    )
+                    continue
+                if target_xy in self.scheduler.pallets and target_xy != source_xy:
+                    self._log(
+                        f"setup_target_occupied hotspot={hotspot} sku={sku} source={source_xy} target={target_xy}"
+                    )
+                    continue
 
-                reserved_pallet_ids.add(source_pallet_id)
                 reserved_targets.add(target_xy)
                 jobs.append(
                     SetupJob(
@@ -1242,7 +1338,7 @@ class WarehouseSolver:
         self._log(f"solve_start total_orders={total_orders}")
         self._log(
             f"setup_plan count={len(self.setup_jobs)} hotspots={self._normalize_setup_hotspots()} "
-            f"radius={self.config.setup_hotspot_radius}"
+            "coverage=nearest_reserved_per_hotspot_sku"
         )
         if self._setup_robot_by_hotspot:
             mapping_summary = ", ".join(
@@ -3112,10 +3208,11 @@ class WarehouseSolver:
             self._log_handle = None
 
     def _log(self, message: str) -> None:
-        if self._log_handle is None:
+        log_handle = getattr(self, "_log_handle", None)
+        if log_handle is None:
             return
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        self._log_handle.write(f"[{ts}] {message}\n")
+        log_handle.write(f"[{ts}] {message}\n")
 
     def _repair_idle_wait_conflicts(
         self, actions: List[Tuple[int, int, str, int, int]]
