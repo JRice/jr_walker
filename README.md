@@ -144,5 +144,3 @@ This will be implemented in Python. We'll use uv for managing packages. You shou
 - Use type-hinting.
 - Be mindful of potential "hyperparameters," the kinds of "dials" we can tweak to improve the algorithm. These should be extracted to the medata config file in `input/config.toml`.
 - Tests! I don't want the codebase to have particularly high coverage, but I do want to ensure clear pressure points are covered and that we have a test suite that validates those parts of the code are all functioning; I'd like to ensure no regressions as we progress.
-- A condensed summary of the code's structure is in summary.md. Update summary.md as you implement changes, to keep it current with the code, but keep it condensed. It is intended to be instructional to AIs. Humans may start their sessions with:
-    - Start with README.md and consider "The Codebase" section at the end as a critical part of your context.
