@@ -837,6 +837,127 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertGreater(near_other, 0.0)
         self.assertEqual(far_from_other, 0.0)
 
+    def test_persistent_hotspots_only_for_initially_assigned_robots(self) -> None:
+        solver = self._new_solver_shell()
+        solver.robots = [
+            SimpleNamespace(id=0, x=1, y=1, last_t=0),
+            SimpleNamespace(id=1, x=8, y=8, last_t=0),
+        ]
+        solver._setup_robot_by_hotspot = {(0, 10): 0}
+
+        mapping = solver._assign_persistent_robot_hotspots()
+        self.assertEqual(mapping, {0: (0, 10)})
+        self.assertEqual(getattr(solver.robots[0], "assigned_hotspot", None), (0, 10))
+        self.assertFalse(hasattr(solver.robots[1], "assigned_hotspot"))
+
+    def test_unassigned_robot_order_origin_uses_current_position(self) -> None:
+        solver = self._new_solver_shell()
+        solver._robot_hotspot_by_id = {}
+        robot = SimpleNamespace(id=3, x=4, y=7, last_t=0)
+
+        first = solver._robot_assigned_hotspot(robot)
+        self.assertEqual(first, (4, 7))
+
+        robot.x, robot.y = 9, 2
+        second = solver._robot_assigned_hotspot(robot)
+        self.assertEqual(second, (9, 2))
+
+    def test_build_non_hotspot_forbidden_cells_includes_three_cell_band_and_caps(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=30, height=20)
+        hotspot = (10, 0)
+        jobs = [
+            SimpleNamespace(target_xy=(x, 0))
+            for x in range(10, 20)
+        ] + [
+            SimpleNamespace(target_xy=(x, 2))
+            for x in range(10, 20)
+        ]
+        solver._setup_jobs_by_hotspot = {hotspot: jobs}
+        solver._nearest_edge_anchor = lambda cell: cell
+
+        forbidden = solver._build_non_hotspot_forbidden_cells()
+        self.assertIn((10, 0), forbidden)
+        self.assertIn((15, 1), forbidden)
+        self.assertIn((19, 2), forbidden)
+        self.assertIn((9, 0), forbidden)   # left cap
+        self.assertIn((20, 0), forbidden)  # right cap
+        self.assertNotIn((15, 3), forbidden)  # allowed boundary just outside 3-cell band
+
+    def test_safe_plan_path_blocks_forbidden_target_for_unassigned_robot(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(path_step_limit=10, astar_slow_ms=9999, astar_print_slow=False, astar_log_blocked=False)
+        solver._astar_calls = 0
+        solver._astar_total_ms = 0.0
+        solver._astar_max_ms = 0.0
+        solver._astar_blocked_calls = 0
+        solver._astar_slow_calls = 0
+        solver._log = lambda *_args, **_kwargs: None
+        solver._robot_hotspot_by_id = {}
+        solver._non_hotspot_forbidden_cells = {(5, 5)}
+        solver.planner = SimpleNamespace(plan_path=lambda *_args, **_kwargs: [(1, 5, 5)])
+
+        robot = SimpleNamespace(id=1, x=0, y=0, last_t=0, docks={})
+        path = solver._safe_plan_path(robot, 5, 5)
+        self.assertEqual(path, [])
+
+    def test_safe_plan_path_passes_forbidden_cells_to_planner_for_unassigned_robot(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(path_step_limit=10, astar_slow_ms=9999, astar_print_slow=False, astar_log_blocked=False)
+        solver._astar_calls = 0
+        solver._astar_total_ms = 0.0
+        solver._astar_max_ms = 0.0
+        solver._astar_blocked_calls = 0
+        solver._astar_slow_calls = 0
+        solver._log = lambda *_args, **_kwargs: None
+        solver._robot_hotspot_by_id = {}
+        solver._non_hotspot_forbidden_cells = {(2, 2), (3, 3)}
+        captured = {}
+
+        def _plan_path(_robot, _tx, _ty, *, max_path_steps, blocked_cells):
+            captured["blocked_cells"] = set(blocked_cells)
+            return []
+
+        solver.planner = SimpleNamespace(plan_path=_plan_path)
+        robot = SimpleNamespace(id=7, x=0, y=0, last_t=0, docks={})
+        solver._safe_plan_path(robot, 6, 6)
+        self.assertEqual(captured.get("blocked_cells"), {(2, 2), (3, 3)})
+
+    def test_finalize_dock_pallet_state_removes_static_pallet_from_scheduler(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(max_time=50)
+        solver.scheduler = SimpleNamespace(
+            pallets={(4, 4): 7, (5, 5): 9},
+            _rebuild_indexes=lambda: None,
+        )
+        solver.pallet_id_by_coord = {(4, 4): 11, (5, 5): 12}
+        solver._persistently_docked_pallet_ids = set()
+        captured = {}
+        solver._record_pallet_move = lambda **kwargs: captured.update(kwargs)
+
+        solver._finalize_dock_pallet_state(pallet_id=11, old_xy=(4, 4), dock_t=9)
+        self.assertNotIn((4, 4), solver.scheduler.pallets)
+        self.assertNotIn((4, 4), solver.pallet_id_by_coord)
+        self.assertIn(11, solver._persistently_docked_pallet_ids)
+        self.assertEqual(captured.get("dock_t"), 9)
+        self.assertEqual(captured.get("undock_t"), 49)
+
+    def test_candidate_robots_for_dock_prefers_robots_without_existing_docks(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)
+        solver.robots = [
+            SimpleNamespace(id=0, x=0, y=0, last_t=1, docks={(1, 0): 1}),
+            SimpleNamespace(id=1, x=1, y=1, last_t=2, docks={}),
+            SimpleNamespace(id=2, x=2, y=2, last_t=3, docks={}),
+        ]
+        solver._retired_robot_ids = set()
+        solver._has_pending_setup_for_robot = lambda _rid: False
+        from jr_walker.logic import DockSuggestion
+        suggestion = DockSuggestion(sku=5, plan=[1, 2], gain=1.0, pallet_xy=(0, 0))
+
+        ranked = solver._candidate_robots_for_suggestion(suggestion)
+        self.assertEqual([r.id for r in ranked], [1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

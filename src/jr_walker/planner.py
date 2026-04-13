@@ -43,10 +43,18 @@ class ReservationPlanner:
         target_x: int,
         target_y: int,
         max_path_steps: int | None = None,
+        blocked_cells: set[Tuple[int, int]] | None = None,
     ) -> List[Tuple[int, int, int]]:
         robot = self._to_robot(robot_state)
+        blocked_cells = blocked_cells or set()
 
         if max_path_steps is None:
+            table = self.reservation_table
+            if blocked_cells:
+                table = self.reservation_table.copy()
+                for bx, by in blocked_cells:
+                    if 0 <= bx < self.width and 0 <= by < self.height:
+                        table[:, by, bx] = np.maximum(table[:, by, bx], 2)
             return find_path(
                 robot,
                 robot_state.last_t,
@@ -54,7 +62,7 @@ class ReservationPlanner:
                 robot_state.y,
                 target_x,
                 target_y,
-                self.reservation_table,
+                table,
             )
 
         start_t = max(robot_state.last_t, 0)
@@ -63,6 +71,11 @@ class ReservationPlanner:
             return []
 
         sliced_table = self.reservation_table[start_t:end_t]
+        if blocked_cells:
+            sliced_table = sliced_table.copy()
+            for bx, by in blocked_cells:
+                if 0 <= bx < self.width and 0 <= by < self.height:
+                    sliced_table[:, by, bx] = np.maximum(sliced_table[:, by, bx], 2)
         path = find_path(
             robot,
             0,

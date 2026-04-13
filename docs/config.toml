@@ -92,7 +92,10 @@ edge_band_for_heatmap = 6
 # Set to 1 to disable chunking (original exact-cell behavior).
 relocate_chunk_size = 5
 # Setup hotspots used by SetupSuggestion initialization phase.
-setup_hotspots = [[0, 15], [15, 0], [35,0], [15, 39], [35,39]]
+# FULL: setup_hotspots = [[0, 15], [15, 0], [35,0], [15, 39], [35,39]]
+# FOUR: setup_hotspots = [[0, 15], [15, 0], [35,0], [20, 39]] # 7301 4/13
+# THREE: [[20, 0], [20, 39], [0, 15]] # @ 4/13AM, got 6723, with different code.
+setup_hotspots = [[20, 0], [20, 39], [0, 15]]
 # Optional explicit relocation SKU order. If provided, only these SKUs are
 # used for startup relocation planning (in listed order).
 # skus_to_relocate = [1, 2, 3, 4, 5]

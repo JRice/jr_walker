@@ -362,6 +362,8 @@ class WarehouseSolver:
         self._setup_robot_by_hotspot: Dict[Tuple[int, int], int] = self._assign_setup_robots_by_hotspot()
         self._setup_robot_ids: set[int] = set(self._setup_robot_by_hotspot.values())
         self._robot_hotspot_by_id: Dict[int, Tuple[int, int]] = self._assign_persistent_robot_hotspots()
+        self._non_hotspot_forbidden_cells: set[Tuple[int, int]] = self._build_non_hotspot_forbidden_cells()
+        self._persistently_docked_pallet_ids: set[int] = set()
         self._completed_setup_pallet_ids: set[int] = set()
         self._dropped_setup_pallet_ids: set[int] = set()
         self._setup_job_by_source_pallet_id: Dict[int, SetupJob] = {
@@ -428,43 +430,17 @@ class WarehouseSolver:
         return mapping
 
     def _assign_persistent_robot_hotspots(self) -> Dict[int, Tuple[int, int]]:
-        hotspots = self._normalize_setup_hotspots()
-        if not hotspots:
-            hotspots = [
-                (int(hx), int(hy))
-                for hx, hy in FULFILL_HOT_SPOTS
-                if 0 <= int(hx) < self.state.width and 0 <= int(hy) < self.state.height
-            ]
-        if not hotspots:
-            hotspots = [(int(r.x), int(r.y)) for r in self.robots]
-
         mapping: Dict[int, Tuple[int, int]] = {}
-        usage: collections.Counter = collections.Counter()
         setup_robot_by_hotspot = getattr(self, "_setup_robot_by_hotspot", {})
         for hotspot, robot_id in setup_robot_by_hotspot.items():
             hotspot_key = (int(hotspot[0]), int(hotspot[1]))
             mapping[int(robot_id)] = hotspot_key
-            usage[hotspot_key] += 1
 
         for robot in self.robots:
-            rid = int(robot.id)
-            if rid in mapping:
-                continue
-            chosen = min(
-                hotspots,
-                key=lambda hs: (
-                    usage[(int(hs[0]), int(hs[1]))],
-                    abs(int(robot.x) - int(hs[0])) + abs(int(robot.y) - int(hs[1])),
-                    int(hs[1]),
-                    int(hs[0]),
-                ),
-            )
-            hotspot_key = (int(chosen[0]), int(chosen[1]))
-            mapping[rid] = hotspot_key
-            usage[hotspot_key] += 1
-
-        for robot in self.robots:
-            robot.assigned_hotspot = mapping[int(robot.id)]
+            if int(robot.id) in mapping:
+                robot.assigned_hotspot = mapping[int(robot.id)]
+            elif hasattr(robot, "assigned_hotspot"):
+                delattr(robot, "assigned_hotspot")
         return mapping
 
     def _robot_assigned_hotspot(self, robot: RobotState) -> Tuple[int, int]:
@@ -476,6 +452,81 @@ class WarehouseSolver:
         if assigned is not None:
             return (int(assigned[0]), int(assigned[1]))
         return (int(robot.x), int(robot.y))
+
+    def _robot_has_persistent_hotspot(self, robot: RobotState) -> bool:
+        assigned = getattr(robot, "assigned_hotspot", None)
+        if isinstance(assigned, (tuple, list)) and len(assigned) == 2:
+            return True
+        return int(robot.id) in getattr(self, "_robot_hotspot_by_id", {})
+
+    def _build_non_hotspot_forbidden_cells(self) -> set[Tuple[int, int]]:
+        """
+        Build hard no-go movement cells for non-hotspot robots around each setup column:
+        - edge-side 3-cell band covering the setup odd/even template span
+        - two cap cells just outside the odd-row/odd-column endpoints
+        """
+        forbidden: set[Tuple[int, int]] = set()
+        jobs_by_hotspot = getattr(self, "_setup_jobs_by_hotspot", {})
+        if not jobs_by_hotspot:
+            return forbidden
+
+        width = int(self.state.width)
+        height = int(self.state.height)
+
+        def add(cell: Tuple[int, int]) -> None:
+            x, y = int(cell[0]), int(cell[1])
+            if 0 <= x < width and 0 <= y < height:
+                forbidden.add((x, y))
+
+        for hotspot, jobs in jobs_by_hotspot.items():
+            if not jobs:
+                continue
+            hx, hy = self._nearest_edge_anchor((int(hotspot[0]), int(hotspot[1])))
+            targets = [(int(j.target_xy[0]), int(j.target_xy[1])) for j in jobs]
+            xs = [x for x, _ in targets]
+            ys = [y for _, y in targets]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+
+            # Horizontal templates (top or bottom edge hotspot).
+            if hy == 0:
+                for x in range(min_x, max_x + 1):
+                    for y in range(0, min(2, height - 1) + 1):
+                        add((x, y))
+                add((min_x - 1, 0))
+                add((max_x + 1, 0))
+                continue
+
+            if hy == height - 1:
+                for x in range(min_x, max_x + 1):
+                    for y in range(max(0, height - 3), height):
+                        add((x, y))
+                add((min_x - 1, height - 1))
+                add((max_x + 1, height - 1))
+                continue
+
+            # Vertical templates (left or right edge hotspot).
+            if hx == 0:
+                for y in range(min_y, max_y + 1):
+                    for x in range(0, min(2, width - 1) + 1):
+                        add((x, y))
+                add((0, min_y - 1))
+                add((0, max_y + 1))
+                continue
+
+            if hx == width - 1:
+                for y in range(min_y, max_y + 1):
+                    for x in range(max(0, width - 3), width):
+                        add((x, y))
+                add((width - 1, min_y - 1))
+                add((width - 1, max_y + 1))
+
+        return forbidden
+
+    def _forbidden_cells_for_robot(self, robot: RobotState) -> set[Tuple[int, int]]:
+        if self._robot_has_persistent_hotspot(robot):
+            return set()
+        return set(getattr(self, "_non_hotspot_forbidden_cells", set()))
 
     def _build_setup_frontier_maps(
         self,
@@ -1833,6 +1884,9 @@ class WarehouseSolver:
                 )
             )
             self._log(f"setup_robot_assignment [{mapping_summary}]")
+        protected_count = len(getattr(self, "_non_hotspot_forbidden_cells", set()))
+        if protected_count > 0:
+            self._log(f"non_hotspot_protected_cells count={protected_count}")
         if self.setup_jobs:
             jobs_by_hotspot: Dict[Tuple[int, int], List[SetupJob]] = collections.defaultdict(list)
             for job in self.setup_jobs:
@@ -2368,6 +2422,11 @@ class WarehouseSolver:
         if non_setup_robots:
             robot_pool = non_setup_robots
 
+        if isinstance(suggestion, DockSuggestion):
+            dock_free_pool = [r for r in robot_pool if not getattr(r, "docks", {})]
+            if dock_free_pool:
+                robot_pool = dock_free_pool
+
         if isinstance(suggestion, OrderSuggestion):
             ranked = sorted(
                 robot_pool,
@@ -2553,17 +2612,23 @@ class WarehouseSolver:
         self,
         *,
         from_xy: Tuple[int, int],
+        robot: RobotState | None = None,
         limit: int = 48,
     ) -> List[Tuple[int, int]]:
         fx, fy = int(from_xy[0]), int(from_xy[1])
         cells: List[Tuple[int, int]] = []
         seen: set[Tuple[int, int]] = set()
         occupied_by_robot = {(int(r.x), int(r.y)) for r in self.robots}
+        forbidden_cells: set[Tuple[int, int]] = set()
+        if robot is not None:
+            forbidden_cells = self._forbidden_cells_for_robot(robot)
 
         def add(cell: Tuple[int, int]) -> None:
             if cell in seen:
                 return
             if cell in self.scheduler.pallets:
+                return
+            if cell in forbidden_cells:
                 return
             seen.add(cell)
             cells.append(cell)
@@ -2821,7 +2886,11 @@ class WarehouseSolver:
         base_pending_actions = list(pending_actions)
         base_pending_paths = list(pending_paths)
         base_pending_footprints = list(pending_footprints)
-        for fulfill_x, fulfill_y in self._candidate_fulfill_cells(from_xy=(base_robot.x, base_robot.y), limit=48):
+        for fulfill_x, fulfill_y in self._candidate_fulfill_cells(
+            from_xy=(base_robot.x, base_robot.y),
+            robot=robot,
+            limit=48,
+        ):
             trial_robot = self._clone_robot_state(base_robot)
             trial_actions = list(base_pending_actions)
             trial_paths = list(base_pending_paths)
@@ -2858,6 +2927,12 @@ class WarehouseSolver:
 
     def _plan_dock_pallet(self, robot: RobotState, sku: int) -> bool:
         """Plans the actions for a robot to find, travel to, and dock a pallet with a given SKU."""
+        if robot.docks:
+            self._log(
+                f"dock_suggestion_fail robot={robot.id} sku={sku} reason=robot_already_has_dock "
+                f"dock_count={len(robot.docks)}"
+            )
+            return False
         source = self._select_relocation_source_pallet(robot, sku)
         if source is None:
             self._log(f"dock_suggestion_fail robot={robot.id} sku={sku} reason=no_source_pallet")
@@ -2905,6 +2980,11 @@ class WarehouseSolver:
             return False
 
         self._commit_plan(robot, temp_robot, pending_actions, pending_paths, pending_footprints)
+        self._finalize_dock_pallet_state(
+            pallet_id=int(pallet_id),
+            old_xy=(int(pallet_xy[0]), int(pallet_xy[1])),
+            dock_t=int(dock_t),
+        )
         return True
 
     def _setup_target_candidates(
@@ -3557,6 +3637,31 @@ class WarehouseSolver:
         self.pallet_by_id[pallet_id]["y"] = new_xy[1]
         self.relocated_pallet_targets.add(new_xy)
 
+    def _finalize_dock_pallet_state(
+        self,
+        *,
+        pallet_id: int,
+        old_xy: Tuple[int, int],
+        dock_t: int,
+    ) -> None:
+        """
+        Persist a strategic dock as non-static for the remainder of the planning horizon.
+        This keeps scheduler/static pallet views consistent with validator behavior.
+        """
+        horizon_undock_t = max(int(dock_t), int(self.config.max_time) - 1)
+        self._record_pallet_move(
+            pallet_id=int(pallet_id),
+            old_xy=(int(old_xy[0]), int(old_xy[1])),
+            new_xy=(int(old_xy[0]), int(old_xy[1])),
+            dock_t=int(dock_t),
+            undock_t=horizon_undock_t,
+        )
+        if (int(old_xy[0]), int(old_xy[1])) in self.scheduler.pallets:
+            self.scheduler.pallets.pop((int(old_xy[0]), int(old_xy[1])), None)
+            self.scheduler._rebuild_indexes()
+        self.pallet_id_by_coord.pop((int(old_xy[0]), int(old_xy[1])), None)
+        self._persistently_docked_pallet_ids.add(int(pallet_id))
+
     def _plan_relocate_pallet_for_robot(self, robot: RobotState, job: RelocationJob) -> bool:
         source = self._select_relocation_source_pallet(robot, job.sku)
         if source is None:
@@ -3806,12 +3911,16 @@ class WarehouseSolver:
     ) -> List[Tuple[int, int, int]]:
         """Adapter boundary for planner pathfinding (Space-Time A* in ReservationPlanner)."""
         start_x, start_y = robot.x, robot.y
+        forbidden_cells = self._forbidden_cells_for_robot(robot)
+        if forbidden_cells and (int(target_x), int(target_y)) in forbidden_cells:
+            return []
         started = time.perf_counter()
         path = self.planner.plan_path(
             robot,
             target_x,
             target_y,
             max_path_steps=self.config.path_step_limit,
+            blocked_cells=forbidden_cells,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self._astar_calls += 1
@@ -3855,12 +3964,16 @@ class WarehouseSolver:
         Keeps setup redock attempts from spending long A* searches on impossible micro-moves.
         """
         start_x, start_y = robot.x, robot.y
+        forbidden_cells = self._forbidden_cells_for_robot(robot)
+        if forbidden_cells and (int(target_x), int(target_y)) in forbidden_cells:
+            return []
         started = time.perf_counter()
         path = self.planner.plan_path(
             robot,
             target_x,
             target_y,
             max_path_steps=max(0, int(max_path_steps)),
+            blocked_cells=forbidden_cells,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self._astar_calls += 1
