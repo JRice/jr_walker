@@ -362,7 +362,8 @@ class WarehouseSolver:
         self._setup_robot_by_hotspot: Dict[Tuple[int, int], int] = self._assign_setup_robots_by_hotspot()
         self._setup_robot_ids: set[int] = set(self._setup_robot_by_hotspot.values())
         self._robot_hotspot_by_id: Dict[int, Tuple[int, int]] = self._assign_persistent_robot_hotspots()
-        self._non_hotspot_forbidden_cells: set[Tuple[int, int]] = self._build_non_hotspot_forbidden_cells()
+        self._hotspot_protected_cells_by_hotspot: Dict[Tuple[int, int], set[Tuple[int, int]]] = {}
+        self._non_hotspot_forbidden_cells: set[Tuple[int, int]] = set()
         self._persistently_docked_pallet_ids: set[int] = set()
         self._completed_setup_pallet_ids: set[int] = set()
         self._dropped_setup_pallet_ids: set[int] = set()
@@ -373,6 +374,8 @@ class WarehouseSolver:
         for job in self.setup_jobs:
             hs = (int(job.hotspot[0]), int(job.hotspot[1]))
             self._setup_jobs_by_hotspot[hs].append(job)
+        self._hotspot_protected_cells_by_hotspot = self._build_hotspot_protected_cells_by_hotspot()
+        self._non_hotspot_forbidden_cells = self._build_non_hotspot_forbidden_cells()
         (
             self._setup_slot_index_by_source_pallet_id,
             self._setup_hotspot_frontier_pallet_ids,
@@ -459,28 +462,31 @@ class WarehouseSolver:
             return True
         return int(robot.id) in getattr(self, "_robot_hotspot_by_id", {})
 
-    def _build_non_hotspot_forbidden_cells(self) -> set[Tuple[int, int]]:
+    def _build_hotspot_protected_cells_by_hotspot(
+        self,
+    ) -> Dict[Tuple[int, int], set[Tuple[int, int]]]:
         """
-        Build hard no-go movement cells for non-hotspot robots around each setup column:
+        Build per-hotspot protected movement cells around each setup column:
         - edge-side 3-cell band covering the setup odd/even template span
         - two cap cells just outside the odd-row/odd-column endpoints
         """
-        forbidden: set[Tuple[int, int]] = set()
+        by_hotspot: Dict[Tuple[int, int], set[Tuple[int, int]]] = {}
         jobs_by_hotspot = getattr(self, "_setup_jobs_by_hotspot", {})
         if not jobs_by_hotspot:
-            return forbidden
+            return by_hotspot
 
         width = int(self.state.width)
         height = int(self.state.height)
 
-        def add(cell: Tuple[int, int]) -> None:
+        def add(cells: set[Tuple[int, int]], cell: Tuple[int, int]) -> None:
             x, y = int(cell[0]), int(cell[1])
             if 0 <= x < width and 0 <= y < height:
-                forbidden.add((x, y))
+                cells.add((x, y))
 
         for hotspot, jobs in jobs_by_hotspot.items():
             if not jobs:
                 continue
+            cells: set[Tuple[int, int]] = set()
             hx, hy = self._nearest_edge_anchor((int(hotspot[0]), int(hotspot[1])))
             targets = [(int(j.target_xy[0]), int(j.target_xy[1])) for j in jobs]
             xs = [x for x, _ in targets]
@@ -492,41 +498,65 @@ class WarehouseSolver:
             if hy == 0:
                 for x in range(min_x, max_x + 1):
                     for y in range(0, min(2, height - 1) + 1):
-                        add((x, y))
-                add((min_x - 1, 0))
-                add((max_x + 1, 0))
+                        add(cells, (x, y))
+                add(cells, (min_x - 1, 0))
+                add(cells, (max_x + 1, 0))
+                by_hotspot[(int(hx), int(hy))] = cells
                 continue
 
             if hy == height - 1:
                 for x in range(min_x, max_x + 1):
                     for y in range(max(0, height - 3), height):
-                        add((x, y))
-                add((min_x - 1, height - 1))
-                add((max_x + 1, height - 1))
+                        add(cells, (x, y))
+                add(cells, (min_x - 1, height - 1))
+                add(cells, (max_x + 1, height - 1))
+                by_hotspot[(int(hx), int(hy))] = cells
                 continue
 
             # Vertical templates (left or right edge hotspot).
             if hx == 0:
                 for y in range(min_y, max_y + 1):
                     for x in range(0, min(2, width - 1) + 1):
-                        add((x, y))
-                add((0, min_y - 1))
-                add((0, max_y + 1))
+                        add(cells, (x, y))
+                add(cells, (0, min_y - 1))
+                add(cells, (0, max_y + 1))
+                by_hotspot[(int(hx), int(hy))] = cells
                 continue
 
             if hx == width - 1:
                 for y in range(min_y, max_y + 1):
                     for x in range(max(0, width - 3), width):
-                        add((x, y))
-                add((width - 1, min_y - 1))
-                add((width - 1, max_y + 1))
+                        add(cells, (x, y))
+                add(cells, (width - 1, min_y - 1))
+                add(cells, (width - 1, max_y + 1))
+                by_hotspot[(int(hx), int(hy))] = cells
 
+        return by_hotspot
+
+    def _build_non_hotspot_forbidden_cells(self) -> set[Tuple[int, int]]:
+        forbidden: set[Tuple[int, int]] = set()
+        for cells in getattr(self, "_hotspot_protected_cells_by_hotspot", {}).values():
+            forbidden.update(cells)
         return forbidden
 
     def _forbidden_cells_for_robot(self, robot: RobotState) -> set[Tuple[int, int]]:
-        if self._robot_has_persistent_hotspot(robot):
-            return set()
-        return set(getattr(self, "_non_hotspot_forbidden_cells", set()))
+        by_hotspot = getattr(self, "_hotspot_protected_cells_by_hotspot", {})
+        if not by_hotspot:
+            if self._robot_has_persistent_hotspot(robot):
+                return set()
+            return set(getattr(self, "_non_hotspot_forbidden_cells", set()))
+
+        if not self._robot_has_persistent_hotspot(robot):
+            return set(getattr(self, "_non_hotspot_forbidden_cells", set()))
+
+        assigned = self._nearest_edge_anchor(self._robot_assigned_hotspot(robot))
+        blocked: set[Tuple[int, int]] = set()
+        for hotspot, cells in by_hotspot.items():
+            hs = (int(hotspot[0]), int(hotspot[1]))
+            if hs == (int(assigned[0]), int(assigned[1])):
+                continue
+            blocked.update(cells)
+        return blocked
 
     def _build_setup_frontier_maps(
         self,

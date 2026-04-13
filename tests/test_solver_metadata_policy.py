@@ -876,6 +876,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver._setup_jobs_by_hotspot = {hotspot: jobs}
         solver._nearest_edge_anchor = lambda cell: cell
 
+        solver._hotspot_protected_cells_by_hotspot = solver._build_hotspot_protected_cells_by_hotspot()
         forbidden = solver._build_non_hotspot_forbidden_cells()
         self.assertIn((10, 0), forbidden)
         self.assertIn((15, 1), forbidden)
@@ -883,6 +884,24 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertIn((9, 0), forbidden)   # left cap
         self.assertIn((20, 0), forbidden)  # right cap
         self.assertNotIn((15, 3), forbidden)  # allowed boundary just outside 3-cell band
+
+    def test_forbidden_cells_for_assigned_robot_blocks_other_hotspots_only(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=30, height=20)
+        h1 = (10, 0)
+        h2 = (22, 0)
+        jobs1 = [SimpleNamespace(target_xy=(x, 0)) for x in range(10, 13)] + [SimpleNamespace(target_xy=(x, 2)) for x in range(10, 13)]
+        jobs2 = [SimpleNamespace(target_xy=(x, 0)) for x in range(22, 25)] + [SimpleNamespace(target_xy=(x, 2)) for x in range(22, 25)]
+        solver._setup_jobs_by_hotspot = {h1: jobs1, h2: jobs2}
+        solver._nearest_edge_anchor = lambda cell: cell
+        solver._hotspot_protected_cells_by_hotspot = solver._build_hotspot_protected_cells_by_hotspot()
+        solver._non_hotspot_forbidden_cells = solver._build_non_hotspot_forbidden_cells()
+        solver._robot_hotspot_by_id = {0: h1}
+
+        robot = SimpleNamespace(id=0, x=0, y=0, assigned_hotspot=h1)
+        blocked = solver._forbidden_cells_for_robot(robot)
+        self.assertIn((22, 0), blocked)
+        self.assertNotIn((10, 0), blocked)
 
     def test_safe_plan_path_blocks_forbidden_target_for_unassigned_robot(self) -> None:
         solver = self._new_solver_shell()
