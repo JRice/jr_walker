@@ -57,6 +57,7 @@ class RunConfig:
     relocation_edge_band: int = 6
     relocate_chunk_size: int = 1
     setup_hotspots: list[tuple[int, int]] = field(default_factory=list)
+    setup_mini_box_radius: int = 2
     relocation_skus_to_relocate: list[int] | None = None
     max_time: int = 50000
     min_jobs_for_dock: int = 3
@@ -268,6 +269,11 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.max_robots_per_suggestion",
         minimum=1,
     )
+    run_config.setup_mini_box_radius = _require_int(
+        solver_section.get("setup_mini_box_radius", run_config.setup_mini_box_radius),
+        "solver.setup_mini_box_radius",
+        minimum=1,
+    )
     run_config.robot_fail_streak_for_parking = _require_int(
         solver_section.get("robot_fail_streak_for_parking", run_config.robot_fail_streak_for_parking),
         "solver.robot_fail_streak_for_parking",
@@ -358,6 +364,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             astar_print_slow=run_config.astar_print_slow,
             astar_log_blocked=run_config.astar_log_blocked,
             enable_relocation_suggestions=run_config.enable_relocation_suggestions,
+            setup_mini_box_radius=run_config.setup_mini_box_radius,
             suggestion_retry_limit=run_config.suggestion_retry_limit,
             suggestion_backoff_base_cycles=run_config.suggestion_backoff_base_cycles,
             suggestion_backoff_max_cycles=run_config.suggestion_backoff_max_cycles,
@@ -578,6 +585,7 @@ def main():
             f"suggestion_backoff_base_cycles={run_config.suggestion_backoff_base_cycles}, "
             f"suggestion_backoff_max_cycles={run_config.suggestion_backoff_max_cycles}, "
             f"max_robots_per_suggestion={run_config.max_robots_per_suggestion}, "
+            f"setup_mini_box_radius={run_config.setup_mini_box_radius}, "
             f"robot_fail_streak_for_parking={run_config.robot_fail_streak_for_parking}, "
             f"parking_candidate_limit={run_config.parking_candidate_limit}, "
             f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."
