@@ -2453,6 +2453,74 @@ class WarehouseSolver:
         temp_robot.last_t = dock_t
         temp_robot.docks[(dx, dy)] = pallet_id
 
+        def try_carry_with_offset(
+            carry_robot: RobotState,
+            carry_offset: Tuple[int, int],
+            carry_pallet_xy: Tuple[int, int],
+            target_xy: Tuple[int, int],
+        ) -> Tuple[List[Tuple[int, int, int]] | None, str | None]:
+            tx2, ty2 = target_xy
+            target_robot_x = tx2 - carry_offset[0]
+            target_robot_y = ty2 - carry_offset[1]
+            if not (0 <= target_robot_x < self.state.width and 0 <= target_robot_y < self.state.height):
+                return None, "carry_target_robot_oob"
+            if (target_robot_x, target_robot_y) in self.scheduler.pallets and (
+                target_robot_x, target_robot_y
+            ) != carry_pallet_xy:
+                return None, "carry_target_robot_blocked"
+
+            carry_path2 = self._safe_plan_path(carry_robot, target_robot_x, target_robot_y)
+            if not carry_path2 and (carry_robot.x != target_robot_x or carry_robot.y != target_robot_y):
+                return None, "carry_path_fail"
+
+            candidate_arrival_t = carry_path2[-1][0] if carry_path2 else carry_robot.last_t
+            candidate_undock_t = candidate_arrival_t + 1
+            candidate_static_from_t = candidate_undock_t + 1
+            if not self.planner.can_add_static_obstacle_from(candidate_static_from_t, tx2, ty2):
+                return None, "carry_static_obstacle_conflict"
+            return carry_path2, None
+
+        def ordered_reorientation_offsets(
+            *,
+            current_offset: Tuple[int, int],
+            preferred_offset: Tuple[int, int] | None,
+            target_xy: Tuple[int, int],
+            pallet_xy_now: Tuple[int, int],
+            robot_anchor_xy: Tuple[int, int],
+        ) -> List[Tuple[int, int]]:
+            offsets = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+            out: List[Tuple[int, int]] = []
+            seen: set[Tuple[int, int]] = set()
+
+            def add_offset(offset: Tuple[int, int]) -> None:
+                ox, oy = offset
+                if (ox, oy) == current_offset:
+                    return
+                if (ox, oy) in seen:
+                    return
+                rx = pallet_xy_now[0] - ox
+                ry = pallet_xy_now[1] - oy
+                if not (0 <= rx < self.state.width and 0 <= ry < self.state.height):
+                    return
+                if (rx, ry) in self.scheduler.pallets and (rx, ry) != robot_anchor_xy:
+                    return
+                seen.add((ox, oy))
+                out.append((ox, oy))
+
+            if preferred_offset is not None:
+                add_offset(preferred_offset)
+            heuristic = sorted(
+                offsets,
+                key=lambda o: (
+                    abs((pallet_xy_now[0] - o[0]) - target_xy[0]) + abs((pallet_xy_now[1] - o[1]) - target_xy[1]),
+                    o[1],
+                    o[0],
+                ),
+            )
+            for offset in heuristic:
+                add_offset(offset)
+            return out
+
         chosen_target: Tuple[int, int, List[Tuple[int, int, int]], int] | None = None
         for tx, ty in target_pallet_cells:
             if (tx, ty) in self.scheduler.pallets and (tx, ty) != pallet_xy:
@@ -2466,6 +2534,7 @@ class WarehouseSolver:
             candidate_offset = (dx, dy)
             candidate_pallet_xy = pallet_xy
 
+            preferred_setup_offset: Tuple[int, int] | None = None
             if setup_redock_edge_step is not None:
                 if hasattr(self, "task_planner"):
                     macros = self.task_planner.build_setup_relocation_macros(
@@ -2479,6 +2548,7 @@ class WarehouseSolver:
                         "task_plan_setup_relocation "
                         f"robot={robot.id} source={pallet_xy} target=({tx},{ty}) macros={macro_names}"
                     )
+                preferred_setup_offset = (0, -setup_redock_edge_step)
 
                 # Retry redock staging by pulling farther toward target before trying edge-side orientation.
                 # This avoids getting stuck when the first reorientation point is blocked.
@@ -2540,7 +2610,10 @@ class WarehouseSolver:
 
                     # Motion planner (local 5x5 mini-game) handles the micro maneuver:
                     # undock -> local moves -> dock from desired side.
-                    target_offset = (0, -setup_redock_edge_step)
+                    target_offset = preferred_setup_offset
+                    if target_offset is None:
+                        note("redock_target_offset_missing")
+                        continue
                     redock_ok, staged_offset = self._execute_local_pivot_maneuver(
                         staged_robot=staged_robot,
                         pallet_id=pallet_id,
@@ -2566,29 +2639,78 @@ class WarehouseSolver:
 
                 if not redock_done:
                     note("redock_not_possible")
-                    continue
+                    # Fall through into generalized maneuver attempts as a backup.
 
-            target_robot_x = tx - candidate_offset[0]
-            target_robot_y = ty - candidate_offset[1]
-            if not (0 <= target_robot_x < self.state.width and 0 <= target_robot_y < self.state.height):
-                note("carry_target_robot_oob")
-                continue
-            if (target_robot_x, target_robot_y) in self.scheduler.pallets and (
-                target_robot_x, target_robot_y
-            ) != candidate_pallet_xy:
-                note("carry_target_robot_blocked")
-                continue
+            carry_path, carry_reason = try_carry_with_offset(
+                candidate_robot,
+                candidate_offset,
+                candidate_pallet_xy,
+                (tx, ty),
+            )
 
-            carry_path = self._safe_plan_path(candidate_robot, target_robot_x, target_robot_y)
-            if not carry_path and (candidate_robot.x != target_robot_x or candidate_robot.y != target_robot_y):
-                note("carry_path_fail")
-                continue
+            if carry_path is None:
+                if carry_reason is not None:
+                    note(carry_reason)
+                if hasattr(self, "task_planner"):
+                    macros = self.task_planner.build_setup_relocation_macros(
+                        stand_xy=(stand_x, stand_y),
+                        source_xy=pallet_xy,
+                        target_xy=(tx, ty),
+                        requires_local_maneuver=True,
+                    )
+                    macro_names = ",".join(m.name for m in macros)
+                    self._log(
+                        "task_plan_relocation_fallback "
+                        f"robot={robot.id} source={pallet_xy} target=({tx},{ty}) macros={macro_names}"
+                    )
 
-            candidate_arrival_t = carry_path[-1][0] if carry_path else candidate_robot.last_t
-            candidate_undock_t = candidate_arrival_t + 1
-            candidate_static_from_t = candidate_undock_t + 1
-            if not self.planner.can_add_static_obstacle_from(candidate_static_from_t, tx, ty):
-                note("carry_static_obstacle_conflict")
+                reorientation_offsets = ordered_reorientation_offsets(
+                    current_offset=candidate_offset,
+                    preferred_offset=preferred_setup_offset,
+                    target_xy=(tx, ty),
+                    pallet_xy_now=candidate_pallet_xy,
+                    robot_anchor_xy=(candidate_robot.x, candidate_robot.y),
+                )
+                for target_offset in reorientation_offsets:
+                    trial_robot = self._clone_robot_state(candidate_robot)
+                    trial_paths = list(candidate_paths)
+                    trial_actions = list(candidate_actions)
+                    trial_footprints = list(candidate_footprints)
+
+                    reorient_ok, new_offset = self._execute_local_pivot_maneuver(
+                        staged_robot=trial_robot,
+                        pallet_id=pallet_id,
+                        staged_pallet_xy=candidate_pallet_xy,
+                        staged_offset=candidate_offset,
+                        target_offset=target_offset,
+                        staged_paths=trial_paths,
+                        staged_actions=trial_actions,
+                        staged_footprints=trial_footprints,
+                        note=note,
+                    )
+                    if not reorient_ok:
+                        continue
+
+                    trial_carry_path, trial_reason = try_carry_with_offset(
+                        trial_robot,
+                        new_offset,
+                        candidate_pallet_xy,
+                        (tx, ty),
+                    )
+                    if trial_carry_path is None:
+                        if trial_reason is not None:
+                            note(f"{trial_reason}_after_reorient")
+                        continue
+
+                    candidate_robot = trial_robot
+                    candidate_paths = trial_paths
+                    candidate_actions = trial_actions
+                    candidate_footprints = trial_footprints
+                    candidate_offset = new_offset
+                    carry_path = trial_carry_path
+                    break
+
+            if carry_path is None:
                 continue
 
             pending_paths.extend(candidate_paths)
@@ -2596,14 +2718,14 @@ class WarehouseSolver:
             pending_footprints.extend(candidate_footprints)
             temp_robot = candidate_robot
             dx, dy = candidate_offset
-            chosen_target = (tx, ty, carry_path, candidate_undock_t)
+            chosen_target = (tx, ty, carry_path)
             break
 
         if chosen_target is None:
             note("no_target_candidate_after_stand")
             return None
 
-        target_pallet_x, target_pallet_y, carry_path, _ = chosen_target
+        target_pallet_x, target_pallet_y, carry_path = chosen_target
         if carry_path:
             pending_paths.append((self._clone_robot_state(temp_robot), carry_path))
         pending_actions.extend(self._apply_moves_to_robot(temp_robot, carry_path))
