@@ -248,6 +248,27 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         )
         self.assertEqual(source, ((1, 1), 202))
 
+    def test_setup_stand_priority_avoids_foreign_active_corridors(self) -> None:
+        solver = self._new_solver_shell()
+        solver._completed_setup_pallet_ids = set()
+        solver._dropped_setup_pallet_ids = set()
+        solver._setup_jobs_by_hotspot = {
+            (0, 0): [SimpleNamespace(source_pallet_id=1)],
+            (5, 0): [SimpleNamespace(source_pallet_id=2)],
+        }
+        solver._setup_slot_candidates = lambda hotspot, limit=80: (
+            [(5, 0), (5, 1)] if hotspot == (5, 0) else [(0, 0), (0, 1)]
+        )
+        stand_cells = [(5, 0), (4, 0), (5, 1)]
+
+        ordered, penalized, corridor_size = solver._prioritize_setup_stands_away_from_foreign_corridors(
+            stand_cells,
+            (0, 0),
+        )
+        self.assertEqual(ordered, [(4, 0), (5, 0), (5, 1)])
+        self.assertEqual(penalized, 2)
+        self.assertEqual(corridor_size, 2)
+
     def test_candidate_robots_for_setup_prefers_reachable_probe(self) -> None:
         solver = self._new_solver_shell()
         solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)

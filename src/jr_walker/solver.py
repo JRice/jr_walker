@@ -2594,6 +2594,58 @@ class WarehouseSolver:
         capped = rows[: max(1, int(limit))]
         return [(source_pallet_id, source_xy) for _, _, _, _, source_pallet_id, source_xy in capped]
 
+    def _hotspot_has_pending_setup_jobs(self, hotspot: Tuple[int, int]) -> bool:
+        hotspot_key = (int(hotspot[0]), int(hotspot[1]))
+        jobs = self._setup_jobs_by_hotspot.get(hotspot_key, [])
+        if not jobs:
+            return False
+        for job in jobs:
+            source_pallet_id = int(job.source_pallet_id)
+            if source_pallet_id in self._completed_setup_pallet_ids:
+                continue
+            if source_pallet_id in self._dropped_setup_pallet_ids:
+                continue
+            return True
+        return False
+
+    def _active_foreign_setup_corridor_cells(
+        self,
+        hotspot: Tuple[int, int],
+        *,
+        limit_per_hotspot: int = 80,
+    ) -> set[Tuple[int, int]]:
+        avoid: set[Tuple[int, int]] = set()
+        own_hotspot = (int(hotspot[0]), int(hotspot[1]))
+        for other_hotspot in self._setup_jobs_by_hotspot.keys():
+            other_key = (int(other_hotspot[0]), int(other_hotspot[1]))
+            if other_key == own_hotspot:
+                continue
+            if not self._hotspot_has_pending_setup_jobs(other_key):
+                continue
+            for cell in self._setup_slot_candidates(other_key, limit=max(1, int(limit_per_hotspot))):
+                avoid.add((int(cell[0]), int(cell[1])))
+        return avoid
+
+    def _prioritize_setup_stands_away_from_foreign_corridors(
+        self,
+        stand_cells: List[Tuple[int, int]],
+        hotspot: Tuple[int, int],
+    ) -> Tuple[List[Tuple[int, int]], int, int]:
+        if not stand_cells:
+            return [], 0, 0
+        foreign_corridors = self._active_foreign_setup_corridor_cells(hotspot)
+        if not foreign_corridors:
+            return list(stand_cells), 0, 0
+
+        safe: List[Tuple[int, int]] = []
+        penalized: List[Tuple[int, int]] = []
+        for cell in stand_cells:
+            if (int(cell[0]), int(cell[1])) in foreign_corridors:
+                penalized.append(cell)
+            else:
+                safe.append(cell)
+        return safe + penalized, len(penalized), len(foreign_corridors)
+
     def _plan_setup_pallet_for_robot(self, robot: RobotState, job: SetupJob) -> bool:
         source_candidates = self._setup_source_candidates_for_job(robot, job)
         if not source_candidates:
@@ -2623,6 +2675,17 @@ class WarehouseSolver:
                 return True
 
             stand_cells = self._candidate_relocation_stand_cells(robot, source_xy)
+            stand_cells, corridor_penalized, corridor_size = (
+                self._prioritize_setup_stands_away_from_foreign_corridors(stand_cells, job.hotspot)
+            )
+            if corridor_penalized > 0:
+                failure_reasons["stand_in_foreign_corridor"] += corridor_penalized
+                self._log(
+                    "setup_stand_corridor_penalty "
+                    f"robot={robot.id} sku={job.sku} hotspot={job.hotspot} "
+                    f"source={source_xy} penalized={corridor_penalized}/{len(stand_cells)} "
+                    f"foreign_corridor_cells={corridor_size}"
+                )
             if not stand_cells:
                 failure_reasons["no_stand_cells"] += 1
                 continue
