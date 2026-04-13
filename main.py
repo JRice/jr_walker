@@ -64,6 +64,84 @@ def _save_fulfill_rate_plot(
     return output_path
 
 
+def _save_final_warehouse_map(
+    actions: list[tuple[int, int, str, int, int]],
+    *,
+    run_id: int | None,
+    worklist_path: str | Path,
+    media_dir: Path = Path("media"),
+) -> Path:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import ListedColormap
+
+    validator = SubmissionValidator(worklist_path=worklist_path)
+    for t, rid, action, x, y in actions:
+        validator.validate_line(f"{t} {rid} {action} {x} {y}")
+    final_state = validator.finalize()
+
+    width = 60
+    height = 40
+    grid = np.zeros((height, width), dtype=int)
+    # 0: empty, 1: perimeter, 2: pallets, 3: robots
+    grid[0, :] = 1
+    grid[-1, :] = 1
+    grid[:, 0] = 1
+    grid[:, -1] = 1
+
+    pallet_items: list[tuple[tuple[int, int], int]] = []
+    for pallet in final_state.pallets:
+        if pallet.docked_to_robot is not None:
+            continue
+        x = int(pallet.x)
+        y = int(pallet.y)
+        if 0 <= x < width and 0 <= y < height:
+            grid[y, x] = 2
+            pallet_items.append(((x, y), int(pallet.sku)))
+
+    robot_cells: list[tuple[int, int]] = []
+    for robot in final_state.robots:
+        x = int(robot.x)
+        y = int(robot.y)
+        if 0 <= x < width and 0 <= y < height:
+            grid[y, x] = 3
+            robot_cells.append((x, y))
+
+    cmap = ListedColormap(["#f8f7f4", "#d4f2d2", "#f7b267", "#7aa2f7"])
+    fig, ax = plt.subplots(figsize=(18, 12))
+    ax.imshow(grid, cmap=cmap, origin="upper")
+
+    if pallet_items:
+        unique_skus = sorted({sku for _, sku in pallet_items})
+        sku_to_idx = {sku: i for i, sku in enumerate(unique_skus)}
+        palette = plt.cm.tab20(np.linspace(0.0, 1.0, 20))
+        xs = [xy[0] for xy, _ in pallet_items]
+        ys = [xy[1] for xy, _ in pallet_items]
+        colors = [palette[sku_to_idx[sku] % 20] for _, sku in pallet_items]
+        ax.scatter(xs, ys, c=colors, s=180, marker="s", edgecolors="black", linewidths=0.4, zorder=3)
+        for (x, y), sku in pallet_items:
+            ax.text(x, y, str(sku), ha="center", va="center", fontsize=6.8, color="black", zorder=4)
+
+    if robot_cells:
+        rx = [x for x, _ in robot_cells]
+        ry = [y for _, y in robot_cells]
+        ax.scatter(rx, ry, c="#1f77b4", s=140, marker="o", edgecolors="white", linewidths=0.8, zorder=5)
+
+    run_label = str(int(run_id)) if run_id is not None else "unknown"
+    ax.set_title(f"Final Tick Warehouse Map (run_id={run_label})", fontsize=14)
+    ax.set_xticks(np.arange(-0.5, width, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, height, 1), minor=True)
+    ax.grid(which="minor", color="black", linestyle="-", linewidth=0.35, alpha=0.15)
+    ax.tick_params(which="major", bottom=False, left=False, labelbottom=False, labelleft=False)
+    plt.tight_layout()
+
+    media_dir.mkdir(parents=True, exist_ok=True)
+    output_path = media_dir / f"warehouse_final_run_{run_label}.png"
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    return output_path
+
+
 def make_unique_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -116,6 +194,7 @@ class RunConfig:
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
     order_stagnation_cycle_limit: int = 256
+    realistic_fail_mode: bool = False
     max_robots_per_suggestion: int = 3
     robot_fail_streak_for_parking: int = 3
     parking_candidate_limit: int = 96
@@ -313,6 +392,10 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.order_stagnation_cycle_limit",
         minimum=1,
     )
+    raw_realistic_fail_mode = solver_section.get("realistic_fail_mode", run_config.realistic_fail_mode)
+    if not isinstance(raw_realistic_fail_mode, bool):
+        raise ValueError("solver.realistic_fail_mode must be a boolean.")
+    run_config.realistic_fail_mode = raw_realistic_fail_mode
     run_config.setup_mini_box_radius = _require_int(
         solver_section.get("setup_mini_box_radius", run_config.setup_mini_box_radius),
         "solver.setup_mini_box_radius",
@@ -413,6 +496,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             suggestion_backoff_base_cycles=run_config.suggestion_backoff_base_cycles,
             suggestion_backoff_max_cycles=run_config.suggestion_backoff_max_cycles,
             order_stagnation_cycle_limit=run_config.order_stagnation_cycle_limit,
+            realistic_fail_mode=run_config.realistic_fail_mode,
             max_robots_per_suggestion=run_config.max_robots_per_suggestion,
             robot_fail_streak_for_parking=run_config.robot_fail_streak_for_parking,
             parking_candidate_limit=run_config.parking_candidate_limit,
@@ -580,6 +664,15 @@ def _save_and_report(
 
     plot_path = _save_fulfill_rate_plot(actions, metadata_run_id)
     print(f"Wrote fulfill-rate plot to {plot_path}")
+    try:
+        map_path = _save_final_warehouse_map(
+            actions,
+            run_id=metadata_run_id,
+            worklist_path=run_config.input_path,
+        )
+        print(f"Wrote final warehouse map to {map_path}")
+    except Exception as map_exc:
+        print(f"Final warehouse map generation failed: {map_exc}")
 
 
 def main():
@@ -633,6 +726,7 @@ def main():
             f"suggestion_backoff_base_cycles={run_config.suggestion_backoff_base_cycles}, "
             f"suggestion_backoff_max_cycles={run_config.suggestion_backoff_max_cycles}, "
             f"order_stagnation_cycle_limit={run_config.order_stagnation_cycle_limit}, "
+            f"realistic_fail_mode={run_config.realistic_fail_mode}, "
             f"max_robots_per_suggestion={run_config.max_robots_per_suggestion}, "
             f"setup_mini_box_radius={run_config.setup_mini_box_radius}, "
             f"robot_fail_streak_for_parking={run_config.robot_fail_streak_for_parking}, "

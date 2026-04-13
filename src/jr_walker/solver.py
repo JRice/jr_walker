@@ -151,6 +151,7 @@ class SolverConfig:
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
     order_stagnation_cycle_limit: int = 256
+    realistic_fail_mode: bool = False
     max_robots_per_suggestion: int = 3
     robot_fail_streak_for_parking: int = 3
     parking_candidate_limit: int = 96
@@ -382,6 +383,7 @@ class WarehouseSolver:
         self._suggestion_backoff_until_cycle: Dict[str, int] = {}
         self._robot_fail_streak: Dict[int, int] = collections.defaultdict(int)
         self._parking_moves = 0
+        self._retired_robot_ids: set[int] = set()
 
     def _assign_setup_robots_by_hotspot(self) -> Dict[Tuple[int, int], int]:
         hotspots: List[Tuple[int, int]] = []
@@ -679,6 +681,32 @@ class WarehouseSolver:
                     total_orders=total_orders,
                     dispatch_count=dispatch_count,
                 )
+                if bool(getattr(self.config, "realistic_fail_mode", False)):
+                    retired_ids = getattr(self, "_retired_robot_ids", set())
+                    moved_any = False
+                    for r in self.robots:
+                        if r.id in retired_ids:
+                            continue
+                        if self._plan_retire_robot_to_corner(r):
+                            moved_any = True
+                    if moved_any:
+                        no_progress_attempts = 0
+                        self._log(
+                            "realistic_fail_mode_progress "
+                            f"retired={len(getattr(self, '_retired_robot_ids', set()))}/{len(self.robots)}"
+                        )
+                        return
+                    self._log(
+                        "realistic_fail_mode_no_move "
+                        f"retired={len(getattr(self, '_retired_robot_ids', set()))}/{len(self.robots)}"
+                    )
+                    if len(getattr(self, "_retired_robot_ids", set())) >= len(self.robots):
+                        self._log(
+                            "realistic_fail_mode_terminated "
+                            f"completed_orders={len(completed_orders)}/{total_orders}"
+                        )
+                        raise RuntimeError(msg)
+                    return
                 self._log(msg)
                 raise RuntimeError(msg)
 
@@ -884,8 +912,34 @@ class WarehouseSolver:
                         total_orders=total_orders,
                         dispatch_count=dispatch_count,
                     )
-                    self._log(msg)
-                    raise RuntimeError(msg)
+                    if bool(getattr(self.config, "realistic_fail_mode", False)):
+                        retired_ids = getattr(self, "_retired_robot_ids", set())
+                        moved_any = False
+                        for r in self.robots:
+                            if r.id in retired_ids:
+                                continue
+                            if self._plan_retire_robot_to_corner(r):
+                                moved_any = True
+                        if moved_any:
+                            cycles_since_order_progress = 0
+                            self._log(
+                                "realistic_fail_mode_progress "
+                                f"retired={len(getattr(self, '_retired_robot_ids', set()))}/{len(self.robots)}"
+                            )
+                            continue
+                        self._log(
+                            "realistic_fail_mode_no_move "
+                            f"retired={len(getattr(self, '_retired_robot_ids', set()))}/{len(self.robots)}"
+                        )
+                        if len(getattr(self, "_retired_robot_ids", set())) >= len(self.robots):
+                            self._log(
+                                "realistic_fail_mode_terminated "
+                                f"completed_orders={current_completed}/{total_orders}"
+                            )
+                            break
+                    else:
+                        self._log(msg)
+                        raise RuntimeError(msg)
 
         if len(completed_orders) < total_orders:
             self._log(f"Warning: Only {len(completed_orders)}/{total_orders} orders were completed from suggestion queue.")
@@ -1568,6 +1622,8 @@ class WarehouseSolver:
             f"retry_limit={self.config.suggestion_retry_limit} "
             f"backoff_base={self.config.suggestion_backoff_base_cycles} "
             f"backoff_max={self.config.suggestion_backoff_max_cycles} "
+            f"stagnation_limit={self.config.order_stagnation_cycle_limit} "
+            f"realistic_fail_mode={self.config.realistic_fail_mode} "
             f"robots_per_suggestion={self.config.max_robots_per_suggestion} "
             f"parking_fail_streak={self.config.robot_fail_streak_for_parking}"
         )
@@ -2038,6 +2094,7 @@ class WarehouseSolver:
 
     def _candidate_robots_for_suggestion(self, suggestion: Suggestion) -> List[RobotState]:
         center = suggestion.center
+        retired_ids: set[int] = getattr(self, "_retired_robot_ids", set())
 
         if isinstance(suggestion, SetupSuggestion):
             setup_robot_by_hotspot = getattr(self, "_setup_robot_by_hotspot", {})
@@ -2052,11 +2109,13 @@ class WarehouseSolver:
                 self.robots,
                 key=lambda r: self._setup_probe_robot_for_job(r, suggestion.job),
             )
+            ranked = [r for r in ranked if r.id not in retired_ids]
             limit = max(1, min(int(self.config.max_robots_per_suggestion), len(ranked)))
             return ranked[:limit]
 
-        robot_pool = list(self.robots)
+        robot_pool = [r for r in self.robots if r.id not in retired_ids]
         non_setup_robots = [r for r in self.robots if not self._has_pending_setup_for_robot(r.id)]
+        non_setup_robots = [r for r in non_setup_robots if r.id not in retired_ids]
         if non_setup_robots:
             robot_pool = non_setup_robots
 
@@ -2070,6 +2129,57 @@ class WarehouseSolver:
         )
         limit = max(1, min(int(self.config.max_robots_per_suggestion), len(ranked)))
         return ranked[:limit]
+
+    def _corner_cells(self) -> List[Tuple[int, int]]:
+        return [
+            (0, 0),
+            (self.state.width - 1, 0),
+            (0, self.state.height - 1),
+            (self.state.width - 1, self.state.height - 1),
+        ]
+
+    def _plan_retire_robot_to_corner(self, robot: RobotState) -> bool:
+        retired_ids: set[int] = getattr(self, "_retired_robot_ids", set())
+        if robot.id in retired_ids:
+            return False
+        if robot.docks:
+            return False
+        corners = sorted(
+            self._corner_cells(),
+            key=lambda c: (abs(c[0] - robot.x) + abs(c[1] - robot.y), c[1], c[0]),
+        )
+        for tx, ty in corners:
+            if (tx, ty) in self.scheduler.pallets:
+                continue
+            path = self._safe_plan_path(robot, tx, ty)
+            if not path and (robot.x != tx or robot.y != ty):
+                continue
+
+            temp_robot = self._clone_robot_state(robot)
+            pending_actions: List[Tuple[int, int, str, int, int]] = []
+            pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+            pending_footprints: List[Tuple[RobotState, int, int, int]] = []
+            if path:
+                pending_paths.append((self._clone_robot_state(temp_robot), path))
+            pending_actions.extend(self._apply_moves_to_robot(temp_robot, path))
+            if pending_actions and not self._can_commit_pending_actions(pending_actions):
+                continue
+            self._commit_plan(
+                robot=robot,
+                temp_robot=temp_robot,
+                pending_actions=pending_actions,
+                pending_paths=pending_paths,
+                pending_footprints=pending_footprints,
+            )
+            if not hasattr(self, "_retired_robot_ids"):
+                self._retired_robot_ids = set()
+            self._retired_robot_ids.add(robot.id)
+            self._log(
+                f"realistic_fail_mode_retire robot={robot.id} corner=({tx},{ty}) "
+                f"path_len={len(path)} last_t={robot.last_t}"
+            )
+            return True
+        return False
 
     def _setup_probe_robot_for_job(
         self,
