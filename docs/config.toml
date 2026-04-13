@@ -4,7 +4,7 @@ max_runs = 1
 [limits]
 # Hard stop on produced plan length. If exceeded before finishing all orders,
 # the run exits and writes partial output. For a full run, you want this to be 16000 or so.
-max_makespan = 1000
+max_makespan = 2000
 # Seconds of compute budget: One run has been taking 30-60 minutes, so you want this high:
 max_plan_time = 6000
 # Solve every Nth order from the worklist (1 = all orders). THIS SHOULD BE 1 for a full run.

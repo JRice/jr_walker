@@ -347,6 +347,19 @@ class WarehouseSolver:
         self._setup_robot_by_hotspot: Dict[Tuple[int, int], int] = self._assign_setup_robots_by_hotspot()
         self._setup_robot_ids: set[int] = set(self._setup_robot_by_hotspot.values())
         self._completed_setup_pallet_ids: set[int] = set()
+        self._dropped_setup_pallet_ids: set[int] = set()
+        self._setup_job_by_source_pallet_id: Dict[int, SetupJob] = {
+            int(job.source_pallet_id): job for job in self.setup_jobs
+        }
+        self._setup_jobs_by_hotspot: Dict[Tuple[int, int], List[SetupJob]] = collections.defaultdict(list)
+        for job in self.setup_jobs:
+            hs = (int(job.hotspot[0]), int(job.hotspot[1]))
+            self._setup_jobs_by_hotspot[hs].append(job)
+        (
+            self._setup_slot_index_by_source_pallet_id,
+            self._setup_hotspot_frontier_pallet_ids,
+        ) = self._build_setup_frontier_maps()
+        self._setup_frontier_wait_logged_cycle: Dict[int, int] = {}
 
         self._plan_started_monotonic = 0.0
         self._log_handle = None
@@ -391,6 +404,154 @@ class WarehouseSolver:
             mapping[(hx, hy)] = best.id
             available.remove(best)
         return mapping
+
+    def _build_setup_frontier_maps(
+        self,
+    ) -> Tuple[Dict[int, int], Dict[Tuple[int, int], List[int]]]:
+        slot_index_by_source_pallet_id: Dict[int, int] = {}
+        hotspot_frontier_pallet_ids: Dict[Tuple[int, int], List[int]] = {}
+
+        for hotspot, jobs in self._setup_jobs_by_hotspot.items():
+            slot_order = {
+                cell: idx for idx, cell in enumerate(self._setup_slot_candidates(hotspot, limit=240))
+            }
+            rows: List[Tuple[int, int]] = []
+            for job in jobs:
+                source_pallet_id = int(job.source_pallet_id)
+                target = (int(job.target_xy[0]), int(job.target_xy[1]))
+                slot_idx = int(slot_order.get(target, 10**9))
+                slot_index_by_source_pallet_id[source_pallet_id] = slot_idx
+                rows.append((slot_idx, source_pallet_id))
+            rows.sort(key=lambda row: (row[0], row[1]))
+            hotspot_frontier_pallet_ids[hotspot] = [source_pallet_id for _, source_pallet_id in rows]
+
+        return slot_index_by_source_pallet_id, hotspot_frontier_pallet_ids
+
+    def _requeue_setup_suggestion(
+        self,
+        suggestion_queue: collections.deque[Suggestion],
+        suggestion: SetupSuggestion,
+    ) -> None:
+        for idx, queued in enumerate(suggestion_queue):
+            if not isinstance(queued, SetupSuggestion):
+                suggestion_queue.insert(idx, suggestion)
+                return
+        suggestion_queue.append(suggestion)
+
+    def _setup_frontier_blocking_pallet_id(self, job: SetupJob) -> int | None:
+        hotspot = (int(job.hotspot[0]), int(job.hotspot[1]))
+        current_pid = int(job.source_pallet_id)
+        for source_pallet_id in self._setup_hotspot_frontier_pallet_ids.get(hotspot, []):
+            if source_pallet_id == current_pid:
+                return None
+            if source_pallet_id in self._completed_setup_pallet_ids:
+                continue
+            if source_pallet_id in self._dropped_setup_pallet_ids:
+                continue
+            return source_pallet_id
+        return None
+
+    def _is_setup_frontier_ready(self, job: SetupJob) -> bool:
+        return self._setup_frontier_blocking_pallet_id(job) is None
+
+    def _setup_retry_limit(self) -> int:
+        return max(1, int(self.config.suggestion_retry_limit))
+
+    def _log_setup_hotspot_progress(self, hotspot: Tuple[int, int], *, reason: str) -> None:
+        hotspot_key = (int(hotspot[0]), int(hotspot[1]))
+        jobs = self._setup_jobs_by_hotspot.get(hotspot_key, [])
+        completed = 0
+        dropped = 0
+        pending = 0
+        next_target: Tuple[int, int] | None = None
+        next_source_pallet_id: int | None = None
+        for source_pallet_id in self._setup_hotspot_frontier_pallet_ids.get(hotspot_key, []):
+            if source_pallet_id in self._completed_setup_pallet_ids:
+                completed += 1
+                continue
+            if source_pallet_id in self._dropped_setup_pallet_ids:
+                dropped += 1
+                continue
+            pending += 1
+            if next_target is None:
+                job = self._setup_job_by_source_pallet_id.get(source_pallet_id)
+                if job is not None:
+                    next_target = (int(job.target_xy[0]), int(job.target_xy[1]))
+                    next_source_pallet_id = int(job.source_pallet_id)
+
+        # Keep accounting robust if any job is not present in the frontier index map.
+        indexed = completed + dropped + pending
+        if indexed < len(jobs):
+            for job in jobs:
+                source_pallet_id = int(job.source_pallet_id)
+                if source_pallet_id in self._setup_slot_index_by_source_pallet_id:
+                    continue
+                if source_pallet_id in self._completed_setup_pallet_ids:
+                    completed += 1
+                elif source_pallet_id in self._dropped_setup_pallet_ids:
+                    dropped += 1
+                else:
+                    pending += 1
+                    if next_target is None:
+                        next_target = (int(job.target_xy[0]), int(job.target_xy[1]))
+                        next_source_pallet_id = source_pallet_id
+
+        self._log(
+            "setup_hotspot_progress "
+            f"hotspot={hotspot_key} reason={reason} "
+            f"completed={completed} dropped={dropped} pending={pending} "
+            f"next_target={next_target} next_source_pallet_id={next_source_pallet_id}"
+        )
+
+    @staticmethod
+    def _format_reason_counts(counter: collections.Counter, *, limit: int = 5) -> str:
+        if not counter:
+            return "none"
+        rows = counter.most_common(max(1, int(limit)))
+        return ",".join(f"{name}:{count}" for name, count in rows)
+
+    def _rebind_setup_source_pallet_id(
+        self,
+        *,
+        job: SetupJob,
+        old_source_pallet_id: int,
+        new_source_pallet_id: int,
+    ) -> None:
+        old_source_pallet_id = int(old_source_pallet_id)
+        new_source_pallet_id = int(new_source_pallet_id)
+        if old_source_pallet_id == new_source_pallet_id:
+            return
+
+        hotspot = (int(job.hotspot[0]), int(job.hotspot[1]))
+        frontier = self._setup_hotspot_frontier_pallet_ids.get(hotspot, [])
+        for idx, source_pallet_id in enumerate(frontier):
+            if int(source_pallet_id) == old_source_pallet_id:
+                frontier[idx] = new_source_pallet_id
+                break
+
+        slot_index = self._setup_slot_index_by_source_pallet_id.pop(old_source_pallet_id, None)
+        if slot_index is not None:
+            self._setup_slot_index_by_source_pallet_id[new_source_pallet_id] = int(slot_index)
+        self._setup_frontier_wait_logged_cycle.pop(old_source_pallet_id, None)
+
+    def _has_pending_setup_for_robot(self, robot_id: int) -> bool:
+        setup_jobs = getattr(self, "setup_jobs", [])
+        completed = getattr(self, "_completed_setup_pallet_ids", set())
+        dropped = getattr(self, "_dropped_setup_pallet_ids", set())
+        setup_robot_by_hotspot = getattr(self, "_setup_robot_by_hotspot", {})
+        for job in setup_jobs:
+            source_pallet_id = getattr(job, "source_pallet_id", None)
+            hotspot = getattr(job, "hotspot", None)
+            if source_pallet_id is None or hotspot is None:
+                continue
+            if source_pallet_id in completed:
+                continue
+            if source_pallet_id in dropped:
+                continue
+            assigned_id = setup_robot_by_hotspot.get((int(hotspot[0]), int(hotspot[1])))
+            if assigned_id == robot_id:
+                return True
+        return False
 
     def solve(self) -> Tuple[Path, List[Tuple[int, int, str, int, int]]]:
         self._open_log()
@@ -449,7 +610,10 @@ class WarehouseSolver:
             suggestion_key = self._suggestion_key(suggestion)
             blocked_until = self._suggestion_backoff_until_cycle.get(suggestion_key, 0)
             if blocked_until > self._dispatch_cycle:
-                suggestion_queue.append(suggestion)
+                if isinstance(suggestion, SetupSuggestion):
+                    self._requeue_setup_suggestion(suggestion_queue, suggestion)
+                else:
+                    suggestion_queue.append(suggestion)
                 continue
 
             # Skip if already handled
@@ -457,9 +621,27 @@ class WarehouseSolver:
                 continue
             if isinstance(suggestion, SetupSuggestion) and suggestion.job.source_pallet_id in self._completed_setup_pallet_ids:
                 continue
+            if isinstance(suggestion, SetupSuggestion) and suggestion.job.source_pallet_id in self._dropped_setup_pallet_ids:
+                continue
             if isinstance(suggestion, RelocateSuggestion) and suggestion.job.sku in self.relocated_skus:
                 continue
             if isinstance(suggestion, DockSuggestion) and suggestion.sku in self.docked_skus:
+                continue
+
+            if isinstance(suggestion, SetupSuggestion) and not self._is_setup_frontier_ready(suggestion.job):
+                blocker = self._setup_frontier_blocking_pallet_id(suggestion.job)
+                source_pallet_id = int(suggestion.job.source_pallet_id)
+                last_logged = self._setup_frontier_wait_logged_cycle.get(source_pallet_id, -10**9)
+                if self._dispatch_cycle - last_logged >= 64:
+                    self._setup_frontier_wait_logged_cycle[source_pallet_id] = self._dispatch_cycle
+                    blocker_job = self._setup_job_by_source_pallet_id.get(int(blocker)) if blocker is not None else None
+                    self._log(
+                        "setup_frontier_wait "
+                        f"hotspot={suggestion.job.hotspot} source_pallet_id={source_pallet_id} "
+                        f"target={suggestion.job.target_xy} waiting_on={blocker} "
+                        f"waiting_target={(blocker_job.target_xy if blocker_job is not None else None)}"
+                    )
+                self._requeue_setup_suggestion(suggestion_queue, suggestion)
                 continue
 
             handled = False
@@ -478,11 +660,16 @@ class WarehouseSolver:
                             f"setup_done sku={suggestion.job.sku} source={suggestion.job.source_xy} "
                             f"target={suggestion.job.target_xy} hotspot={suggestion.job.hotspot}"
                         )
-                        if len(self._completed_setup_pallet_ids) >= len(self.setup_jobs):
-                            suggestion_queue = self._refresh_pending_order_suggestions(
-                                suggestion_queue,
-                                completed_orders,
-                            )
+                        self._log_setup_hotspot_progress(
+                            suggestion.job.hotspot,
+                            reason=f"done_pid_{suggestion.job.source_pallet_id}",
+                        )
+                        # Re-score pending order suggestions immediately after each
+                        # setup placement so robots can exploit newly moved pallets.
+                        suggestion_queue = self._refresh_pending_order_suggestions(
+                            suggestion_queue,
+                            completed_orders,
+                        )
                 elif isinstance(suggestion, RelocateSuggestion):
                     if suggestion.remaining_job_factor() <= 0:
                         handled = True
@@ -524,31 +711,48 @@ class WarehouseSolver:
                     continue
             else:
                 parked = False
-                for robot in candidate_robots:
-                    if self._robot_fail_streak.get(robot.id, 0) < self.config.robot_fail_streak_for_parking:
-                        continue
-                    if self._plan_idle_parking_move(robot):
-                        self._parking_moves += 1
-                        parked = True
-                        self._robot_fail_streak[robot.id] = 0
-                        break
+                if not isinstance(suggestion, SetupSuggestion):
+                    for robot in candidate_robots:
+                        if self._robot_fail_streak.get(robot.id, 0) < self.config.robot_fail_streak_for_parking:
+                            continue
+                        if self._plan_idle_parking_move(robot):
+                            self._parking_moves += 1
+                            parked = True
+                            self._robot_fail_streak[robot.id] = 0
+                            break
 
                 failure_count = self._suggestion_fail_counts.get(suggestion_key, 0) + 1
                 self._suggestion_fail_counts[suggestion_key] = failure_count
                 retry_limit = int(self.config.suggestion_retry_limit)
                 if isinstance(suggestion, SetupSuggestion):
-                    # Setup failures are often transient congestion; allow more retries.
-                    retry_limit = max(retry_limit, retry_limit * 4)
+                    retry_limit = self._setup_retry_limit()
                 if failure_count >= retry_limit:
                     self._log(
                         "suggestion_dropped "
                         f"key={suggestion_key} failures={failure_count} parked={parked}"
                     )
+                    if isinstance(suggestion, SetupSuggestion):
+                        self._dropped_setup_pallet_ids.add(suggestion.job.source_pallet_id)
+                        assigned = self._setup_robot_by_hotspot.get(
+                            (int(suggestion.job.hotspot[0]), int(suggestion.job.hotspot[1]))
+                        )
+                        self._log(
+                            "setup_job_dropped "
+                            f"sku={suggestion.job.sku} hotspot={suggestion.job.hotspot} "
+                            f"source_pallet_id={suggestion.job.source_pallet_id} assigned_robot={assigned}"
+                        )
+                        self._log_setup_hotspot_progress(
+                            suggestion.job.hotspot,
+                            reason=f"dropped_pid_{suggestion.job.source_pallet_id}",
+                        )
                     self._suggestion_backoff_until_cycle.pop(suggestion_key, None)
                 else:
                     backoff_cycles = self._suggestion_backoff_cycles(failure_count)
                     self._suggestion_backoff_until_cycle[suggestion_key] = self._dispatch_cycle + backoff_cycles
-                    suggestion_queue.append(suggestion)
+                    if isinstance(suggestion, SetupSuggestion):
+                        self._requeue_setup_suggestion(suggestion_queue, suggestion)
+                    else:
+                        suggestion_queue.append(suggestion)
                     if failure_count == 1 or failure_count % 3 == 0:
                         self._log(
                             "suggestion_retry_scheduled "
@@ -575,6 +779,13 @@ class WarehouseSolver:
 
         if len(completed_orders) < total_orders:
             self._log(f"Warning: Only {len(completed_orders)}/{total_orders} orders were completed from suggestion queue.")
+        if self.setup_jobs:
+            pending = len(self.setup_jobs) - len(self._completed_setup_pallet_ids) - len(self._dropped_setup_pallet_ids)
+            self._log(
+                "setup_summary "
+                f"planned={len(self.setup_jobs)} completed={len(self._completed_setup_pallet_ids)} "
+                f"dropped={len(self._dropped_setup_pallet_ids)} pending={max(0, pending)}"
+            )
 
         sorted_actions = self.actions.sorted_actions()
         repaired_actions = self._repair_idle_wait_conflicts(sorted_actions)
@@ -965,10 +1176,44 @@ class WarehouseSolver:
         optimizer = OrderOptimizer(self.state.pallets)
 
         for robot_id, fulfills in fulfills_by_robot.items():
+            fulfills_sorted = sorted(
+                fulfills,
+                key=lambda row: int(row.get("timestep", 0)),
+            )
+
             # For each high-demand SKU, look for streaks
             for sku in self.skus_by_demand[:10]:
                 current_streak: List[int] = []
-                for fulfill in fulfills:
+
+                def emit_streak() -> None:
+                    if len(current_streak) < max(2, int(self.config.min_jobs_for_dock)):
+                        return
+
+                    first_order_idx = current_streak[0]
+                    if first_order_idx < 0 or first_order_idx >= len(self.orders):
+                        return
+                    order_items = self.orders[first_order_idx].items
+                    cluster, _ = optimizer.find_tightest_cluster(list(order_items.keys()))
+                    if not cluster:
+                        return
+
+                    xs = [pos[0] for pos in cluster.values()]
+                    ys = [pos[1] for pos in cluster.values()]
+                    order_center = (int(sum(xs) / len(xs)), int(sum(ys) / len(ys)))
+
+                    pallet_locs = self.scheduler.pallet_cells_for_sku(sku)
+                    if not pallet_locs:
+                        return
+
+                    nearest_pallet = min(pallet_locs, key=lambda p: manhattan_distance(p, order_center))
+                    gain = (
+                        manhattan_distance(order_center, nearest_pallet)
+                        * len(current_streak)
+                        * self.config.dock_gain_scale
+                    )
+                    suggestions.append(DockSuggestion(sku, list(current_streak), gain, nearest_pallet))
+
+                for fulfill in fulfills_sorted:
                     order_id = fulfill.get("order_id")
                     if order_id is None or order_id < 0:
                         continue
@@ -976,31 +1221,10 @@ class WarehouseSolver:
                     if sku in fulfill["skus"]:
                         current_streak.append(order_id)
                     else:
-                        if len(current_streak) > 1:
-                            # Found a streak, create a suggestion
-                            first_order_idx = current_streak[0]
-                            order_items = self.orders[first_order_idx].items
-                            cluster, _ = optimizer.find_tightest_cluster(list(order_items.keys()))
-                            if not cluster:
-                                continue
-
-                            # Simplified center calculation for speed
-                            xs = [pos[0] for pos in cluster.values()]
-                            ys = [pos[1] for pos in cluster.values()]
-                            order_center = (int(sum(xs) / len(xs)), int(sum(ys) / len(ys)))
-
-                            pallet_locs = self.scheduler.pallet_cells_for_sku(sku)
-                            if not pallet_locs:
-                                continue
-                            
-                            nearest_pallet = min(pallet_locs, key=lambda p: manhattan_distance(p, order_center))
-                            gain = (
-                                manhattan_distance(order_center, nearest_pallet)
-                                * len(current_streak)
-                                * self.config.dock_gain_scale
-                            )
-                            suggestions.append(DockSuggestion(sku, list(current_streak), gain, nearest_pallet))
+                        emit_streak()
                         current_streak = []
+                # Flush a trailing streak that reaches the end of fulfill history.
+                emit_streak()
         return suggestions
 
     def _optimize_actions_core(
@@ -1029,6 +1253,27 @@ class WarehouseSolver:
                 )
             )
             self._log(f"setup_robot_assignment [{mapping_summary}]")
+        if self.setup_jobs:
+            jobs_by_hotspot: Dict[Tuple[int, int], List[SetupJob]] = collections.defaultdict(list)
+            for job in self.setup_jobs:
+                jobs_by_hotspot[(int(job.hotspot[0]), int(job.hotspot[1]))].append(job)
+
+            for hotspot, jobs in sorted(jobs_by_hotspot.items(), key=lambda item: (item[0][1], item[0][0])):
+                slot_order = {cell: idx for idx, cell in enumerate(self._setup_slot_candidates(hotspot, limit=240))}
+                jobs_sorted = sorted(
+                    jobs,
+                    key=lambda j: (slot_order.get((int(j.target_xy[0]), int(j.target_xy[1])), 9999), j.sku),
+                )
+                preview = ", ".join(
+                    f"{j.target_xy}:sku{j.sku}:src{j.source_xy}:pid{j.source_pallet_id}"
+                    for j in jobs_sorted[:10]
+                )
+                assigned = self._setup_robot_by_hotspot.get(hotspot)
+                self._log(
+                    f"setup_hotspot_plan hotspot={hotspot} assigned_robot={assigned} "
+                    f"jobs={len(jobs_sorted)} preview=[{preview}]"
+                )
+                self._log_setup_hotspot_progress(hotspot, reason="initial")
         self._log(
             "dispatch_policy "
             f"retry_limit={self.config.suggestion_retry_limit} "
@@ -1051,13 +1296,16 @@ class WarehouseSolver:
         if completed % self.config.progress_every != 0:
             return
         current_makespan = max(r.last_t for r in self.robots)
+        elapsed_s = self._elapsed_plan_seconds()
         print(
             f"[solver] planned {completed}/{total_orders} orders, "
-            f"current makespan={current_makespan}, dispatches={dispatch_count}"
+            f"current makespan={current_makespan}, dispatches={dispatch_count}, "
+            f"runtime={elapsed_s:.1f}s"
         )
         self._log(
             f"progress completed={completed}/{total_orders} "
-            f"makespan={current_makespan} dispatches={dispatch_count}"
+            f"makespan={current_makespan} dispatches={dispatch_count} "
+            f"runtime_s={elapsed_s:.3f}"
         )
 
     def _elapsed_plan_seconds(self) -> float:
@@ -1501,9 +1749,6 @@ class WarehouseSolver:
 
     def _candidate_robots_for_suggestion(self, suggestion: Suggestion) -> List[RobotState]:
         center = suggestion.center
-        setup_jobs = getattr(self, "setup_jobs", [])
-        completed_setup = getattr(self, "_completed_setup_pallet_ids", set())
-        setup_phase_active = bool(setup_jobs) and len(completed_setup) < len(setup_jobs)
 
         if isinstance(suggestion, SetupSuggestion):
             setup_robot_by_hotspot = getattr(self, "_setup_robot_by_hotspot", {})
@@ -1522,11 +1767,9 @@ class WarehouseSolver:
             return ranked[:limit]
 
         robot_pool = list(self.robots)
-        if setup_phase_active:
-            setup_robot_ids = getattr(self, "_setup_robot_ids", set())
-            non_setup_robots = [r for r in self.robots if r.id not in setup_robot_ids]
-            if non_setup_robots:
-                robot_pool = non_setup_robots
+        non_setup_robots = [r for r in self.robots if not self._has_pending_setup_for_robot(r.id)]
+        if non_setup_robots:
+            robot_pool = non_setup_robots
 
         ranked = sorted(
             robot_pool,
@@ -1789,59 +2032,146 @@ class WarehouseSolver:
             seen.add(cell)
             out.append(cell)
 
-        preferred_x = int(job.target_xy[0])
-        target_y = int(job.target_xy[1])
-        step = self._setup_inward_step(job.hotspot)
-
+        # Strict setup packing: keep each job on its pre-planned target cell.
+        # This prevents opportunistic fallback from creating jagged one-wide growth.
         push(job.target_xy)
-        for cell in self._setup_slot_candidates(job.hotspot, limit=240):
-            if len(out) >= limit:
-                break
-            if cell[0] != preferred_x:
-                continue
-            if (cell[1] - target_y) * step < 0:
-                continue
-            push(cell)
         return out
 
-    def _plan_setup_pallet_for_robot(self, robot: RobotState, job: SetupJob) -> bool:
-        pallet_info = self.pallet_by_id.get(job.source_pallet_id)
-        if pallet_info is None:
-            return False
-        source_xy = (int(pallet_info["x"]), int(pallet_info["y"]))
-        job.source_xy = source_xy
-        if source_xy == job.target_xy:
-            return True
-
-        stand_cells = self._candidate_relocation_stand_cells(robot, source_xy)
-        if not stand_cells:
-            return False
-
-        target_cells = self._setup_target_candidates(job, source_xy)
-        if not target_cells:
-            return False
-
-        for stand_xy in stand_cells:
-            outcome = self._attempt_relocation_via_stand(
-                robot=robot,
-                pallet_xy=source_xy,
-                pallet_id=job.source_pallet_id,
-                stand_xy=stand_xy,
-                target_pallet_cells=target_cells,
-                setup_redock_edge_step=self._setup_inward_step(job.hotspot),
-            )
-            if outcome is None:
+    def _setup_source_candidates_for_job(
+        self,
+        robot: RobotState,
+        job: SetupJob,
+        *,
+        limit: int = 8,
+    ) -> List[Tuple[int, Tuple[int, int]]]:
+        blocked_source_pallet_ids: set[int] = set()
+        for other in self.setup_jobs:
+            other_id = int(other.source_pallet_id)
+            if other_id == int(job.source_pallet_id):
                 continue
-            new_xy, dock_t, undock_t = outcome
-            self._finalize_relocation_pallet_state(
-                pallet_id=job.source_pallet_id,
-                old_xy=source_xy,
-                new_xy=new_xy,
-                dock_t=dock_t,
-                undock_t=undock_t,
+            if other_id in self._completed_setup_pallet_ids:
+                continue
+            if other_id in self._dropped_setup_pallet_ids:
+                continue
+            blocked_source_pallet_ids.add(other_id)
+
+        rows: List[Tuple[int, int, int, int, Tuple[int, int]]] = []
+        seen: set[int] = set()
+        hx, hy = int(job.hotspot[0]), int(job.hotspot[1])
+        for source_xy in self.scheduler.pallet_cells_for_sku(int(job.sku)):
+            source_pallet_id = self.pallet_id_by_coord.get(source_xy)
+            if source_pallet_id is None:
+                continue
+            source_pallet_id = int(source_pallet_id)
+            if source_pallet_id in seen:
+                continue
+            if source_pallet_id in blocked_source_pallet_ids:
+                continue
+            seen.add(source_pallet_id)
+            rows.append(
+                (
+                    0 if source_pallet_id == int(job.source_pallet_id) else 1,
+                    abs(robot.x - source_xy[0]) + abs(robot.y - source_xy[1]),
+                    abs(hx - source_xy[0]) + abs(hy - source_xy[1]),
+                    source_pallet_id,
+                    (int(source_xy[0]), int(source_xy[1])),
+                )
             )
-            job.target_xy = new_xy
-            return True
+
+        rows.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
+        capped = rows[: max(1, int(limit))]
+        return [(source_pallet_id, source_xy) for _, _, _, source_pallet_id, source_xy in capped]
+
+    def _plan_setup_pallet_for_robot(self, robot: RobotState, job: SetupJob) -> bool:
+        source_candidates = self._setup_source_candidates_for_job(robot, job)
+        if not source_candidates:
+            self._log(
+                "setup_attempt_fail "
+                f"robot={robot.id} sku={job.sku} hotspot={job.hotspot} "
+                f"reason=missing_source_pallet source_pallet_id={job.source_pallet_id}"
+            )
+            return False
+
+        total_stands_tried = 0
+        stand_failures = 0
+        sources_tried = 0
+        failure_reasons: collections.Counter = collections.Counter()
+
+        for source_pallet_id, source_xy in source_candidates:
+            sources_tried += 1
+            source_xy = (int(source_xy[0]), int(source_xy[1]))
+            if source_xy == (int(job.target_xy[0]), int(job.target_xy[1])):
+                job.source_pallet_id = int(source_pallet_id)
+                job.source_xy = source_xy
+                return True
+
+            stand_cells = self._candidate_relocation_stand_cells(robot, source_xy)
+            if not stand_cells:
+                failure_reasons["no_stand_cells"] += 1
+                continue
+
+            target_cells = self._setup_target_candidates(job, source_xy)
+            if not target_cells:
+                target_blocked = job.target_xy in self.scheduler.pallets and job.target_xy != source_xy
+                self._log(
+                    "setup_attempt_fail "
+                    f"robot={robot.id} sku={job.sku} hotspot={job.hotspot} "
+                    f"source={source_xy} target={job.target_xy} "
+                    f"reason=no_target_cells target_blocked={target_blocked}"
+                )
+                return False
+
+            for stand_xy in stand_cells:
+                total_stands_tried += 1
+                stand_attempt_reasons: collections.Counter = collections.Counter()
+                outcome = self._attempt_relocation_via_stand(
+                    robot=robot,
+                    pallet_xy=source_xy,
+                    pallet_id=source_pallet_id,
+                    stand_xy=stand_xy,
+                    target_pallet_cells=target_cells,
+                    setup_redock_edge_step=self._setup_inward_step(job.hotspot),
+                    debug_reasons=stand_attempt_reasons,
+                )
+                if outcome is None:
+                    stand_failures += 1
+                    failure_reasons.update(stand_attempt_reasons)
+                    continue
+                new_xy, dock_t, undock_t = outcome
+                self._finalize_relocation_pallet_state(
+                    pallet_id=source_pallet_id,
+                    old_xy=source_xy,
+                    new_xy=new_xy,
+                    dock_t=dock_t,
+                    undock_t=undock_t,
+                )
+                old_source_pallet_id = int(job.source_pallet_id)
+                if int(source_pallet_id) != old_source_pallet_id:
+                    self._log(
+                        "setup_source_swap "
+                        f"hotspot={job.hotspot} sku={job.sku} "
+                        f"old_source_pallet_id={old_source_pallet_id} new_source_pallet_id={source_pallet_id}"
+                    )
+                    self._setup_job_by_source_pallet_id.pop(old_source_pallet_id, None)
+                    self._rebind_setup_source_pallet_id(
+                        job=job,
+                        old_source_pallet_id=old_source_pallet_id,
+                        new_source_pallet_id=int(source_pallet_id),
+                    )
+                job.source_pallet_id = int(source_pallet_id)
+                job.source_xy = source_xy
+                job.target_xy = new_xy
+                self._setup_job_by_source_pallet_id[int(source_pallet_id)] = job
+                return True
+
+        self._log(
+            "setup_attempt_fail "
+            f"robot={robot.id} sku={job.sku} hotspot={job.hotspot} "
+            f"source={job.source_xy} target={job.target_xy} "
+            f"reason=no_feasible_stand_path sources_tried={sources_tried} "
+            f"stands_tried={total_stands_tried} stand_failures={stand_failures} "
+            f"failure_reasons={self._format_reason_counts(failure_reasons)}"
+        )
         return False
 
     def _select_relocation_source_pallet(
@@ -1893,7 +2223,12 @@ class WarehouseSolver:
         stand_xy: Tuple[int, int],
         target_pallet_cells: List[Tuple[int, int]],
         setup_redock_edge_step: int | None = None,
+        debug_reasons: collections.Counter | None = None,
     ) -> Tuple[Tuple[int, int], int, int] | None:
+        def note(reason: str) -> None:
+            if debug_reasons is not None:
+                debug_reasons[reason] += 1
+
         stand_x, stand_y = stand_xy
         temp_robot = self._clone_robot_state(robot)
         pending_actions: List[Tuple[int, int, str, int, int]] = []
@@ -1903,6 +2238,7 @@ class WarehouseSolver:
 
         path_to_stand = self._safe_plan_path(temp_robot, stand_x, stand_y)
         if not path_to_stand and (temp_robot.x != stand_x or temp_robot.y != stand_y):
+            note("no_path_to_stand")
             return None
         if path_to_stand:
             pending_paths.append((self._clone_robot_state(temp_robot), path_to_stand))
@@ -1911,10 +2247,12 @@ class WarehouseSolver:
         dx = pallet_xy[0] - temp_robot.x
         dy = pallet_xy[1] - temp_robot.y
         if abs(dx) + abs(dy) != 1:
+            note("stand_not_adjacent_to_source")
             return None
 
         dock_t = temp_robot.last_t + 1
         if not self.planner.can_occupy(temp_robot, dock_t, temp_robot.x, temp_robot.y):
+            note("dock_footprint_blocked")
             return None
         pending_actions.append((dock_t, temp_robot.id, "dock", pallet_xy[0], pallet_xy[1]))
         pending_footprints.append((self._clone_robot_state(temp_robot), dock_t, temp_robot.x, temp_robot.y))
@@ -1924,6 +2262,7 @@ class WarehouseSolver:
         chosen_target: Tuple[int, int, List[Tuple[int, int, int]], int] | None = None
         for tx, ty in target_pallet_cells:
             if (tx, ty) in self.scheduler.pallets and (tx, ty) != pallet_xy:
+                note("target_cell_occupied")
                 continue
 
             candidate_robot = self._clone_robot_state(temp_robot)
@@ -1959,11 +2298,14 @@ class WarehouseSolver:
                             pull_pallet_x = staged_pallet_xy[0] + move_dx
                             pull_pallet_y = staged_pallet_xy[1] + move_dy
                             if not (0 <= pull_robot_x < self.state.width and 0 <= pull_robot_y < self.state.height):
+                                note("redock_pull_robot_oob")
                                 continue
                             if not (0 <= pull_pallet_x < self.state.width and 0 <= pull_pallet_y < self.state.height):
+                                note("redock_pull_pallet_oob")
                                 continue
                             pulled_xy = (pull_pallet_x, pull_pallet_y)
                             if pulled_xy in self.scheduler.pallets and pulled_xy != staged_pallet_xy:
+                                note("redock_pull_target_blocked")
                                 continue
 
                             pull_path = self._safe_plan_path_with_step_cap(
@@ -1973,6 +2315,7 @@ class WarehouseSolver:
                                 max_path_steps=1,
                             )
                             if not pull_path and (staged_robot.x != pull_robot_x or staged_robot.y != pull_robot_y):
+                                note("redock_pull_path_fail")
                                 continue
                             if pull_path:
                                 staged_paths.append((self._clone_robot_state(staged_robot), pull_path))
@@ -1985,10 +2328,12 @@ class WarehouseSolver:
                             break
 
                     if not staged_ok:
+                        note("redock_pull_step_failed")
                         continue
 
                     undock_pull_t = staged_robot.last_t + 1
                     if not self.planner.can_occupy(staged_robot, undock_pull_t, staged_robot.x, staged_robot.y):
+                        note("redock_undock_blocked")
                         continue
                     staged_actions.append(
                         (undock_pull_t, staged_robot.id, "undock", staged_pallet_xy[0], staged_pallet_xy[1])
@@ -2001,18 +2346,21 @@ class WarehouseSolver:
 
                     edge_side_xy = (staged_pallet_xy[0], staged_pallet_xy[1] + setup_redock_edge_step)
                     if not (0 <= edge_side_xy[0] < self.state.width and 0 <= edge_side_xy[1] < self.state.height):
+                        note("redock_edge_side_oob")
                         continue
                     reposition_path = self._safe_plan_path_with_step_cap(
                         staged_robot,
                         edge_side_xy[0],
                         edge_side_xy[1],
-                        max_path_steps=3,
+                        max_path_steps=8,
                     )
                     if not reposition_path and (staged_robot.x != edge_side_xy[0] or staged_robot.y != edge_side_xy[1]):
+                        note("redock_edge_reposition_fail")
                         continue
                     # During this brief undocked phase, the pallet is effectively static at staged_pallet_xy.
                     # Reject staging paths that would step through that pallet cell.
                     if any((px, py) == staged_pallet_xy for _, px, py in reposition_path):
+                        note("redock_reposition_crosses_staged_pallet")
                         continue
                     if reposition_path:
                         staged_paths.append((self._clone_robot_state(staged_robot), reposition_path))
@@ -2021,10 +2369,12 @@ class WarehouseSolver:
                     redock_dx = staged_pallet_xy[0] - staged_robot.x
                     redock_dy = staged_pallet_xy[1] - staged_robot.y
                     if abs(redock_dx) + abs(redock_dy) != 1:
+                        note("redock_not_adjacent")
                         continue
 
                     redock_t = staged_robot.last_t + 1
                     if not self.planner.can_occupy(staged_robot, redock_t, staged_robot.x, staged_robot.y):
+                        note("redock_footprint_blocked")
                         continue
                     staged_actions.append((redock_t, staged_robot.id, "dock", staged_pallet_xy[0], staged_pallet_xy[1]))
                     staged_footprints.append(
@@ -2044,25 +2394,30 @@ class WarehouseSolver:
                     break
 
                 if not redock_done:
+                    note("redock_not_possible")
                     continue
 
             target_robot_x = tx - candidate_offset[0]
             target_robot_y = ty - candidate_offset[1]
             if not (0 <= target_robot_x < self.state.width and 0 <= target_robot_y < self.state.height):
+                note("carry_target_robot_oob")
                 continue
             if (target_robot_x, target_robot_y) in self.scheduler.pallets and (
                 target_robot_x, target_robot_y
             ) != candidate_pallet_xy:
+                note("carry_target_robot_blocked")
                 continue
 
             carry_path = self._safe_plan_path(candidate_robot, target_robot_x, target_robot_y)
             if not carry_path and (candidate_robot.x != target_robot_x or candidate_robot.y != target_robot_y):
+                note("carry_path_fail")
                 continue
 
             candidate_arrival_t = carry_path[-1][0] if carry_path else candidate_robot.last_t
             candidate_undock_t = candidate_arrival_t + 1
             candidate_static_from_t = candidate_undock_t + 1
             if not self.planner.can_add_static_obstacle_from(candidate_static_from_t, tx, ty):
+                note("carry_static_obstacle_conflict")
                 continue
 
             pending_paths.extend(candidate_paths)
@@ -2074,6 +2429,7 @@ class WarehouseSolver:
             break
 
         if chosen_target is None:
+            note("no_target_candidate_after_stand")
             return None
 
         target_pallet_x, target_pallet_y, carry_path, _ = chosen_target
@@ -2083,6 +2439,7 @@ class WarehouseSolver:
 
         undock_t = temp_robot.last_t + 1
         if not self.planner.can_occupy(temp_robot, undock_t, temp_robot.x, temp_robot.y):
+            note("final_undock_blocked")
             return None
         pending_actions.append((undock_t, temp_robot.id, "undock", target_pallet_x, target_pallet_y))
         pending_footprints.append((self._clone_robot_state(temp_robot), undock_t, temp_robot.x, temp_robot.y))
@@ -2091,6 +2448,7 @@ class WarehouseSolver:
 
         pending_static_additions.append((undock_t + 1, target_pallet_x, target_pallet_y))
         if not self._can_commit_pending_actions(pending_actions):
+            note("candidate_validation_rejected")
             return None
         self._commit_plan(
             robot=robot,

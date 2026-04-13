@@ -280,8 +280,13 @@ class SolverMetadataPolicyTests(unittest.TestCase):
             SimpleNamespace(id=1, x=5, y=5, last_t=0),
             SimpleNamespace(id=2, x=9, y=9, last_t=0),
         ]
-        solver.setup_jobs = [object()]
+        solver.setup_jobs = [
+            SetupJob(sku=1, hotspot=(10, 5), source_pallet_id=70, source_xy=(3, 3), target_xy=(10, 5)),
+            SetupJob(sku=2, hotspot=(10, 15), source_pallet_id=71, source_xy=(4, 4), target_xy=(10, 15)),
+        ]
         solver._completed_setup_pallet_ids = set()
+        solver._dropped_setup_pallet_ids = set()
+        solver._setup_robot_by_hotspot = {(10, 5): 0, (10, 15): 1}
         solver._setup_robot_ids = {0, 1}
 
         suggestion = SimpleNamespace(center=(8, 8))
@@ -289,6 +294,32 @@ class SolverMetadataPolicyTests(unittest.TestCase):
 
         self.assertEqual(len(ranked), 1)
         self.assertEqual(ranked[0].id, 2)
+
+    def test_non_setup_suggestions_release_robot_when_hotspot_done(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)
+        solver.robots = [
+            SimpleNamespace(id=0, x=0, y=0, last_t=0),
+            SimpleNamespace(id=1, x=5, y=5, last_t=0),
+            SimpleNamespace(id=2, x=9, y=9, last_t=0),
+        ]
+        solver.setup_jobs = [
+            SetupJob(sku=1, hotspot=(10, 5), source_pallet_id=70, source_xy=(3, 3), target_xy=(10, 5)),
+            SetupJob(sku=2, hotspot=(10, 15), source_pallet_id=71, source_xy=(4, 4), target_xy=(10, 15)),
+        ]
+        # Robot 0 has finished its hotspot's setup work; robot 1 still has pending setup.
+        solver._completed_setup_pallet_ids = {70}
+        solver._dropped_setup_pallet_ids = set()
+        solver._setup_robot_by_hotspot = {(10, 5): 0, (10, 15): 1}
+        solver._setup_robot_ids = {0, 1}
+
+        suggestion = SimpleNamespace(center=(8, 8))
+        ranked = solver._candidate_robots_for_suggestion(suggestion)
+        ranked_ids = {r.id for r in ranked}
+
+        self.assertIn(0, ranked_ids)
+        self.assertIn(2, ranked_ids)
+        self.assertNotIn(1, ranked_ids)
 
     def test_iter_sku_anchor_rows_groups_counts_by_chunk(self) -> None:
         solver = self._new_solver_shell()
