@@ -166,6 +166,11 @@ class RunConfig:
     max_robots_per_suggestion: int = 3
     robot_fail_streak_for_parking: int = 3
     parking_candidate_limit: int = 96
+    enable_order_cluster_discovery: bool = False
+    recalculate_order_suggestions: bool = False
+    order_pick_local_manhattan_radius: int = 10
+    order_other_hotspot_penalty: float = 0.0
+    order_other_hotspot_penalty_radius: int = 6
     lns_enabled: bool = True
     lns_iterations: int = 60
     lns_window_actions: int = 28
@@ -384,6 +389,44 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.parking_candidate_limit",
         minimum=1,
     )
+    raw_enable_order_cluster_discovery = solver_section.get(
+        "enable_order_cluster_discovery",
+        run_config.enable_order_cluster_discovery,
+    )
+    if not isinstance(raw_enable_order_cluster_discovery, bool):
+        raise ValueError("solver.enable_order_cluster_discovery must be a boolean.")
+    run_config.enable_order_cluster_discovery = raw_enable_order_cluster_discovery
+    raw_recalculate_order_suggestions = solver_section.get(
+        "recalculate_order_suggestions",
+        run_config.recalculate_order_suggestions,
+    )
+    if not isinstance(raw_recalculate_order_suggestions, bool):
+        raise ValueError("solver.recalculate_order_suggestions must be a boolean.")
+    run_config.recalculate_order_suggestions = raw_recalculate_order_suggestions
+    run_config.order_pick_local_manhattan_radius = _require_int(
+        solver_section.get(
+            "order_pick_local_manhattan_radius",
+            run_config.order_pick_local_manhattan_radius,
+        ),
+        "solver.order_pick_local_manhattan_radius",
+        minimum=0,
+    )
+    run_config.order_other_hotspot_penalty = _require_number(
+        solver_section.get(
+            "order_other_hotspot_penalty",
+            run_config.order_other_hotspot_penalty,
+        ),
+        "solver.order_other_hotspot_penalty",
+        minimum=0.0,
+    )
+    run_config.order_other_hotspot_penalty_radius = _require_int(
+        solver_section.get(
+            "order_other_hotspot_penalty_radius",
+            run_config.order_other_hotspot_penalty_radius,
+        ),
+        "solver.order_other_hotspot_penalty_radius",
+        minimum=0,
+    )
 
     limits_section = _get_table(data, "limits")
     raw_max_makespan = limits_section.get("max_makespan", run_config.max_makespan)
@@ -474,6 +517,11 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             max_robots_per_suggestion=run_config.max_robots_per_suggestion,
             robot_fail_streak_for_parking=run_config.robot_fail_streak_for_parking,
             parking_candidate_limit=run_config.parking_candidate_limit,
+            enable_order_cluster_discovery=run_config.enable_order_cluster_discovery,
+            recalculate_order_suggestions=run_config.recalculate_order_suggestions,
+            order_pick_local_manhattan_radius=run_config.order_pick_local_manhattan_radius,
+            order_other_hotspot_penalty=run_config.order_other_hotspot_penalty,
+            order_other_hotspot_penalty_radius=run_config.order_other_hotspot_penalty_radius,
             worklist_path=Path(run_config.input_path),
             lns_enabled=run_config.lns_enabled,
             lns_iterations=run_config.lns_iterations,

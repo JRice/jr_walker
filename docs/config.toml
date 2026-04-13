@@ -66,6 +66,16 @@ setup_mini_box_radius = 2
 robot_fail_streak_for_parking = 3
 # Max low-use parking targets scanned per parking attempt.
 parking_candidate_limit = 96
+# Legacy cluster discovery for OrderSuggestions (disable for hotspot-sticky dispatch).
+enable_order_cluster_discovery = false
+# If true, rebuild/re-score pending order suggestions during dispatch.
+recalculate_order_suggestions = false
+# Local hotspot-seeded BFS radius; if no candidate within this Manhattan radius, fallback to global.
+order_pick_local_manhattan_radius = 10
+# Penalty weight for picks too close to non-assigned hotspots (0 disables).
+order_other_hotspot_penalty = 0.0
+# Manhattan radius considered "too close" for non-assigned hotspots.
+order_other_hotspot_penalty_radius = 6
 
 [lns]
 enabled = true

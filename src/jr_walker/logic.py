@@ -146,15 +146,24 @@ class SetupSuggestion(Suggestion):
 
 
 class OrderSuggestion(Suggestion):
-    def __init__(self, order_idx, order, cluster, order_gain_constant, warehouse_width, warehouse_height, scheduler):
+    def __init__(
+        self,
+        order_idx,
+        order,
+        cluster,
+        order_gain_constant,
+        warehouse_width,
+        warehouse_height,
+        scheduler,
+    ):
         self.order_idx = order_idx
         self.order = order
-        self.cluster = cluster
+        self.cluster = dict(cluster) if cluster else {}
         self.preferred_pallet_cells_by_sku: Dict[int, List[Tuple[int, int]]] = {}
         for sku in order.keys():
             sku_i = int(sku)
             preferred: List[Tuple[int, int]] = []
-            cluster_xy = cluster.get(sku_i)
+            cluster_xy = self.cluster.get(sku_i)
             if cluster_xy is not None:
                 preferred.append((int(cluster_xy[0]), int(cluster_xy[1])))
             self.preferred_pallet_cells_by_sku[sku_i] = preferred
@@ -185,6 +194,9 @@ class OrderSuggestion(Suggestion):
     @property
     def expected_cost(self) -> float:
         if self._cost < 0:
+            if not self.cluster:
+                self._cost = 0.0
+                return self._cost
             xs = [pos[0] for pos in self.cluster.values()]
             ys = [pos[1] for pos in self.cluster.values()]
             span_x = max(xs) - min(xs)
@@ -201,6 +213,9 @@ class OrderSuggestion(Suggestion):
     @property
     def center(self) -> Tuple[int, int]:
         if self._center == (-1, -1):
+            if not self.cluster:
+                self._center = (0, 0)
+                return self._center
             xs = [pos[0] for pos in self.cluster.values()]
             ys = [pos[1] for pos in self.cluster.values()]
             span_x = max(xs) - min(xs)

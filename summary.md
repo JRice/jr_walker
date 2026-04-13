@@ -66,19 +66,26 @@
 - Greedy suggestion dispatcher:
   - Builds setup + optional relocation + dock + order suggestions.
   - Sort key is mostly `gain - cost` with hard priority for setup suggestions.
-  - Retries failed suggestions with exponential backoff and drop limit.
+  - Retries failed non-setup suggestions with exponential backoff and drop limit.
+  - Retries failed setup suggestions by waiting `setup_retry_wait_ticks` (makespan-time gate), then drops at retry limit.
   - Per-robot fail streak can trigger parking moves to reduce blocking.
+  - If a DockSuggestion throws `ValueError("Cannot reserve footprint for robot=...")`, it is skipped (fail-soft) instead of failing the run.
 
 ### 5.2 Setup strategy (recently evolved)
 - Preplanned hotspot-oriented setup jobs:
-  - Targets produced by `_setup_slot_candidates` using a two-wide growth pattern:
-    - `(x, y)`, `(x+1, y)`, then next row toward nearest edge.
+  - Edge-anchored two-line template:
+    - odd SKUs on the edge line from hotspot in ascending order,
+    - even SKUs on the line two cells inward, also ascending.
 - Same-column frontier gating:
   - A setup job only runs when all earlier slot jobs for that hotspot are completed/dropped.
 - Dedicated setup robot by hotspot:
   - `_assign_setup_robots_by_hotspot` maps one robot per hotspot when possible.
+- Locality-biased source reservation:
+  - nearest source pallet per hotspot/SKU is biased to pallets "owned" by that hotspot region, reducing cross-hotspot source stealing.
 - Reachability-first fallback ranking:
   - `_setup_probe_robot_for_job` probes path feasibility to stand cells and prioritizes reachable robots.
+- Foreign-corridor stand avoidance:
+  - setup stand cells are prioritized away from other hotspots' active setup corridors while they still have pending setup jobs.
 - Reorientation for tight setup moves:
   - In `_attempt_relocation_via_stand`, setup jobs can do pull -> undock -> edge-side reposition -> redock before final carry.
   - Includes limited pull-round retries for blocked micro-moves.
@@ -88,6 +95,10 @@
   - Picks an anchor SKU (rarest first), greedily picks nearest pallets for other SKUs, scores by bounding-box perimeter.
 - `OrderSuggestion`:
   - Uses fixed gain constant and a cheap cost estimate from cluster span + edge distance.
+  - Carries preferred per-SKU pallet cells from the computed cluster.
+- Pick execution policy:
+  - try suggestion-provided preferred pallet cells first,
+  - if not feasible, fall back to nearest-available pick options (previous behavior).
 - `EdgeAwareOrderScorer` exists for richer detour-aware estimation but current dispatch queue mainly uses `OrderSuggestion` scoring.
 
 ### 5.4 Dock strategy
@@ -163,6 +174,7 @@
   - `solver.suggestion_retry_limit`
   - `solver.suggestion_backoff_base_cycles`
   - `solver.suggestion_backoff_max_cycles`
+  - `solver.setup_retry_wait_ticks` (setup-only retry wait gate)
 - Validation overhead:
   - `solver.ticks_to_full_validation` (periodic full replay interval)
 - LNS budget:
@@ -186,7 +198,7 @@
   - `relocation.relocate_chunk_size`
 - Failure handling behavior:
   - parking thresholds (`robot_fail_streak_for_parking`, `parking_candidate_limit`)
-  - setup retry/drop policy (prevents stalls but can leave coverage holes).
+  - setup retry wait (`setup_retry_wait_ticks`) + retry limit.
 
 ## 9) Current observability quality
 - Strong logging exists in solver:
@@ -195,10 +207,15 @@
   - A* slow/blocked summaries,
   - periodic validation checkpoints,
   - dispatch progress with runtime.
+- New useful setup/debug logs:
+  - `setup_suggestion_rejected` with robot/hotspot/source/target and detailed rejection reason.
+  - `setup_stand_corridor_penalty` showing when foreign-corridor stand penalties applied.
+  - `setup_source_reservations` and per-hotspot `cross_hotspot_sources`.
+  - crash context now includes `Active suggestion at failure: ...` in `main.py`.
 - Good foundation for debugging setup gaps:
   - failure reason counters are already emitted (`setup_attempt_fail ... failure_reasons=...`).
-- Biggest remaining visibility gap:
-  - no concise end-of-run histogram that aggregates setup failure reasons by hotspot/robot/source.
+- Remaining gap:
+  - still no concise end-of-run histogram that aggregates setup failure reasons by hotspot/robot/source.
 
 ## 10) Tests and what they protect
 - `tests/test_solver_metadata_policy.py`
@@ -238,4 +255,3 @@ Coverage is targeted around high-risk policy logic and validation invariants, no
 - Consolidate pallet-state update paths into one authoritative helper to reduce desync risk.
 - Decide on one primary order-cost model (simple cluster vs edge-aware scorer) and wire it consistently.
 - Add a run-end setup diagnostics block (per-hotspot completions, drops, fail reasons, average A* cost per setup move).
-

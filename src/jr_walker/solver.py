@@ -156,6 +156,11 @@ class SolverConfig:
     max_robots_per_suggestion: int = 3
     robot_fail_streak_for_parking: int = 3
     parking_candidate_limit: int = 96
+    enable_order_cluster_discovery: bool = False
+    recalculate_order_suggestions: bool = False
+    order_pick_local_manhattan_radius: int = 10
+    order_other_hotspot_penalty: float = 0.0
+    order_other_hotspot_penalty_radius: int = 6
 
 
 def _select_best_non_test_run_id(conn: sqlite3.Connection) -> int | None:
@@ -356,6 +361,7 @@ class WarehouseSolver:
         self.setup_jobs: List[SetupJob] = self._build_setup_jobs()
         self._setup_robot_by_hotspot: Dict[Tuple[int, int], int] = self._assign_setup_robots_by_hotspot()
         self._setup_robot_ids: set[int] = set(self._setup_robot_by_hotspot.values())
+        self._robot_hotspot_by_id: Dict[int, Tuple[int, int]] = self._assign_persistent_robot_hotspots()
         self._completed_setup_pallet_ids: set[int] = set()
         self._dropped_setup_pallet_ids: set[int] = set()
         self._setup_job_by_source_pallet_id: Dict[int, SetupJob] = {
@@ -420,6 +426,56 @@ class WarehouseSolver:
             mapping[(hx, hy)] = best.id
             available.remove(best)
         return mapping
+
+    def _assign_persistent_robot_hotspots(self) -> Dict[int, Tuple[int, int]]:
+        hotspots = self._normalize_setup_hotspots()
+        if not hotspots:
+            hotspots = [
+                (int(hx), int(hy))
+                for hx, hy in FULFILL_HOT_SPOTS
+                if 0 <= int(hx) < self.state.width and 0 <= int(hy) < self.state.height
+            ]
+        if not hotspots:
+            hotspots = [(int(r.x), int(r.y)) for r in self.robots]
+
+        mapping: Dict[int, Tuple[int, int]] = {}
+        usage: collections.Counter = collections.Counter()
+        setup_robot_by_hotspot = getattr(self, "_setup_robot_by_hotspot", {})
+        for hotspot, robot_id in setup_robot_by_hotspot.items():
+            hotspot_key = (int(hotspot[0]), int(hotspot[1]))
+            mapping[int(robot_id)] = hotspot_key
+            usage[hotspot_key] += 1
+
+        for robot in self.robots:
+            rid = int(robot.id)
+            if rid in mapping:
+                continue
+            chosen = min(
+                hotspots,
+                key=lambda hs: (
+                    usage[(int(hs[0]), int(hs[1]))],
+                    abs(int(robot.x) - int(hs[0])) + abs(int(robot.y) - int(hs[1])),
+                    int(hs[1]),
+                    int(hs[0]),
+                ),
+            )
+            hotspot_key = (int(chosen[0]), int(chosen[1]))
+            mapping[rid] = hotspot_key
+            usage[hotspot_key] += 1
+
+        for robot in self.robots:
+            robot.assigned_hotspot = mapping[int(robot.id)]
+        return mapping
+
+    def _robot_assigned_hotspot(self, robot: RobotState) -> Tuple[int, int]:
+        assigned = getattr(robot, "assigned_hotspot", None)
+        if isinstance(assigned, (tuple, list)) and len(assigned) == 2:
+            return (int(assigned[0]), int(assigned[1]))
+        by_id = getattr(self, "_robot_hotspot_by_id", {})
+        assigned = by_id.get(int(robot.id))
+        if assigned is not None:
+            return (int(assigned[0]), int(assigned[1]))
+        return (int(robot.x), int(robot.y))
 
     def _build_setup_frontier_maps(
         self,
@@ -848,12 +904,12 @@ class WarehouseSolver:
                             suggestion.job.hotspot,
                             reason=f"done_pid_{suggestion.job.source_pallet_id}",
                         )
-                        # Re-score pending order suggestions immediately after each
-                        # setup placement so robots can exploit newly moved pallets.
-                        suggestion_queue = self._refresh_pending_order_suggestions(
-                            suggestion_queue,
-                            completed_orders,
-                        )
+                        if bool(getattr(self.config, "recalculate_order_suggestions", False)):
+                            # Optional legacy behavior: re-score order suggestions after each setup move.
+                            suggestion_queue = self._refresh_pending_order_suggestions(
+                                suggestion_queue,
+                                completed_orders,
+                            )
                     else:
                         reject_detail = self._consume_setup_reject(robot.id)
                         assigned_robot_id = self._setup_robot_by_hotspot.get(
@@ -879,12 +935,12 @@ class WarehouseSolver:
                             f"relocation_done sku={suggestion.job.sku} bucket={suggestion.job.bucket} "
                             f"target={suggestion.job.preferred_target_xy} score={suggestion.job.score:.3f}"
                         )
-                        # Re-score pending delivery/order suggestions against the new pallet layout.
-                        # Keep existing non-order suggestions (relocate/dock) as-is.
-                        suggestion_queue = self._refresh_pending_order_suggestions(
-                            suggestion_queue,
-                            completed_orders,
-                        )
+                        if bool(getattr(self.config, "recalculate_order_suggestions", False)):
+                            # Optional legacy behavior: re-score order suggestions after relocation moves.
+                            suggestion_queue = self._refresh_pending_order_suggestions(
+                                suggestion_queue,
+                                completed_orders,
+                            )
                 elif isinstance(suggestion, DockSuggestion):
                     try:
                         handled = self._plan_dock_pallet(robot, suggestion.sku)
@@ -1604,10 +1660,26 @@ class WarehouseSolver:
         if not order_indexes:
             return suggestions
 
-        # Use current scheduler pallet positions (includes relocations).
+        cluster_enabled = bool(getattr(self.config, "enable_order_cluster_discovery", False))
+        if not cluster_enabled:
+            for order_idx in order_indexes:
+                order = self.orders[order_idx]
+                suggestions.append(
+                    OrderSuggestion(
+                        order_idx=order_idx,
+                        order=order.items,
+                        cluster={},
+                        order_gain_constant=self.config.order_suggestion_gain_constant,
+                        warehouse_width=self.state.width,
+                        warehouse_height=self.state.height,
+                        scheduler=self.scheduler,
+                    )
+                )
+            return suggestions
+
+        # Legacy mode: score orders by discovered tightest clusters.
         optimizer = OrderOptimizer(self.scheduler.pallets)
         scored_orders: List[Tuple[int, int, dict]] = []
-
         for order_idx in order_indexes:
             order = self.orders[order_idx]
             unique_skus = list(order.items.keys())
@@ -1797,7 +1869,12 @@ class WarehouseSolver:
             f"stagnation_limit={self.config.order_stagnation_cycle_limit} "
             f"realistic_fail_mode={self.config.realistic_fail_mode} "
             f"robots_per_suggestion={self.config.max_robots_per_suggestion} "
-            f"parking_fail_streak={self.config.robot_fail_streak_for_parking}"
+            f"parking_fail_streak={self.config.robot_fail_streak_for_parking} "
+            f"order_cluster_discovery={getattr(self.config, 'enable_order_cluster_discovery', False)} "
+            f"recalculate_orders={getattr(self.config, 'recalculate_order_suggestions', False)} "
+            f"order_local_radius={getattr(self.config, 'order_pick_local_manhattan_radius', 10)} "
+            f"other_hotspot_penalty={getattr(self.config, 'order_other_hotspot_penalty', 0.0)} "
+            f"other_hotspot_penalty_radius={getattr(self.config, 'order_other_hotspot_penalty_radius', 6)}"
         )
         self._log(f"relocate_suggestions_enabled={self.config.enable_relocation_suggestions}")
         if self.relocation_plan:
@@ -2291,14 +2368,20 @@ class WarehouseSolver:
         if non_setup_robots:
             robot_pool = non_setup_robots
 
-        ranked = sorted(
-            robot_pool,
-            key=lambda r: (
-                r.last_t,
-                abs(r.x - center[0]) + abs(r.y - center[1]),
-                r.id,
-            ),
-        )
+        if isinstance(suggestion, OrderSuggestion):
+            ranked = sorted(
+                robot_pool,
+                key=lambda r: (r.last_t, r.id),
+            )
+        else:
+            ranked = sorted(
+                robot_pool,
+                key=lambda r: (
+                    r.last_t,
+                    abs(r.x - center[0]) + abs(r.y - center[1]),
+                    r.id,
+                ),
+            )
         limit = max(1, min(int(self.config.max_robots_per_suggestion), len(ranked)))
         return ranked[:limit]
 
@@ -2502,6 +2585,113 @@ class WarehouseSolver:
         )
         return cells[: max(1, int(limit))]
 
+    def _clamp_in_bounds(self, cell: Tuple[int, int]) -> Tuple[int, int]:
+        x = min(max(0, int(cell[0])), self.state.width - 1)
+        y = min(max(0, int(cell[1])), self.state.height - 1)
+        return (x, y)
+
+    def _other_hotspot_proximity_penalty(
+        self,
+        pick_xy: Tuple[int, int],
+        assigned_hotspot: Tuple[int, int],
+    ) -> float:
+        weight = float(getattr(self.config, "order_other_hotspot_penalty", 0.0))
+        if weight <= 0:
+            return 0.0
+        radius = max(0, int(getattr(self.config, "order_other_hotspot_penalty_radius", 6)))
+        if radius <= 0:
+            return 0.0
+
+        hotspot_cells: List[Tuple[int, int]] = []
+        if hasattr(self.config, "setup_hotspots"):
+            hotspots = getattr(self, "_normalize_setup_hotspots", None)
+            if callable(hotspots):
+                hotspot_cells = self._normalize_setup_hotspots()
+        assigned = (int(assigned_hotspot[0]), int(assigned_hotspot[1]))
+        px, py = int(pick_xy[0]), int(pick_xy[1])
+        penalty = 0.0
+        for hotspot in hotspot_cells:
+            hs = (int(hotspot[0]), int(hotspot[1]))
+            if hs == assigned:
+                continue
+            dist = abs(px - hs[0]) + abs(py - hs[1])
+            if dist <= radius:
+                penalty += float(radius - dist + 1) * weight
+        return penalty
+
+    def _bfs_pick_candidates_for_remaining(
+        self,
+        *,
+        remaining: collections.Counter,
+        temp_robot: RobotState,
+        assigned_hotspot: Tuple[int, int],
+        max_manhattan_radius: int | None,
+    ) -> List[Tuple[int, Tuple[int, int], Tuple[int, int]]]:
+        needed_skus = {int(sku) for sku, qty in remaining.items() if int(qty) > 0}
+        if not needed_skus:
+            return []
+
+        start = self._clamp_in_bounds(assigned_hotspot)
+        queue: collections.deque[Tuple[int, int, int]] = collections.deque(
+            [(int(start[0]), int(start[1]), 0)]
+        )
+        visited: set[Tuple[int, int]] = {start}
+        seen_options: set[Tuple[int, Tuple[int, int], Tuple[int, int]]] = set()
+        ranked: List[Tuple[float, int, float, int, int, int, int, int, int, Tuple[int, int], Tuple[int, int]]] = []
+
+        while queue:
+            x, y, depth = queue.popleft()
+            if max_manhattan_radius is not None and depth > max_manhattan_radius:
+                continue
+
+            sku = self.scheduler.pallets.get((x, y))
+            if sku in needed_skus:
+                pallet_xy = (int(x), int(y))
+                for pick_cell_xy in self.scheduler.pick_cells_for_pallet(pallet_xy):
+                    pick_xy = (int(pick_cell_xy[0]), int(pick_cell_xy[1]))
+                    pick_dist = abs(start[0] - pick_xy[0]) + abs(start[1] - pick_xy[1])
+                    if max_manhattan_radius is not None and pick_dist > max_manhattan_radius:
+                        continue
+                    option = (int(sku), pallet_xy, pick_xy)
+                    if option in seen_options:
+                        continue
+                    seen_options.add(option)
+                    proximity_penalty = self._other_hotspot_proximity_penalty(
+                        pick_xy,
+                        assigned_hotspot=start,
+                    )
+                    robot_dist = abs(int(temp_robot.x) - pick_xy[0]) + abs(int(temp_robot.y) - pick_xy[1])
+                    qty_bias = -int(remaining.get(int(sku), 0))
+                    total_score = float(pick_dist) + proximity_penalty + (0.05 * float(robot_dist))
+                    ranked.append(
+                        (
+                            total_score,
+                            pick_dist,
+                            proximity_penalty,
+                            robot_dist,
+                            qty_bias,
+                            int(sku),
+                            pick_xy[1],
+                            pick_xy[0],
+                            depth,
+                            pallet_xy,
+                            pick_xy,
+                        )
+                    )
+
+            for nx, ny in adjacent_cells(self.state.width, self.state.height, x, y):
+                next_cell = (int(nx), int(ny))
+                if next_cell in visited:
+                    continue
+                next_depth = depth + 1
+                if max_manhattan_radius is not None and next_depth > max_manhattan_radius:
+                    continue
+                visited.add(next_cell)
+                queue.append((next_cell[0], next_cell[1], next_depth))
+
+        ranked.sort(key=lambda row: row[:9])
+        return [(sku, pallet_xy, pick_xy) for _, _, _, _, _, sku, _, _, _, pallet_xy, pick_xy in ranked]
+
     def _plan_order_for_robot(
         self,
         order_idx: int,
@@ -2511,6 +2701,8 @@ class WarehouseSolver:
     ) -> bool:
         temp_robot = self._clone_robot_state(robot)
         remaining = collections.Counter(order)
+        assigned_hotspot = self._robot_assigned_hotspot(robot)
+        local_radius = max(0, int(getattr(self.config, "order_pick_local_manhattan_radius", 10)))
         pending_actions: List[Tuple[int, int, str, int, int]] = []
         pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
         pending_footprints: List[Tuple[RobotState, int, int, int]] = []
@@ -2557,27 +2749,56 @@ class WarehouseSolver:
                     break
 
             if selected is None:
-                options = self.scheduler.candidate_pick_options(remaining, (temp_robot.x, temp_robot.y))
-                for _, sku, pallet_xy, pick_cell_xy in options:
+                local_candidates = self._bfs_pick_candidates_for_remaining(
+                    remaining=remaining,
+                    temp_robot=temp_robot,
+                    assigned_hotspot=assigned_hotspot,
+                    max_manhattan_radius=local_radius,
+                )
+                for sku, pallet_xy, pick_cell_xy in local_candidates:
                     target_x, target_y = pick_cell_xy
                     path = self._safe_plan_path(temp_robot, target_x, target_y)
+                    if not (path or (temp_robot.x == target_x and temp_robot.y == target_y)):
+                        continue
+                    pick_t = (path[-1][0] + 1) if path else (temp_robot.last_t + 1)
+                    if not self._is_pick_target_static_at_time(pallet_xy, pick_t):
+                        continue
+                    selected = (sku, pallet_xy, path, pick_t, "hotspot_bfs_local")
+                    break
 
-                    if path or (temp_robot.x == target_x and temp_robot.y == target_y):
-                        pick_t = (path[-1][0] + 1) if path else (temp_robot.last_t + 1)
-                        if not self._is_pick_target_static_at_time(pallet_xy, pick_t):
-                            continue
-                        selected = (sku, pallet_xy, path, pick_t, "fallback")
-                        break
+            if selected is None:
+                global_candidates = self._bfs_pick_candidates_for_remaining(
+                    remaining=remaining,
+                    temp_robot=temp_robot,
+                    assigned_hotspot=assigned_hotspot,
+                    max_manhattan_radius=None,
+                )
+                for sku, pallet_xy, pick_cell_xy in global_candidates:
+                    target_x, target_y = pick_cell_xy
+                    path = self._safe_plan_path(temp_robot, target_x, target_y)
+                    if not (path or (temp_robot.x == target_x and temp_robot.y == target_y)):
+                        continue
+                    pick_t = (path[-1][0] + 1) if path else (temp_robot.last_t + 1)
+                    if not self._is_pick_target_static_at_time(pallet_xy, pick_t):
+                        continue
+                    selected = (sku, pallet_xy, path, pick_t, "hotspot_bfs_global")
+                    break
 
             if selected is None:
                 return False
 
             sku, pallet_xy, path, pick_t, pick_source = selected
-            if pick_source == "fallback" and preferred_tried > 0:
+            if pick_source in {"hotspot_bfs_local", "hotspot_bfs_global"} and preferred_tried > 0:
                 self._log(
                     "order_pick_fallback_after_preferred "
                     f"order={order_idx} robot={robot.id} sku={sku} "
                     f"preferred_tried={preferred_tried} chosen={pallet_xy}"
+                )
+            if pick_source == "hotspot_bfs_global":
+                self._log(
+                    "order_pick_global_fallback "
+                    f"order={order_idx} robot={robot.id} sku={sku} "
+                    f"hotspot={assigned_hotspot} local_radius={local_radius} chosen={pallet_xy}"
                 )
 
             if path:

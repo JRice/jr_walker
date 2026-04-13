@@ -785,6 +785,58 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertEqual(len(picks), 1)
         self.assertEqual((picks[0][3], picks[0][4]), (2, 2))
 
+    def test_plan_order_bfs_falls_back_to_global_after_local_radius(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=12, height=12)
+        solver.config = SimpleNamespace(
+            order_pick_local_manhattan_radius=1,
+            order_other_hotspot_penalty=0.0,
+            order_other_hotspot_penalty_radius=6,
+            setup_hotspots=[(0, 0), (11, 11)],
+        )
+        robot = SimpleNamespace(
+            id=0,
+            x=0,
+            y=0,
+            last_t=0,
+            storage=collections.Counter(),
+            docks={},
+            assigned_hotspot=(0, 0),
+        )
+        solver.robots = [robot]
+        solver.scheduler = SimpleNamespace(
+            pallets={(8, 8): 7},
+            pick_cells_for_pallet=lambda xy: [(xy[0], xy[1] - 1)],
+        )
+        solver.planner = SimpleNamespace(can_occupy=lambda *_args, **_kwargs: True)
+        solver._safe_plan_path = lambda r, x, y: [(r.last_t + 1, x, y)] if (r.x != x or r.y != y) else []
+        solver._is_pick_target_static_at_time = lambda *_args, **_kwargs: True
+        solver._candidate_fulfill_cells = lambda **_kwargs: [(0, 0)]
+        solver._can_commit_pending_actions = lambda _actions: True
+        solver._log = lambda *_args, **_kwargs: None
+        captured: dict = {}
+        solver._commit_plan = lambda **kwargs: captured.update({"pending_actions": list(kwargs["pending_actions"])})
+
+        ok = solver._plan_order_for_robot(0, collections.Counter({7: 1}), robot)
+        self.assertTrue(ok)
+        picks = [a for a in captured["pending_actions"] if a[2] == "pick"]
+        self.assertEqual(len(picks), 1)
+        self.assertEqual((picks[0][3], picks[0][4]), (8, 8))
+
+    def test_other_hotspot_proximity_penalty_applies_near_other_hotspots(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=12, height=12)
+        solver.config = SimpleNamespace(
+            setup_hotspots=[(0, 0), (10, 10)],
+            order_other_hotspot_penalty=2.0,
+            order_other_hotspot_penalty_radius=5,
+        )
+
+        near_other = solver._other_hotspot_proximity_penalty((9, 9), assigned_hotspot=(0, 0))
+        far_from_other = solver._other_hotspot_proximity_penalty((3, 3), assigned_hotspot=(0, 0))
+        self.assertGreater(near_other, 0.0)
+        self.assertEqual(far_from_other, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
