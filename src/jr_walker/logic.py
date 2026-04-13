@@ -150,6 +150,14 @@ class OrderSuggestion(Suggestion):
         self.order_idx = order_idx
         self.order = order
         self.cluster = cluster
+        self.preferred_pallet_cells_by_sku: Dict[int, List[Tuple[int, int]]] = {}
+        for sku in order.keys():
+            sku_i = int(sku)
+            preferred: List[Tuple[int, int]] = []
+            cluster_xy = cluster.get(sku_i)
+            if cluster_xy is not None:
+                preferred.append((int(cluster_xy[0]), int(cluster_xy[1])))
+            self.preferred_pallet_cells_by_sku[sku_i] = preferred
         self._order_gain_constant = order_gain_constant
         self._width = warehouse_width
         self._height = warehouse_height

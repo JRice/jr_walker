@@ -767,7 +767,16 @@ class WarehouseSolver:
             candidate_robots = self._candidate_robots_for_suggestion(suggestion)
             for robot in candidate_robots:
                 if isinstance(suggestion, OrderSuggestion):
-                    handled = self._plan_order_for_robot(suggestion.order_idx, suggestion.order, robot)
+                    handled = self._plan_order_for_robot(
+                        suggestion.order_idx,
+                        suggestion.order,
+                        robot,
+                        preferred_pallet_cells_by_sku=getattr(
+                            suggestion,
+                            "preferred_pallet_cells_by_sku",
+                            None,
+                        ),
+                    )
                     if handled:
                         completed_orders.add(suggestion.order_idx)
                 elif isinstance(suggestion, SetupSuggestion):
@@ -2394,7 +2403,11 @@ class WarehouseSolver:
         return cells[: max(1, int(limit))]
 
     def _plan_order_for_robot(
-        self, order_idx: int, order: collections.Counter, robot: RobotState
+        self,
+        order_idx: int,
+        order: collections.Counter,
+        robot: RobotState,
+        preferred_pallet_cells_by_sku: Dict[int, List[Tuple[int, int]]] | None = None,
     ) -> bool:
         temp_robot = self._clone_robot_state(robot)
         remaining = collections.Counter(order)
@@ -2403,23 +2416,70 @@ class WarehouseSolver:
         pending_footprints: List[Tuple[RobotState, int, int, int]] = []
 
         while sum(remaining.values()) > 0:
-            options = self.scheduler.candidate_pick_options(remaining, (temp_robot.x, temp_robot.y))
             selected = None
-            for _, sku, pallet_xy, pick_cell_xy in options:
-                target_x, target_y = pick_cell_xy
-                path = self._safe_plan_path(temp_robot, target_x, target_y)
+            preferred_tried = 0
 
-                if path or (temp_robot.x == target_x and temp_robot.y == target_y):
+            if preferred_pallet_cells_by_sku:
+                preferred_options: List[Tuple[int, int, int, Tuple[int, int], Tuple[int, int]]] = []
+                seen_pref: set[Tuple[int, Tuple[int, int], Tuple[int, int]]] = set()
+                scheduler_pallets = getattr(self.scheduler, "pallets", {})
+                for sku in sorted(remaining.keys()):
+                    for pref_rank, pallet_xy in enumerate(preferred_pallet_cells_by_sku.get(int(sku), [])):
+                        pallet_xy = (int(pallet_xy[0]), int(pallet_xy[1]))
+                        if scheduler_pallets.get(pallet_xy) != int(sku):
+                            continue
+                        for pick_cell_xy in self.scheduler.pick_cells_for_pallet(pallet_xy):
+                            pick_cell_xy = (int(pick_cell_xy[0]), int(pick_cell_xy[1]))
+                            key = (int(sku), pallet_xy, pick_cell_xy)
+                            if key in seen_pref:
+                                continue
+                            seen_pref.add(key)
+                            preferred_options.append(
+                                (
+                                    abs(temp_robot.x - pick_cell_xy[0]) + abs(temp_robot.y - pick_cell_xy[1]),
+                                    pref_rank,
+                                    int(sku),
+                                    pallet_xy,
+                                    pick_cell_xy,
+                                )
+                            )
+                preferred_options.sort(key=lambda row: (row[0], row[1], row[2], row[4][1], row[4][0]))
+                for _, _, sku, pallet_xy, pick_cell_xy in preferred_options:
+                    preferred_tried += 1
+                    target_x, target_y = pick_cell_xy
+                    path = self._safe_plan_path(temp_robot, target_x, target_y)
+                    if not (path or (temp_robot.x == target_x and temp_robot.y == target_y)):
+                        continue
                     pick_t = (path[-1][0] + 1) if path else (temp_robot.last_t + 1)
                     if not self._is_pick_target_static_at_time(pallet_xy, pick_t):
                         continue
-                    selected = (sku, pallet_xy, path, pick_t)
+                    selected = (sku, pallet_xy, path, pick_t, "preferred")
                     break
+
+            if selected is None:
+                options = self.scheduler.candidate_pick_options(remaining, (temp_robot.x, temp_robot.y))
+                for _, sku, pallet_xy, pick_cell_xy in options:
+                    target_x, target_y = pick_cell_xy
+                    path = self._safe_plan_path(temp_robot, target_x, target_y)
+
+                    if path or (temp_robot.x == target_x and temp_robot.y == target_y):
+                        pick_t = (path[-1][0] + 1) if path else (temp_robot.last_t + 1)
+                        if not self._is_pick_target_static_at_time(pallet_xy, pick_t):
+                            continue
+                        selected = (sku, pallet_xy, path, pick_t, "fallback")
+                        break
 
             if selected is None:
                 return False
 
-            sku, pallet_xy, path, pick_t = selected
+            sku, pallet_xy, path, pick_t, pick_source = selected
+            if pick_source == "fallback" and preferred_tried > 0:
+                self._log(
+                    "order_pick_fallback_after_preferred "
+                    f"order={order_idx} robot={robot.id} sku={sku} "
+                    f"preferred_tried={preferred_tried} chosen={pallet_xy}"
+                )
+
             if path:
                 pending_paths.append((self._clone_robot_state(temp_robot), path))
             pending_actions.extend(self._apply_moves_to_robot(temp_robot, path))

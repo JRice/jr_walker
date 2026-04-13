@@ -652,6 +652,83 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertEqual(len(fulfills), 1)
         self.assertEqual((fulfills[0][3], fulfills[0][4]), (2, 0))
 
+    def test_plan_order_prefers_cluster_pallet_cell_first(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=12, height=12)
+        robot = SimpleNamespace(
+            id=0,
+            x=0,
+            y=0,
+            last_t=0,
+            storage=collections.Counter(),
+            docks={},
+        )
+        solver.robots = [robot]
+        solver.scheduler = SimpleNamespace(
+            pallets={(2, 2): 7, (9, 9): 7},
+            pick_cells_for_pallet=lambda xy: [(xy[0], max(0, xy[1] - 1))],
+            candidate_pick_options=lambda _remaining, _xy: [
+                (0, 7, (2, 2), (2, 1)),
+                (0, 7, (9, 9), (9, 8)),
+            ],
+        )
+        solver.planner = SimpleNamespace(can_occupy=lambda *_args, **_kwargs: True)
+        solver._safe_plan_path = lambda r, x, y: [(r.last_t + 1, x, y)] if (r.x != x or r.y != y) else []
+        solver._is_pick_target_static_at_time = lambda *_args, **_kwargs: True
+        solver._candidate_fulfill_cells = lambda **_kwargs: [(0, 0)]
+        solver._can_commit_pending_actions = lambda _actions: True
+        captured: dict = {}
+        solver._commit_plan = lambda **kwargs: captured.update({"pending_actions": list(kwargs["pending_actions"])})
+
+        ok = solver._plan_order_for_robot(
+            0,
+            collections.Counter({7: 1}),
+            robot,
+            preferred_pallet_cells_by_sku={7: [(9, 9)]},
+        )
+        self.assertTrue(ok)
+        picks = [a for a in captured["pending_actions"] if a[2] == "pick"]
+        self.assertEqual(len(picks), 1)
+        self.assertEqual((picks[0][3], picks[0][4]), (9, 9))
+
+    def test_plan_order_falls_back_when_preferred_unavailable(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=12, height=12)
+        robot = SimpleNamespace(
+            id=0,
+            x=0,
+            y=0,
+            last_t=0,
+            storage=collections.Counter(),
+            docks={},
+        )
+        solver.robots = [robot]
+        solver.scheduler = SimpleNamespace(
+            pallets={(2, 2): 7},
+            pick_cells_for_pallet=lambda xy: [(xy[0], max(0, xy[1] - 1))],
+            candidate_pick_options=lambda _remaining, _xy: [
+                (0, 7, (2, 2), (2, 1)),
+            ],
+        )
+        solver.planner = SimpleNamespace(can_occupy=lambda *_args, **_kwargs: True)
+        solver._safe_plan_path = lambda r, x, y: [(r.last_t + 1, x, y)] if (r.x != x or r.y != y) else []
+        solver._is_pick_target_static_at_time = lambda *_args, **_kwargs: True
+        solver._candidate_fulfill_cells = lambda **_kwargs: [(0, 0)]
+        solver._can_commit_pending_actions = lambda _actions: True
+        captured: dict = {}
+        solver._commit_plan = lambda **kwargs: captured.update({"pending_actions": list(kwargs["pending_actions"])})
+
+        ok = solver._plan_order_for_robot(
+            0,
+            collections.Counter({7: 1}),
+            robot,
+            preferred_pallet_cells_by_sku={7: [(9, 9)]},
+        )
+        self.assertTrue(ok)
+        picks = [a for a in captured["pending_actions"] if a[2] == "pick"]
+        self.assertEqual(len(picks), 1)
+        self.assertEqual((picks[0][3], picks[0][4]), (2, 2))
+
 
 if __name__ == "__main__":
     unittest.main()
