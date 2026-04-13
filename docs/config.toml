@@ -51,6 +51,9 @@ suggestion_retry_limit = 12
 # Queue-cycle exponential backoff base and cap for failed suggestions.
 suggestion_backoff_base_cycles = 2
 suggestion_backoff_max_cycles = 128
+# SetupSuggestion retries always wait this many makespan ticks before retrying.
+# Suggestions are still dropped once suggestion_retry_limit is reached.
+setup_retry_wait_ticks = 32
 # Hard fail if setup is complete and no additional orders are completed for this many dispatch cycles.
 order_stagnation_cycle_limit = 256
 # If true, livelocked robots retire to nearest corner instead of immediate fail-fast.

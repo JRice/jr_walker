@@ -160,6 +160,7 @@ class RunConfig:
     suggestion_retry_limit: int = 12
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
+    setup_retry_wait_ticks: int = 0
     order_stagnation_cycle_limit: int = 256
     realistic_fail_mode: bool = False
     max_robots_per_suggestion: int = 3
@@ -349,6 +350,11 @@ def load_run_config(config_path: Path) -> RunConfig:
         raise ValueError(
             "solver.suggestion_backoff_max_cycles must be >= solver.suggestion_backoff_base_cycles."
         )
+    run_config.setup_retry_wait_ticks = _require_int(
+        solver_section.get("setup_retry_wait_ticks", run_config.setup_retry_wait_ticks),
+        "solver.setup_retry_wait_ticks",
+        minimum=0,
+    )
     run_config.max_robots_per_suggestion = _require_int(
         solver_section.get("max_robots_per_suggestion", run_config.max_robots_per_suggestion),
         "solver.max_robots_per_suggestion",
@@ -462,6 +468,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             suggestion_retry_limit=run_config.suggestion_retry_limit,
             suggestion_backoff_base_cycles=run_config.suggestion_backoff_base_cycles,
             suggestion_backoff_max_cycles=run_config.suggestion_backoff_max_cycles,
+            setup_retry_wait_ticks=run_config.setup_retry_wait_ticks,
             order_stagnation_cycle_limit=run_config.order_stagnation_cycle_limit,
             realistic_fail_mode=run_config.realistic_fail_mode,
             max_robots_per_suggestion=run_config.max_robots_per_suggestion,
@@ -508,6 +515,11 @@ def _run_pipeline(
             "Validation interrupted: user pressed Ctrl-C; writing partial solution."
         )
         print(f"Solver/optimizer failed: {type(solve_error).__name__}: {solve_error!r}")
+        if hasattr(solver, "active_work_item_summary"):
+            try:
+                print(f"Active suggestion at failure: {solver.active_work_item_summary()}")
+            except Exception:
+                pass
         if base_actions:
             print("Reverting to pre-LNS baseline actions...")
             actions = list(base_actions)
@@ -524,6 +536,11 @@ def _run_pipeline(
     except Exception as exc:
         solve_error = exc
         print(f"Solver/optimizer failed: {type(exc).__name__}: {exc!r}")
+        if hasattr(solver, "active_work_item_summary"):
+            try:
+                print(f"Active suggestion at failure: {solver.active_work_item_summary()}")
+            except Exception:
+                pass
         print(traceback.format_exc())
         if base_actions:
             print("Reverting to pre-LNS baseline actions...")
@@ -692,6 +709,7 @@ def main():
             f"suggestion_retry_limit={run_config.suggestion_retry_limit}, "
             f"suggestion_backoff_base_cycles={run_config.suggestion_backoff_base_cycles}, "
             f"suggestion_backoff_max_cycles={run_config.suggestion_backoff_max_cycles}, "
+            f"setup_retry_wait_ticks={run_config.setup_retry_wait_ticks}, "
             f"order_stagnation_cycle_limit={run_config.order_stagnation_cycle_limit}, "
             f"realistic_fail_mode={run_config.realistic_fail_mode}, "
             f"max_robots_per_suggestion={run_config.max_robots_per_suggestion}, "

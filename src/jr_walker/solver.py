@@ -150,6 +150,7 @@ class SolverConfig:
     suggestion_retry_limit: int = 12
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
+    setup_retry_wait_ticks: int = 0
     order_stagnation_cycle_limit: int = 256
     realistic_fail_mode: bool = False
     max_robots_per_suggestion: int = 3
@@ -381,10 +382,14 @@ class WarehouseSolver:
         self._dispatch_cycle = 0
         self._suggestion_fail_counts: Dict[str, int] = {}
         self._suggestion_backoff_until_cycle: Dict[str, int] = {}
+        self._setup_retry_not_before_timestep: Dict[int, int] = {}
+        self._setup_wait_logged_cycle: Dict[int, int] = {}
         self._robot_fail_streak: Dict[int, int] = collections.defaultdict(int)
         self._parking_moves = 0
         self._retired_robot_ids: set[int] = set()
         self._last_setup_reject_by_robot: Dict[int, str] = {}
+        self._active_suggestion: Suggestion | None = None
+        self._active_robot_id: int | None = None
 
     def _assign_setup_robots_by_hotspot(self) -> Dict[Tuple[int, int], int]:
         hotspots: List[Tuple[int, int]] = []
@@ -572,6 +577,35 @@ class WarehouseSolver:
         rejects = getattr(self, "_last_setup_reject_by_robot", {})
         return str(rejects.pop(int(robot_id), "unknown"))
 
+    def active_work_item_summary(self) -> str:
+        suggestion = getattr(self, "_active_suggestion", None)
+        robot_id = getattr(self, "_active_robot_id", None)
+        if suggestion is None:
+            return "none"
+        if isinstance(suggestion, SetupSuggestion):
+            job = suggestion.job
+            return (
+                "SetupSuggestion "
+                f"robot={robot_id} hotspot={job.hotspot} sku={job.sku} "
+                f"source_pallet_id={job.source_pallet_id} source={job.source_xy} target={job.target_xy}"
+            )
+        if isinstance(suggestion, OrderSuggestion):
+            return (
+                "OrderSuggestion "
+                f"robot={robot_id} order_idx={suggestion.order_idx} center={suggestion.center}"
+            )
+        if isinstance(suggestion, RelocateSuggestion):
+            return (
+                "RelocateSuggestion "
+                f"robot={robot_id} sku={suggestion.job.sku} hotspot={suggestion.job.hotspot}"
+            )
+        if isinstance(suggestion, DockSuggestion):
+            return (
+                "DockSuggestion "
+                f"robot={robot_id} sku={suggestion.sku} center={suggestion.center}"
+            )
+        return f"{type(suggestion).__name__} robot={robot_id}"
+
     def _rebind_setup_source_pallet_id(
         self,
         *,
@@ -723,6 +757,8 @@ class WarehouseSolver:
                 raise RuntimeError(msg)
 
             suggestion = suggestion_queue.popleft()
+            self._active_suggestion = suggestion
+            self._active_robot_id = None
             suggestion_key = self._suggestion_key(suggestion)
             blocked_until = self._suggestion_backoff_until_cycle.get(suggestion_key, 0)
             if blocked_until > self._dispatch_cycle:
@@ -745,6 +781,26 @@ class WarehouseSolver:
             if isinstance(suggestion, DockSuggestion) and suggestion.sku in self.docked_skus:
                 continue
 
+            if isinstance(suggestion, SetupSuggestion):
+                source_pallet_id = int(suggestion.job.source_pallet_id)
+                not_before_t = int(self._setup_retry_not_before_timestep.get(source_pallet_id, -1))
+                if not_before_t >= 0:
+                    now_t = max((r.last_t for r in self.robots), default=0)
+                    if now_t < not_before_t:
+                        last_logged = self._setup_wait_logged_cycle.get(source_pallet_id, -10**9)
+                        if self._dispatch_cycle - last_logged >= 32:
+                            self._setup_wait_logged_cycle[source_pallet_id] = self._dispatch_cycle
+                            self._log(
+                                "setup_retry_wait "
+                                f"hotspot={suggestion.job.hotspot} sku={suggestion.job.sku} "
+                                f"source_pallet_id={source_pallet_id} now_t={now_t} not_before_t={not_before_t}"
+                            )
+                        self._requeue_setup_suggestion(suggestion_queue, suggestion)
+                        record_no_progress_and_maybe_raise()
+                        continue
+                    self._setup_retry_not_before_timestep.pop(source_pallet_id, None)
+                    self._setup_wait_logged_cycle.pop(source_pallet_id, None)
+
             if isinstance(suggestion, SetupSuggestion) and not self._is_setup_frontier_ready(suggestion.job):
                 blocker = self._setup_frontier_blocking_pallet_id(suggestion.job)
                 source_pallet_id = int(suggestion.job.source_pallet_id)
@@ -766,6 +822,7 @@ class WarehouseSolver:
             skip_without_requeue = False
             candidate_robots = self._candidate_robots_for_suggestion(suggestion)
             for robot in candidate_robots:
+                self._active_robot_id = int(robot.id)
                 if isinstance(suggestion, OrderSuggestion):
                     handled = self._plan_order_for_robot(
                         suggestion.order_idx,
@@ -841,12 +898,17 @@ class WarehouseSolver:
 
                 if handled:
                     self._robot_fail_streak[robot.id] = 0
+                    self._active_robot_id = None
                     break
                 self._robot_fail_streak[robot.id] = self._robot_fail_streak.get(robot.id, 0) + 1
 
             if handled:
                 self._suggestion_fail_counts.pop(suggestion_key, None)
                 self._suggestion_backoff_until_cycle.pop(suggestion_key, None)
+                if isinstance(suggestion, SetupSuggestion):
+                    source_pallet_id = int(suggestion.job.source_pallet_id)
+                    self._setup_retry_not_before_timestep.pop(source_pallet_id, None)
+                    self._setup_wait_logged_cycle.pop(source_pallet_id, None)
                 no_progress_attempts = 0
                 if skip_without_requeue:
                     continue
@@ -867,39 +929,61 @@ class WarehouseSolver:
                 retry_limit = int(self.config.suggestion_retry_limit)
                 if isinstance(suggestion, SetupSuggestion):
                     retry_limit = self._setup_retry_limit()
+                setup_wait_ticks = max(0, int(getattr(self.config, "setup_retry_wait_ticks", 0)))
+
+                force_drop = False
+
                 if failure_count >= retry_limit:
+                    force_drop = True
+
+                if force_drop:
                     self._log(
                         "suggestion_dropped "
                         f"key={suggestion_key} failures={failure_count} parked={parked}"
                     )
                     if isinstance(suggestion, SetupSuggestion):
-                        self._dropped_setup_pallet_ids.add(suggestion.job.source_pallet_id)
+                        source_pallet_id = int(suggestion.job.source_pallet_id)
+                        self._dropped_setup_pallet_ids.add(source_pallet_id)
                         assigned = self._setup_robot_by_hotspot.get(
                             (int(suggestion.job.hotspot[0]), int(suggestion.job.hotspot[1]))
                         )
+                        reject_detail = self._consume_setup_reject(self._active_robot_id or -1)
                         self._log(
                             "setup_job_dropped "
                             f"sku={suggestion.job.sku} hotspot={suggestion.job.hotspot} "
-                            f"source_pallet_id={suggestion.job.source_pallet_id} assigned_robot={assigned}"
+                            f"source_pallet_id={source_pallet_id} assigned_robot={assigned} "
+                            f"detail={reject_detail}"
                         )
                         self._log_setup_hotspot_progress(
                             suggestion.job.hotspot,
-                            reason=f"dropped_pid_{suggestion.job.source_pallet_id}",
+                            reason=f"dropped_pid_{source_pallet_id}",
                         )
+                        self._setup_retry_not_before_timestep.pop(source_pallet_id, None)
+                        self._setup_wait_logged_cycle.pop(source_pallet_id, None)
                     self._suggestion_backoff_until_cycle.pop(suggestion_key, None)
                 else:
-                    backoff_cycles = self._suggestion_backoff_cycles(failure_count)
-                    self._suggestion_backoff_until_cycle[suggestion_key] = self._dispatch_cycle + backoff_cycles
                     if isinstance(suggestion, SetupSuggestion):
+                        source_pallet_id = int(suggestion.job.source_pallet_id)
+                        now_t = max((r.last_t for r in self.robots), default=0)
+                        not_before_t = now_t + setup_wait_ticks
+                        self._setup_retry_not_before_timestep[source_pallet_id] = not_before_t
+                        self._log(
+                            "setup_retry_scheduled "
+                            f"key={suggestion_key} failures={failure_count} "
+                            f"wait_ticks={setup_wait_ticks} now_t={now_t} not_before_t={not_before_t} "
+                            f"parked={parked}"
+                        )
                         self._requeue_setup_suggestion(suggestion_queue, suggestion)
                     else:
+                        backoff_cycles = self._suggestion_backoff_cycles(failure_count)
+                        self._suggestion_backoff_until_cycle[suggestion_key] = self._dispatch_cycle + backoff_cycles
                         suggestion_queue.append(suggestion)
-                    if failure_count == 1 or failure_count % 3 == 0:
-                        self._log(
-                            "suggestion_retry_scheduled "
-                            f"key={suggestion_key} failures={failure_count} "
-                            f"backoff_cycles={backoff_cycles} parked={parked}"
-                        )
+                        if failure_count == 1 or failure_count % 3 == 0:
+                            self._log(
+                                "suggestion_retry_scheduled "
+                                f"key={suggestion_key} failures={failure_count} "
+                                f"backoff_cycles={backoff_cycles} parked={parked}"
+                            )
                 record_no_progress_and_maybe_raise()
 
             if handled:
@@ -1007,6 +1091,8 @@ class WarehouseSolver:
             )
         if self._parking_moves > 0:
             self._log(f"idle_parking_summary moves={self._parking_moves}")
+        self._active_suggestion = None
+        self._active_robot_id = None
         return sorted_actions
 
     def _build_suggestion_queue(self) -> List[Suggestion]:
@@ -1694,6 +1780,7 @@ class WarehouseSolver:
             f"retry_limit={self.config.suggestion_retry_limit} "
             f"backoff_base={self.config.suggestion_backoff_base_cycles} "
             f"backoff_max={self.config.suggestion_backoff_max_cycles} "
+            f"setup_retry_wait_ticks={getattr(self.config, 'setup_retry_wait_ticks', 0)} "
             f"stagnation_limit={self.config.order_stagnation_cycle_limit} "
             f"realistic_fail_mode={self.config.realistic_fail_mode} "
             f"robots_per_suggestion={self.config.max_robots_per_suggestion} "
