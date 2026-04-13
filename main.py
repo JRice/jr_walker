@@ -115,6 +115,7 @@ class RunConfig:
     suggestion_retry_limit: int = 12
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
+    order_stagnation_cycle_limit: int = 256
     max_robots_per_suggestion: int = 3
     robot_fail_streak_for_parking: int = 3
     parking_candidate_limit: int = 96
@@ -307,6 +308,11 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.max_robots_per_suggestion",
         minimum=1,
     )
+    run_config.order_stagnation_cycle_limit = _require_int(
+        solver_section.get("order_stagnation_cycle_limit", run_config.order_stagnation_cycle_limit),
+        "solver.order_stagnation_cycle_limit",
+        minimum=1,
+    )
     run_config.setup_mini_box_radius = _require_int(
         solver_section.get("setup_mini_box_radius", run_config.setup_mini_box_radius),
         "solver.setup_mini_box_radius",
@@ -406,6 +412,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             suggestion_retry_limit=run_config.suggestion_retry_limit,
             suggestion_backoff_base_cycles=run_config.suggestion_backoff_base_cycles,
             suggestion_backoff_max_cycles=run_config.suggestion_backoff_max_cycles,
+            order_stagnation_cycle_limit=run_config.order_stagnation_cycle_limit,
             max_robots_per_suggestion=run_config.max_robots_per_suggestion,
             robot_fail_streak_for_parking=run_config.robot_fail_streak_for_parking,
             parking_candidate_limit=run_config.parking_candidate_limit,
@@ -625,6 +632,7 @@ def main():
             f"suggestion_retry_limit={run_config.suggestion_retry_limit}, "
             f"suggestion_backoff_base_cycles={run_config.suggestion_backoff_base_cycles}, "
             f"suggestion_backoff_max_cycles={run_config.suggestion_backoff_max_cycles}, "
+            f"order_stagnation_cycle_limit={run_config.order_stagnation_cycle_limit}, "
             f"max_robots_per_suggestion={run_config.max_robots_per_suggestion}, "
             f"setup_mini_box_radius={run_config.setup_mini_box_radius}, "
             f"robot_fail_streak_for_parking={run_config.robot_fail_streak_for_parking}, "

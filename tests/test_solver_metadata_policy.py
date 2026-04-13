@@ -501,6 +501,56 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         )
         self.assertEqual([job.target_xy for job in jobs], expected_targets)
 
+    def test_candidate_fulfill_cells_avoids_pallet_perimeter_cells(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=6, height=4)
+        solver.scheduler = SimpleNamespace(pallets={(0, 0): 1, (3, 0): 2, (5, 3): 3})
+        solver.robots = [SimpleNamespace(id=0, x=2, y=1, last_t=0)]
+
+        cells = solver._candidate_fulfill_cells(from_xy=(2, 1), limit=20)
+        self.assertNotIn((0, 0), cells)
+        self.assertNotIn((3, 0), cells)
+        self.assertNotIn((5, 3), cells)
+        self.assertIn((2, 0), cells)
+
+    def test_plan_order_uses_alternate_fulfill_cell_when_first_rejected(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=10, height=6)
+        robot = SimpleNamespace(
+            id=0,
+            x=0,
+            y=1,
+            last_t=0,
+            storage=collections.Counter(),
+            docks={},
+        )
+        solver.robots = [robot]
+        solver.scheduler = SimpleNamespace(
+            pallets={},
+            candidate_pick_options=lambda _remaining, _xy: [],
+        )
+        solver.planner = SimpleNamespace(can_occupy=lambda *_args, **_kwargs: True)
+        solver._candidate_fulfill_cells = lambda **_kwargs: [(1, 0), (2, 0)]
+        solver._safe_plan_path = lambda r, x, y: [(r.last_t + 1, x, y)] if (r.x != x or r.y != y) else []
+
+        def _can_commit(actions):
+            # Reject plans that fulfill at (1,0), accept others.
+            return not any(a[2] == "fulfill" and a[3] == 1 and a[4] == 0 for a in actions)
+
+        solver._can_commit_pending_actions = _can_commit
+        captured: dict = {}
+
+        def _capture_commit(**kwargs):
+            captured["pending_actions"] = list(kwargs["pending_actions"])
+
+        solver._commit_plan = _capture_commit
+
+        ok = solver._plan_order_for_robot(0, collections.Counter(), robot)
+        self.assertTrue(ok)
+        fulfills = [a for a in captured["pending_actions"] if a[2] == "fulfill"]
+        self.assertEqual(len(fulfills), 1)
+        self.assertEqual((fulfills[0][3], fulfills[0][4]), (2, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

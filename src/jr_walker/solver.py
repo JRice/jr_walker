@@ -150,6 +150,7 @@ class SolverConfig:
     suggestion_retry_limit: int = 12
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
+    order_stagnation_cycle_limit: int = 256
     max_robots_per_suggestion: int = 3
     robot_fail_streak_for_parking: int = 3
     parking_candidate_limit: int = 96
@@ -478,6 +479,13 @@ class WarehouseSolver:
         for idx, queued in enumerate(queue_snapshot):
             self._log(f"dispatcher_stall_queue[{idx}] {queued}")
 
+    def _setup_phase_complete(self) -> bool:
+        if not self.setup_jobs:
+            return True
+        return (len(self._completed_setup_pallet_ids) + len(self._dropped_setup_pallet_ids)) >= len(
+            self.setup_jobs
+        )
+
     def _setup_frontier_blocking_pallet_id(self, job: SetupJob) -> int | None:
         hotspot = (int(job.hotspot[0]), int(job.hotspot[1]))
         current_pid = int(job.source_pallet_id)
@@ -638,6 +646,8 @@ class WarehouseSolver:
         self._completed_order_indices = completed_orders
         dispatch_count = 0
         no_progress_attempts = 0
+        cycles_since_order_progress = 0
+        last_completed_order_count = 0
         self._log_solve_start(total_orders)
 
         # Keep trying suggestions until all orders are done or queue is empty.
@@ -847,6 +857,35 @@ class WarehouseSolver:
             if dispatch_count > (total_orders + self.config.num_allowed_relocations) * 5:  # circuit breaker
                 self._log("Dispatcher seems to be stuck in a loop. Breaking.")
                 break
+
+            current_completed = len(completed_orders)
+            if current_completed > last_completed_order_count:
+                last_completed_order_count = current_completed
+                cycles_since_order_progress = 0
+            elif self._setup_phase_complete():
+                cycles_since_order_progress += 1
+                stagnation_limit = max(
+                    int(getattr(self.config, "order_stagnation_cycle_limit", 256)),
+                    max(1, len(suggestion_queue)) * 2,
+                )
+                if cycles_since_order_progress >= stagnation_limit:
+                    msg = (
+                        "Order-progress livelock detected: "
+                        f"no new completed orders for {cycles_since_order_progress} cycles "
+                        f"after setup completion; queue_size={len(suggestion_queue)} "
+                        f"completed_orders={current_completed}/{total_orders}"
+                    )
+                    self._log_dispatch_stall_state(
+                        current_suggestion=suggestion,
+                        suggestion_queue=suggestion_queue,
+                        attempts=cycles_since_order_progress,
+                        queue_size=len(suggestion_queue),
+                        completed_orders=current_completed,
+                        total_orders=total_orders,
+                        dispatch_count=dispatch_count,
+                    )
+                    self._log(msg)
+                    raise RuntimeError(msg)
 
         if len(completed_orders) < total_orders:
             self._log(f"Warning: Only {len(completed_orders)}/{total_orders} orders were completed from suggestion queue.")
@@ -2145,6 +2184,42 @@ class WarehouseSolver:
         )
         return bucket
 
+    def _candidate_fulfill_cells(
+        self,
+        *,
+        from_xy: Tuple[int, int],
+        limit: int = 48,
+    ) -> List[Tuple[int, int]]:
+        fx, fy = int(from_xy[0]), int(from_xy[1])
+        cells: List[Tuple[int, int]] = []
+        seen: set[Tuple[int, int]] = set()
+        occupied_by_robot = {(int(r.x), int(r.y)) for r in self.robots}
+
+        def add(cell: Tuple[int, int]) -> None:
+            if cell in seen:
+                return
+            if cell in self.scheduler.pallets:
+                return
+            seen.add(cell)
+            cells.append(cell)
+
+        for x in range(self.state.width):
+            add((x, 0))
+            add((x, self.state.height - 1))
+        for y in range(1, self.state.height - 1):
+            add((0, y))
+            add((self.state.width - 1, y))
+
+        cells.sort(
+            key=lambda c: (
+                abs(c[0] - fx) + abs(c[1] - fy),
+                1 if c in occupied_by_robot else 0,
+                c[1],
+                c[0],
+            )
+        )
+        return cells[: max(1, int(limit))]
+
     def _plan_order_for_robot(
         self, order_idx: int, order: collections.Counter, robot: RobotState
     ) -> bool:
@@ -2188,34 +2263,44 @@ class WarehouseSolver:
             if remaining[sku] <= 0:
                 del remaining[sku]
 
-        fulfill_x, fulfill_y = self.scheduler.best_fulfill_cell(temp_robot.x, temp_robot.y)
-        fulfill_path = self._safe_plan_path(temp_robot, fulfill_x, fulfill_y)
-        if not fulfill_path and (temp_robot.x != fulfill_x or temp_robot.y != fulfill_y):
-            return False
+        base_robot = self._clone_robot_state(temp_robot)
+        base_pending_actions = list(pending_actions)
+        base_pending_paths = list(pending_paths)
+        base_pending_footprints = list(pending_footprints)
+        for fulfill_x, fulfill_y in self._candidate_fulfill_cells(from_xy=(base_robot.x, base_robot.y), limit=48):
+            trial_robot = self._clone_robot_state(base_robot)
+            trial_actions = list(base_pending_actions)
+            trial_paths = list(base_pending_paths)
+            trial_footprints = list(base_pending_footprints)
 
-        if fulfill_path:
-            pending_paths.append((self._clone_robot_state(temp_robot), fulfill_path))
-        pending_actions.extend(self._apply_moves_to_robot(temp_robot, fulfill_path))
+            fulfill_path = self._safe_plan_path(trial_robot, fulfill_x, fulfill_y)
+            if not fulfill_path and (trial_robot.x != fulfill_x or trial_robot.y != fulfill_y):
+                continue
+            if fulfill_path:
+                trial_paths.append((self._clone_robot_state(trial_robot), fulfill_path))
+            trial_actions.extend(self._apply_moves_to_robot(trial_robot, fulfill_path))
 
-        fulfill_t = temp_robot.last_t + 1
-        if not self.planner.can_occupy(temp_robot, fulfill_t, temp_robot.x, temp_robot.y):
-            return False
-        pending_actions.append((fulfill_t, temp_robot.id, "fulfill", fulfill_x, fulfill_y))
-        pending_footprints.append((self._clone_robot_state(temp_robot), fulfill_t, temp_robot.x, temp_robot.y))
-        temp_robot.last_t = fulfill_t
-        temp_robot.storage.clear()
+            fulfill_t = trial_robot.last_t + 1
+            if not self.planner.can_occupy(trial_robot, fulfill_t, trial_robot.x, trial_robot.y):
+                continue
+            trial_actions.append((fulfill_t, trial_robot.id, "fulfill", fulfill_x, fulfill_y))
+            trial_footprints.append((self._clone_robot_state(trial_robot), fulfill_t, trial_robot.x, trial_robot.y))
+            trial_robot.last_t = fulfill_t
+            trial_robot.storage.clear()
 
-        if not self._can_commit_pending_actions(pending_actions):
-            return False
+            if not self._can_commit_pending_actions(trial_actions):
+                continue
 
-        self._commit_plan(
-            robot=robot,
-            temp_robot=temp_robot,
-            pending_actions=pending_actions,
-            pending_paths=pending_paths,
-            pending_footprints=pending_footprints,
-        )
-        return True
+            self._commit_plan(
+                robot=robot,
+                temp_robot=trial_robot,
+                pending_actions=trial_actions,
+                pending_paths=trial_paths,
+                pending_footprints=trial_footprints,
+            )
+            return True
+
+        return False
 
     def _plan_dock_pallet(self, robot: RobotState, sku: int) -> bool:
         """Plans the actions for a robot to find, travel to, and dock a pallet with a given SKU."""

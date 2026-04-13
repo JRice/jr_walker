@@ -51,6 +51,8 @@ suggestion_retry_limit = 12
 # Queue-cycle exponential backoff base and cap for failed suggestions.
 suggestion_backoff_base_cycles = 2
 suggestion_backoff_max_cycles = 128
+# Hard fail if setup is complete and no additional orders are completed for this many dispatch cycles.
+order_stagnation_cycle_limit = 256
 # Try up to this many robots for a suggestion before requeue/backoff.
 max_robots_per_suggestion = 3
 # Local mini-box radius used by hierarchical motion maneuvers (2 => 5x5 box).
