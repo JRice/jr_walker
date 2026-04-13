@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from jr_walker.validator import SubmissionValidator, ValidationError
+from jr_walker.map_render import render_warehouse_map
 from jr_walker.solver import SolverConfig, WarehouseSolver, PastRunAnalysis, load_best_past_analysis
 from jr_walker.view import WarehouseState
 from jr_walker.writer import write_actions
@@ -71,10 +72,6 @@ def _save_final_warehouse_map(
     worklist_path: str | Path,
     media_dir: Path = Path("media"),
 ) -> Path:
-    import matplotlib.pyplot as plt
-    import numpy as np
-    from matplotlib.colors import ListedColormap
-
     validator = SubmissionValidator(worklist_path=worklist_path)
     for t, rid, action, x, y in actions:
         validator.validate_line(f"{t} {rid} {action} {x} {y}")
@@ -82,12 +79,6 @@ def _save_final_warehouse_map(
 
     width = 60
     height = 40
-    grid = np.zeros((height, width), dtype=int)
-    # 0: empty, 1: perimeter, 2: pallets, 3: robots
-    grid[0, :] = 1
-    grid[-1, :] = 1
-    grid[:, 0] = 1
-    grid[:, -1] = 1
 
     pallet_items: list[tuple[tuple[int, int], int]] = []
     for pallet in final_state.pallets:
@@ -96,7 +87,6 @@ def _save_final_warehouse_map(
         x = int(pallet.x)
         y = int(pallet.y)
         if 0 <= x < width and 0 <= y < height:
-            grid[y, x] = 2
             pallet_items.append(((x, y), int(pallet.sku)))
 
     robot_cells: list[tuple[int, int]] = []
@@ -104,41 +94,18 @@ def _save_final_warehouse_map(
         x = int(robot.x)
         y = int(robot.y)
         if 0 <= x < width and 0 <= y < height:
-            grid[y, x] = 3
             robot_cells.append((x, y))
 
-    cmap = ListedColormap(["#f8f7f4", "#d4f2d2", "#f7b267", "#7aa2f7"])
-    fig, ax = plt.subplots(figsize=(18, 12))
-    ax.imshow(grid, cmap=cmap, origin="upper")
-
-    if pallet_items:
-        unique_skus = sorted({sku for _, sku in pallet_items})
-        sku_to_idx = {sku: i for i, sku in enumerate(unique_skus)}
-        palette = plt.cm.tab20(np.linspace(0.0, 1.0, 20))
-        xs = [xy[0] for xy, _ in pallet_items]
-        ys = [xy[1] for xy, _ in pallet_items]
-        colors = [palette[sku_to_idx[sku] % 20] for _, sku in pallet_items]
-        ax.scatter(xs, ys, c=colors, s=180, marker="s", edgecolors="black", linewidths=0.4, zorder=3)
-        for (x, y), sku in pallet_items:
-            ax.text(x, y, str(sku), ha="center", va="center", fontsize=6.8, color="black", zorder=4)
-
-    if robot_cells:
-        rx = [x for x, _ in robot_cells]
-        ry = [y for _, y in robot_cells]
-        ax.scatter(rx, ry, c="#1f77b4", s=140, marker="o", edgecolors="white", linewidths=0.8, zorder=5)
-
     run_label = str(int(run_id)) if run_id is not None else "unknown"
-    ax.set_title(f"Final Tick Warehouse Map (run_id={run_label})", fontsize=14)
-    ax.set_xticks(np.arange(-0.5, width, 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, height, 1), minor=True)
-    ax.grid(which="minor", color="black", linestyle="-", linewidth=0.35, alpha=0.15)
-    ax.tick_params(which="major", bottom=False, left=False, labelbottom=False, labelleft=False)
-    plt.tight_layout()
-
-    media_dir.mkdir(parents=True, exist_ok=True)
     output_path = media_dir / f"warehouse_final_run_{run_label}.png"
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
+    render_warehouse_map(
+        width=width,
+        height=height,
+        pallet_items=pallet_items,
+        robot_cells=robot_cells,
+        title=f"Final Tick Warehouse Map (run_id={run_label})",
+        output_path=output_path,
+    )
     return output_path
 
 

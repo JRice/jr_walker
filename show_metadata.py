@@ -5,16 +5,13 @@ import sys
 import tomllib
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.colors import ListedColormap
-
 # Allow `python show_metadata.py` from repo root without installing the package.
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from jr_walker.map_render import render_warehouse_map
 from jr_walker.view import WarehouseState
 
 
@@ -61,51 +58,14 @@ def _load_paths_and_chunk_size(config_path: Path) -> tuple[Path, int, Path, Path
 
 def _render_tick0_sku_map(input_path: Path, output_path: Path) -> None:
     state = WarehouseState(str(input_path))
-
-    # Background map: empty, fulfillment perimeter, pallets, robots.
-    cmap = ListedColormap(["#f8f7f4", "#d4f2d2", "#f7b267", "#7aa2f7"])
-    fig, ax = plt.subplots(figsize=(18, 12))
-    ax.imshow(state.grid, cmap=cmap, origin="upper")
-
-    # Draw pallet SKUs with distinct colors by SKU id.
-    pallet_items = list(state.pallets.items())
-    if pallet_items:
-        unique_skus = sorted({sku for _, sku in pallet_items})
-        sku_to_idx = {sku: i for i, sku in enumerate(unique_skus)}
-        palette = plt.cm.tab20(np.linspace(0.0, 1.0, 20))
-        xs = [xy[0] for xy, _ in pallet_items]
-        ys = [xy[1] for xy, _ in pallet_items]
-        colors = [palette[sku_to_idx[sku] % 20] for _, sku in pallet_items]
-        ax.scatter(xs, ys, c=colors, s=180, marker="s", edgecolors="black", linewidths=0.4, zorder=3)
-
-        for (x, y), sku in pallet_items:
-            ax.text(
-                x,
-                y,
-                str(sku),
-                ha="center",
-                va="center",
-                fontsize=6.8,
-                color="black",
-                zorder=4,
-            )
-
-    # Highlight robots.
-    if state.robots:
-        rx = [x for x, _ in state.robots]
-        ry = [y for _, y in state.robots]
-        ax.scatter(rx, ry, c="#1f77b4", s=140, marker="o", edgecolors="white", linewidths=0.8, zorder=5)
-
-    ax.set_title("Tick 0 SKU Map (Pallet cells labeled by SKU)", fontsize=14)
-    ax.set_xticks(np.arange(-0.5, state.width, 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, state.height, 1), minor=True)
-    ax.grid(which="minor", color="black", linestyle="-", linewidth=0.35, alpha=0.15)
-    ax.tick_params(which="major", bottom=False, left=False, labelbottom=False, labelleft=False)
-    plt.tight_layout()
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
+    render_warehouse_map(
+        width=state.width,
+        height=state.height,
+        pallet_items=list(state.pallets.items()),
+        robot_cells=list(state.robots),
+        title="Tick 0 SKU Map (Pallet cells labeled by SKU)",
+        output_path=output_path,
+    )
 
 
 def _is_edge_cell(x: int, y: int, width: int, height: int) -> bool:
