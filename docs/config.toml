@@ -69,11 +69,8 @@ edge_band_for_heatmap = 6
 # Group SKU-flow metadata into N x N chunks before selecting anchor cells.
 # Set to 1 to disable chunking (original exact-cell behavior).
 relocate_chunk_size = 5
-# Setup coverage radius: a hotspot is considered to already "have" a SKU
-# if at least one pallet of that SKU is within this Manhattan distance.
-setup_hotspot_radius = 6
 # Setup hotspots used by SetupSuggestion initialization phase.
-setup_hotspots = [[17, 32], [38, 5], [38, 32]]
+setup_hotspots = [[20, 0], [20, 39], [0, 15]]
 # Optional explicit relocation SKU order. If provided, only these SKUs are
 # used for startup relocation planning (in listed order).
 # skus_to_relocate = [1, 2, 3, 4, 5]

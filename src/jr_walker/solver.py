@@ -27,6 +27,9 @@ from jr_walker.sim import ActionLog, RobotState
 from jr_walker.validator import SubmissionValidator, ValidationError
 from jr_walker.writer import write_actions
 
+def _in_bounds(x: int, y: int, width: int = 60, height: int = 40) -> bool:
+    return 0 <= x < width and 0 <= y < height
+
 # Planned delivery hotspot anchors.
 FULFILL_HOT_SPOTS: List[Tuple[int, int]] = [
     (20, 0),
@@ -145,7 +148,6 @@ class SolverConfig:
     astar_log_blocked: bool = False
     enable_relocation_suggestions: bool = False
     setup_hotspots: List[Tuple[int, int]] = field(default_factory=list)
-    setup_hotspot_radius: int = 10
     suggestion_retry_limit: int = 12
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
@@ -1241,8 +1243,7 @@ class WarehouseSolver:
     def _log_solve_start(self, total_orders: int) -> None:
         self._log(f"solve_start total_orders={total_orders}")
         self._log(
-            f"setup_plan count={len(self.setup_jobs)} hotspots={self._normalize_setup_hotspots()} "
-            f"radius={self.config.setup_hotspot_radius}"
+            f"setup_plan count={len(self.setup_jobs)} hotspots={self._normalize_setup_hotspots()}"
         )
         if self._setup_robot_by_hotspot:
             mapping_summary = ", ".join(
@@ -1259,7 +1260,6 @@ class WarehouseSolver:
                 jobs_by_hotspot[(int(job.hotspot[0]), int(job.hotspot[1]))].append(job)
 
             for hotspot, jobs in sorted(jobs_by_hotspot.items(), key=lambda item: (item[0][1], item[0][0])):
-                slot_order = {cell: idx for idx, cell in enumerate(self._setup_slot_candidates(hotspot, limit=240))}
                 jobs_sorted = sorted(
                     jobs,
                     key=lambda j: (slot_order.get((int(j.target_xy[0]), int(j.target_xy[1])), 9999), j.sku),
@@ -2021,21 +2021,13 @@ class WarehouseSolver:
     def _setup_target_candidates(
         self, job: SetupJob, source_xy: Tuple[int, int], limit: int = 12
     ) -> List[Tuple[int, int]]:
-        out: List[Tuple[int, int]] = []
-        seen: set[Tuple[int, int]] = set()
-
-        def push(cell: Tuple[int, int]) -> None:
-            if cell in seen:
-                return
-            if cell in self.scheduler.pallets and cell != source_xy:
-                return
-            seen.add(cell)
-            out.append(cell)
-
-        # Strict setup packing: keep each job on its pre-planned target cell.
-        # This prevents opportunistic fallback from creating jagged one-wide growth.
-        push(job.target_xy)
-        return out
+        # With the new prescriptive setup logic, each job has exactly one target.
+        # We only check that it's not occupied by another pallet (unless it's the
+        # source pallet itself, which will be moved).
+        target_cell = job.target_xy
+        if target_cell in self.scheduler.pallets and target_cell != source_xy:
+            return []
+        return [target_cell]
 
     def _setup_source_candidates_for_job(
         self,

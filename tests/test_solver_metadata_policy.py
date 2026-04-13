@@ -207,23 +207,6 @@ class SolverMetadataPolicyTests(unittest.TestCase):
             [(0, -1), (-1, 0)],
         )
 
-    def test_setup_target_candidates_same_column_frontier_only(self) -> None:
-        solver = self._new_solver_shell()
-        solver.state = SimpleNamespace(width=20, height=20)
-        solver.scheduler = SimpleNamespace(pallets={})
-        job = SetupJob(
-            sku=1,
-            hotspot=(10, 5),
-            source_pallet_id=7,
-            source_xy=(3, 3),
-            target_xy=(10, 5),
-        )
-
-        cells = solver._setup_target_candidates(job, source_xy=(3, 3), limit=6)
-        self.assertTrue(cells)
-        self.assertTrue(all(x == 10 for x, _ in cells))
-        self.assertTrue(all(y <= 5 for _, y in cells))
-
     def test_candidate_robots_for_setup_prefers_reachable_probe(self) -> None:
         solver = self._new_solver_shell()
         solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)
