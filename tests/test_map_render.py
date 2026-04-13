@@ -20,7 +20,7 @@ class MapRenderTests(unittest.TestCase):
                 width=8,
                 height=6,
                 pallet_items=[((1, 1), 3), ((2, 3), 7)],
-                robot_cells=[(0, 0), (7, 5)],
+                robot_cells=[(0, 0, 0), (7, 5, 1)],
                 title="Unit Test Map",
                 output_path=output_path,
             )

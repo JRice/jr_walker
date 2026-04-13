@@ -89,12 +89,12 @@ def _save_final_warehouse_map(
         if 0 <= x < width and 0 <= y < height:
             pallet_items.append(((x, y), int(pallet.sku)))
 
-    robot_cells: list[tuple[int, int]] = []
+    robot_cells: list[tuple[int, int, int]] = []
     for robot in final_state.robots:
         x = int(robot.x)
         y = int(robot.y)
         if 0 <= x < width and 0 <= y < height:
-            robot_cells.append((x, y))
+            robot_cells.append((x, y, int(robot.robot_id)))
 
     run_label = str(int(run_id)) if run_id is not None else "unknown"
     output_path = media_dir / f"warehouse_final_run_{run_label}.png"

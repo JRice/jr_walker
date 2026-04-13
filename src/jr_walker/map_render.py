@@ -12,7 +12,7 @@ def render_warehouse_map(
     width: int,
     height: int,
     pallet_items: list[tuple[tuple[int, int], int]],
-    robot_cells: list[tuple[int, int]],
+    robot_cells: list[tuple[int, int, int]],
     title: str,
     output_path: Path,
 ) -> None:
@@ -28,7 +28,7 @@ def render_warehouse_map(
         if 0 <= x < width and 0 <= y < height:
             grid[y, x] = 2
 
-    for x, y in robot_cells:
+    for x, y, _rid in robot_cells:
         if 0 <= x < width and 0 <= y < height:
             grid[y, x] = 3
 
@@ -58,9 +58,17 @@ def render_warehouse_map(
             )
 
     if robot_cells:
-        rx = [x for x, _ in robot_cells]
-        ry = [y for _, y in robot_cells]
-        ax.scatter(rx, ry, c="#1f77b4", s=140, marker="o", edgecolors="white", linewidths=0.8, zorder=5)
+        for x, y, rid in robot_cells:
+            ax.text(
+                x,
+                y,
+                str(rid),
+                ha="center",
+                va="center",
+                fontsize=8.0,
+                color="white",
+                zorder=5,
+            )
 
     ax.set_title(title, fontsize=14)
     ax.set_xticks(np.arange(-0.5, width, 1), minor=True)

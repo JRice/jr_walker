@@ -225,6 +225,29 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertTrue(all(x == 10 for x, _ in cells))
         self.assertTrue(all(y <= 5 for _, y in cells))
 
+    def test_nearest_unreserved_setup_source_prefers_local_owner(self) -> None:
+        solver = self._new_solver_shell()
+        solver.scheduler = SimpleNamespace(
+            pallet_cells_for_sku=lambda _sku: [(10, 10), (1, 1)],
+        )
+        solver.pallet_id_by_coord = {
+            (10, 10): 101,
+            (1, 1): 202,
+        }
+        hotspot = (20, 20)
+        owner_map = {
+            101: (0, 0),
+            202: hotspot,
+        }
+
+        source = solver._nearest_unreserved_pallet_for_sku(
+            sku=7,
+            hotspot=hotspot,
+            reserved_pallet_ids=set(),
+            source_owner_by_pallet_id=owner_map,
+        )
+        self.assertEqual(source, ((1, 1), 202))
+
     def test_candidate_robots_for_setup_prefers_reachable_probe(self) -> None:
         solver = self._new_solver_shell()
         solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)

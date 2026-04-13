@@ -384,6 +384,7 @@ class WarehouseSolver:
         self._robot_fail_streak: Dict[int, int] = collections.defaultdict(int)
         self._parking_moves = 0
         self._retired_robot_ids: set[int] = set()
+        self._last_setup_reject_by_robot: Dict[int, str] = {}
 
     def _assign_setup_robots_by_hotspot(self) -> Dict[Tuple[int, int], int]:
         hotspots: List[Tuple[int, int]] = []
@@ -559,6 +560,17 @@ class WarehouseSolver:
             return "none"
         rows = counter.most_common(max(1, int(limit)))
         return ",".join(f"{name}:{count}" for name, count in rows)
+
+    def _remember_setup_reject(self, robot_id: int, detail: str) -> None:
+        rejects = getattr(self, "_last_setup_reject_by_robot", None)
+        if rejects is None:
+            self._last_setup_reject_by_robot = {}
+            rejects = self._last_setup_reject_by_robot
+        rejects[int(robot_id)] = str(detail)
+
+    def _consume_setup_reject(self, robot_id: int) -> str:
+        rejects = getattr(self, "_last_setup_reject_by_robot", {})
+        return str(rejects.pop(int(robot_id), "unknown"))
 
     def _rebind_setup_source_pallet_id(
         self,
@@ -775,6 +787,19 @@ class WarehouseSolver:
                         suggestion_queue = self._refresh_pending_order_suggestions(
                             suggestion_queue,
                             completed_orders,
+                        )
+                    else:
+                        reject_detail = self._consume_setup_reject(robot.id)
+                        assigned_robot_id = self._setup_robot_by_hotspot.get(
+                            (int(suggestion.job.hotspot[0]), int(suggestion.job.hotspot[1]))
+                        )
+                        self._log(
+                            "setup_suggestion_rejected "
+                            f"robot={robot.id} assigned_robot={assigned_robot_id} "
+                            f"sku={suggestion.job.sku} hotspot={suggestion.job.hotspot} "
+                            f"source_pallet_id={suggestion.job.source_pallet_id} "
+                            f"source={suggestion.job.source_xy} target={suggestion.job.target_xy} "
+                            f"detail={reject_detail}"
                         )
                 elif isinstance(suggestion, RelocateSuggestion):
                     if suggestion.remaining_job_factor() <= 0:
@@ -1338,28 +1363,47 @@ class WarehouseSolver:
         sku: int,
         hotspot: Tuple[int, int],
         reserved_pallet_ids: set[int],
+        source_owner_by_pallet_id: Dict[int, Tuple[int, int]] | None = None,
     ) -> Tuple[Tuple[int, int], int] | None:
         hx, hy = hotspot
-        candidates: List[Tuple[int, int, int]] = []
+        candidates: List[Tuple[int, int, int, int, int]] = []
         for cell in self.scheduler.pallet_cells_for_sku(sku):
             pallet_id = self.pallet_id_by_coord.get(cell)
             if pallet_id is None or pallet_id in reserved_pallet_ids:
                 continue
+            pallet_id = int(pallet_id)
             dist = abs(cell[0] - hx) + abs(cell[1] - hy)
-            candidates.append((dist, cell[1], cell[0]))
+            owner_priority = 0
+            if source_owner_by_pallet_id is not None:
+                owner_hotspot = source_owner_by_pallet_id.get(pallet_id)
+                owner_priority = 0 if owner_hotspot == hotspot else 1
+            candidates.append((owner_priority, dist, cell[1], cell[0], pallet_id))
         if not candidates:
             return None
-        _, y, x = min(candidates)
+        _, _, y, x, pallet_id = min(candidates)
         cell = (x, y)
-        pallet_id = self.pallet_id_by_coord.get(cell)
-        if pallet_id is None:
-            return None
-        return cell, pallet_id
+        return cell, int(pallet_id)
 
     def _build_setup_jobs(self) -> List[SetupJob]:
         hotspots = self._normalize_setup_hotspots()
+        self._setup_source_owner_by_pallet_id: Dict[int, Tuple[int, int]] = {}
+        self._setup_cross_hotspot_reservations: int = 0
+        self._setup_local_hotspot_reservations: int = 0
         if not hotspots:
             return []
+
+        hotspot_order = {hs: idx for idx, hs in enumerate(hotspots)}
+        for cell, pallet_id in self.pallet_id_by_coord.items():
+            owner = min(
+                hotspots,
+                key=lambda hs: (
+                    abs(cell[0] - hs[0]) + abs(cell[1] - hs[1]),
+                    hotspot_order[hs],
+                    hs[1],
+                    hs[0],
+                ),
+            )
+            self._setup_source_owner_by_pallet_id[int(pallet_id)] = owner
 
         all_skus = sorted({int(sku) for sku in self.scheduler.pallets.values()})
         odd_skus = [sku for sku in all_skus if sku % 2 == 1]
@@ -1378,12 +1422,18 @@ class WarehouseSolver:
                     sku,
                     hotspot,
                     reserved_pallet_ids=reserved_pallet_ids,
+                    source_owner_by_pallet_id=self._setup_source_owner_by_pallet_id,
                 )
                 if source is None:
                     continue
                 source_xy, source_pallet_id = source
                 reserved_pallet_ids.add(source_pallet_id)
                 reserved_sources_by_hotspot_sku[(hotspot, sku)] = (source_xy, source_pallet_id)
+                owner_hotspot = self._setup_source_owner_by_pallet_id.get(int(source_pallet_id))
+                if owner_hotspot is not None and owner_hotspot != hotspot:
+                    self._setup_cross_hotspot_reservations += 1
+                else:
+                    self._setup_local_hotspot_reservations += 1
 
         # Second pass: build setup jobs from reserved hotspot/SKU sources.
         for hotspot in hotspots:
@@ -1585,7 +1635,14 @@ class WarehouseSolver:
         self._log(f"solve_start total_orders={total_orders}")
         self._log(
             f"setup_plan count={len(self.setup_jobs)} hotspots={self._normalize_setup_hotspots()} "
-            f"coverage=nearest_reserved_per_hotspot_sku mini_box_radius={getattr(self.config, 'setup_mini_box_radius', 2)}"
+            f"coverage=nearest_reserved_per_hotspot_sku_with_local_owner_bias "
+            f"mini_box_radius={getattr(self.config, 'setup_mini_box_radius', 2)}"
+        )
+        local_res = int(getattr(self, "_setup_local_hotspot_reservations", 0))
+        cross_res = int(getattr(self, "_setup_cross_hotspot_reservations", 0))
+        self._log(
+            "setup_source_reservations "
+            f"local={local_res} cross_hotspot={cross_res} total={local_res + cross_res}"
         )
         if self._setup_robot_by_hotspot:
             mapping_summary = ", ".join(
@@ -1603,6 +1660,7 @@ class WarehouseSolver:
 
             for hotspot, jobs in sorted(jobs_by_hotspot.items(), key=lambda item: (item[0][1], item[0][0])):
                 slot_order = {cell: idx for idx, cell in enumerate(self._setup_slot_candidates(hotspot, limit=240))}
+                source_owner_by_pallet_id = getattr(self, "_setup_source_owner_by_pallet_id", {})
                 jobs_sorted = sorted(
                     jobs,
                     key=lambda j: (slot_order.get((int(j.target_xy[0]), int(j.target_xy[1])), 9999), j.sku),
@@ -1612,9 +1670,14 @@ class WarehouseSolver:
                     for j in jobs_sorted[:10]
                 )
                 assigned = self._setup_robot_by_hotspot.get(hotspot)
+                cross_sources = sum(
+                    1
+                    for j in jobs_sorted
+                    if source_owner_by_pallet_id.get(int(j.source_pallet_id)) not in (None, hotspot)
+                )
                 self._log(
                     f"setup_hotspot_plan hotspot={hotspot} assigned_robot={assigned} "
-                    f"jobs={len(jobs_sorted)} preview=[{preview}]"
+                    f"jobs={len(jobs_sorted)} cross_hotspot_sources={cross_sources} preview=[{preview}]"
                 )
                 self._log_setup_hotspot_progress(hotspot, reason="initial")
         self._log(
@@ -2500,9 +2563,11 @@ class WarehouseSolver:
                 continue
             blocked_source_pallet_ids.add(other_id)
 
-        rows: List[Tuple[int, int, int, int, Tuple[int, int]]] = []
+        rows: List[Tuple[int, int, int, int, int, Tuple[int, int]]] = []
         seen: set[int] = set()
         hx, hy = int(job.hotspot[0]), int(job.hotspot[1])
+        owner_map: Dict[int, Tuple[int, int]] = getattr(self, "_setup_source_owner_by_pallet_id", {})
+        hotspot_key = (hx, hy)
         for source_xy in self.scheduler.pallet_cells_for_sku(int(job.sku)):
             source_pallet_id = self.pallet_id_by_coord.get(source_xy)
             if source_pallet_id is None:
@@ -2513,9 +2578,11 @@ class WarehouseSolver:
             if source_pallet_id in blocked_source_pallet_ids:
                 continue
             seen.add(source_pallet_id)
+            owner_priority = 0 if owner_map.get(source_pallet_id) == hotspot_key else 1
             rows.append(
                 (
                     0 if source_pallet_id == int(job.source_pallet_id) else 1,
+                    owner_priority,
                     abs(robot.x - source_xy[0]) + abs(robot.y - source_xy[1]),
                     abs(hx - source_xy[0]) + abs(hy - source_xy[1]),
                     source_pallet_id,
@@ -2523,13 +2590,17 @@ class WarehouseSolver:
                 )
             )
 
-        rows.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
+        rows.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4]))
         capped = rows[: max(1, int(limit))]
-        return [(source_pallet_id, source_xy) for _, _, _, source_pallet_id, source_xy in capped]
+        return [(source_pallet_id, source_xy) for _, _, _, _, source_pallet_id, source_xy in capped]
 
     def _plan_setup_pallet_for_robot(self, robot: RobotState, job: SetupJob) -> bool:
         source_candidates = self._setup_source_candidates_for_job(robot, job)
         if not source_candidates:
+            self._remember_setup_reject(
+                robot.id,
+                f"missing_source_pallet source_pallet_id={job.source_pallet_id}",
+            )
             self._log(
                 "setup_attempt_fail "
                 f"robot={robot.id} sku={job.sku} hotspot={job.hotspot} "
@@ -2548,6 +2619,7 @@ class WarehouseSolver:
             if source_xy == (int(job.target_xy[0]), int(job.target_xy[1])):
                 job.source_pallet_id = int(source_pallet_id)
                 job.source_xy = source_xy
+                self._consume_setup_reject(robot.id)
                 return True
 
             stand_cells = self._candidate_relocation_stand_cells(robot, source_xy)
@@ -2558,6 +2630,10 @@ class WarehouseSolver:
             target_cells = self._setup_target_candidates(job, source_xy)
             if not target_cells:
                 target_blocked = job.target_xy in self.scheduler.pallets and job.target_xy != source_xy
+                self._remember_setup_reject(
+                    robot.id,
+                    f"no_target_cells source={source_xy} target={job.target_xy} target_blocked={target_blocked}",
+                )
                 self._log(
                     "setup_attempt_fail "
                     f"robot={robot.id} sku={job.sku} hotspot={job.hotspot} "
@@ -2607,8 +2683,16 @@ class WarehouseSolver:
                 job.source_xy = source_xy
                 job.target_xy = new_xy
                 self._setup_job_by_source_pallet_id[int(source_pallet_id)] = job
+                self._consume_setup_reject(robot.id)
                 return True
 
+        reject_detail = (
+            f"no_feasible_stand_path source={job.source_xy} target={job.target_xy} "
+            f"sources_tried={sources_tried} stands_tried={total_stands_tried} "
+            f"stand_failures={stand_failures} "
+            f"failure_reasons={self._format_reason_counts(failure_reasons)}"
+        )
+        self._remember_setup_reject(robot.id, reject_detail)
         self._log(
             "setup_attempt_fail "
             f"robot={robot.id} sku={job.sku} hotspot={job.hotspot} "

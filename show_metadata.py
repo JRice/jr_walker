@@ -62,7 +62,7 @@ def _render_tick0_sku_map(input_path: Path, output_path: Path) -> None:
         width=state.width,
         height=state.height,
         pallet_items=list(state.pallets.items()),
-        robot_cells=list(state.robots),
+        robot_cells=[(x, y, rid) for rid, (x, y) in enumerate(state.robots)],
         title="Tick 0 SKU Map (Pallet cells labeled by SKU)",
         output_path=output_path,
     )
