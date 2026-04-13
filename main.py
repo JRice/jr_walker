@@ -26,6 +26,44 @@ class UserInterruptError(ValidationError):
     """Raised when planning is interrupted by Ctrl-C after saving partial state."""
 
 
+def _save_fulfill_rate_plot(
+    actions: list[tuple[int, int, str, int, int]],
+    run_id: int | None,
+    *,
+    media_dir: Path = Path("media"),
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    fulfills_by_timestep: dict[int, int] = {}
+    for t, _rid, action, _x, _y in actions:
+        if action != "fulfill":
+            continue
+        fulfills_by_timestep[int(t)] = fulfills_by_timestep.get(int(t), 0) + 1
+
+    x_points: list[int] = [0]
+    y_points: list[int] = [0]
+    cumulative = 0
+    for t in sorted(fulfills_by_timestep.keys()):
+        cumulative += fulfills_by_timestep[t]
+        x_points.append(int(t))
+        y_points.append(int(cumulative))
+
+    run_label = str(int(run_id)) if run_id is not None else "unknown"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    output_path = media_dir / f"fulfill_rate_run_{run_label}.png"
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.step(x_points, y_points, where="post", linewidth=2.0)
+    ax.set_xlabel("Timestep (Makespan Axis)")
+    ax.set_ylabel("Cumulative Fulfill Count")
+    ax.set_title(f"Fulfill Rate Over Time (run_id={run_label})")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+    return output_path
+
+
 def make_unique_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -532,6 +570,9 @@ def _save_and_report(
     print(f"Orders used: {len(state.orders)}")
     if metadata_run_id is not None:
         print(f"Wrote metadata to {metadata_db_path} (run_id={metadata_run_id})")
+
+    plot_path = _save_fulfill_rate_plot(actions, metadata_run_id)
+    print(f"Wrote fulfill-rate plot to {plot_path}")
 
 
 def main():
