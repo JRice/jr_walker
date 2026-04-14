@@ -30,7 +30,7 @@ relocation_top_skus = 16
 # Max relocation suggestions admitted into the dispatch queue.
 num_allowed_relocations = 18
 # Scales DockSuggestion expected gain (higher => more likely to do strategic docking).
-dock_gain_scale = 0.1
+dock_gain_scale = 2.1
 # Scales normalized relocation gain after order-relative normalization.
 relocation_gain_scale = 3.0
 # If true, disallow two robots swapping positions in one timestep.
@@ -94,8 +94,8 @@ relocate_chunk_size = 5
 # Setup hotspots used by SetupSuggestion initialization phase.
 # FULL: setup_hotspots = [[0, 15], [15, 0], [35,0], [15, 39], [35,39]]
 # FOUR: setup_hotspots = [[0, 15], [15, 0], [35,0], [20, 39]] # 7301 4/13
-# THREE: [[20, 0], [20, 39], [0, 15]] # @ 4/13AM, got 6723, with different code.
-setup_hotspots = [[20, 0], [20, 39], [0, 15]]
+# THREE: [[20, 0], [20, 39], [0, 15]] # @ 4/13AM, got 6723
+setup_hotspots = [[0, 15], [15, 0], [35,0], [20, 39]] # 8085 4/13PM (new code)
 # Optional explicit relocation SKU order. If provided, only these SKUs are
 # used for startup relocation planning (in listed order).
 # skus_to_relocate = [1, 2, 3, 4, 5]

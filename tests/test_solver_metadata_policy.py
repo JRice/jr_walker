@@ -961,6 +961,71 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertEqual(captured.get("dock_t"), 9)
         self.assertEqual(captured.get("undock_t"), 49)
 
+    def test_idle_recovery_undock_releases_persistent_dock_state(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(max_time=50)
+        robot = SimpleNamespace(
+            id=2,
+            x=10,
+            y=10,
+            last_t=20,
+            storage=collections.Counter(),
+            docks={(1, 0): 5},
+        )
+        solver.state = SimpleNamespace(width=60, height=40)
+        solver.robots = [robot]
+        solver.planner = SimpleNamespace(can_occupy=lambda *_args, **_kwargs: True)
+        solver._can_commit_pending_actions = lambda _actions: True
+        commit_capture: dict = {}
+
+        def _commit_plan(**kwargs):
+            commit_capture["pending_static_additions"] = list(kwargs.get("pending_static_additions") or [])
+            robot_ref = kwargs["robot"]
+            temp_robot = kwargs["temp_robot"]
+            robot_ref.x = temp_robot.x
+            robot_ref.y = temp_robot.y
+            robot_ref.last_t = temp_robot.last_t
+            robot_ref.storage = collections.Counter(temp_robot.storage)
+            robot_ref.docks = dict(temp_robot.docks)
+
+        solver._commit_plan = _commit_plan
+        solver._log = lambda _msg: None
+
+        solver.pallet_initial_xy = {5: (4, 4)}
+        solver.pallet_moves = collections.defaultdict(list)
+        solver.pallet_moves[5].append(SimpleNamespace(old_xy=(4, 4), new_xy=(4, 4), dock_t=12, undock_t=49))
+        solver.pallet_by_id = {5: {"sku": 7, "x": 4, "y": 4}}
+        solver.pallet_id_by_coord = {}
+        solver.scheduler = SimpleNamespace(pallets={}, _rebuild_indexes=lambda: None)
+        solver._persistently_docked_pallet_ids = {5}
+
+        ok = solver._plan_idle_recovery_undock(robot)
+        self.assertTrue(ok)
+        self.assertEqual(robot.last_t, 21)
+        self.assertEqual(robot.docks, {})
+        self.assertEqual(commit_capture["pending_static_additions"], [(22, 11, 10)])
+        self.assertEqual(solver.pallet_moves[5][-1].undock_t, 21)
+        self.assertEqual(solver.pallet_moves[5][-1].new_xy, (11, 10))
+        self.assertEqual(solver.pallet_by_id[5]["x"], 11)
+        self.assertEqual(solver.pallet_by_id[5]["y"], 10)
+        self.assertEqual(solver.scheduler.pallets[(11, 10)], 7)
+        self.assertEqual(solver.pallet_id_by_coord[(11, 10)], 5)
+        self.assertNotIn(5, solver._persistently_docked_pallet_ids)
+
+    def test_idle_recovery_undock_noop_for_robot_without_docks(self) -> None:
+        solver = self._new_solver_shell()
+        robot = SimpleNamespace(
+            id=1,
+            x=5,
+            y=5,
+            last_t=10,
+            storage=collections.Counter(),
+            docks={},
+        )
+
+        ok = solver._plan_idle_recovery_undock(robot)
+        self.assertFalse(ok)
+
     def test_candidate_robots_for_dock_prefers_robots_without_existing_docks(self) -> None:
         solver = self._new_solver_shell()
         solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)

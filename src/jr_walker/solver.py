@@ -1068,6 +1068,10 @@ class WarehouseSolver:
                     for robot in candidate_robots:
                         if self._robot_fail_streak.get(robot.id, 0) < self.config.robot_fail_streak_for_parking:
                             continue
+                        if self._plan_idle_recovery_undock(robot):
+                            parked = True
+                            self._robot_fail_streak[robot.id] = 0
+                            break
                         if self._plan_idle_parking_move(robot):
                             self._parking_moves += 1
                             parked = True
@@ -2589,6 +2593,87 @@ class WarehouseSolver:
         scored.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
         limit = max(1, int(self.config.parking_candidate_limit))
         return [(x, y) for _, _, y, x in scored[:limit]]
+
+    def _plan_idle_recovery_undock(self, robot: RobotState) -> bool:
+        if not robot.docks:
+            return False
+
+        # Recover stuck docked robots by dropping one carried pallet in place.
+        dock_offset, pallet_id = next(iter(robot.docks.items()))
+        dx, dy = int(dock_offset[0]), int(dock_offset[1])
+        pallet_id = int(pallet_id)
+        undock_x = int(robot.x + dx)
+        undock_y = int(robot.y + dy)
+        if not (0 <= undock_x < self.state.width and 0 <= undock_y < self.state.height):
+            return False
+
+        temp_robot = self._clone_robot_state(robot)
+        pending_actions: List[Tuple[int, int, str, int, int]] = []
+        pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+        pending_footprints: List[Tuple[RobotState, int, int, int]] = []
+
+        undock_t = temp_robot.last_t + 1
+        if not self.planner.can_occupy(temp_robot, undock_t, temp_robot.x, temp_robot.y):
+            return False
+
+        pending_actions.append((undock_t, temp_robot.id, "undock", undock_x, undock_y))
+        pending_footprints.append((self._clone_robot_state(temp_robot), undock_t, temp_robot.x, temp_robot.y))
+        temp_robot.last_t = undock_t
+        temp_robot.docks.pop((dx, dy), None)
+
+        if not self._can_commit_pending_actions(pending_actions):
+            return False
+
+        self._commit_plan(
+            robot=robot,
+            temp_robot=temp_robot,
+            pending_actions=pending_actions,
+            pending_paths=pending_paths,
+            pending_footprints=pending_footprints,
+            pending_static_additions=[(undock_t + 1, undock_x, undock_y)],
+        )
+
+        persisted_move_updated = False
+        moves = self.pallet_moves.get(pallet_id, [])
+        if moves:
+            latest_move = moves[-1]
+            if (
+                latest_move.dock_t <= undock_t <= latest_move.undock_t
+                and latest_move.undock_t >= int(self.config.max_time) - 1
+            ):
+                latest_move.undock_t = undock_t
+                latest_move.new_xy = (undock_x, undock_y)
+                persisted_move_updated = True
+
+        if not persisted_move_updated:
+            current_xy = self._pallet_static_xy_at(pallet_id, undock_t)
+            old_xy = current_xy if current_xy is not None else (undock_x, undock_y)
+            self._record_pallet_move(
+                pallet_id=pallet_id,
+                old_xy=(int(old_xy[0]), int(old_xy[1])),
+                new_xy=(undock_x, undock_y),
+                dock_t=undock_t,
+                undock_t=undock_t,
+            )
+
+        sku = None
+        pallet_info = self.pallet_by_id.get(pallet_id)
+        if pallet_info is not None:
+            pallet_info["x"] = undock_x
+            pallet_info["y"] = undock_y
+            sku = int(pallet_info["sku"])
+
+        self.pallet_id_by_coord[(undock_x, undock_y)] = pallet_id
+        if sku is not None:
+            self.scheduler.pallets[(undock_x, undock_y)] = sku
+            if hasattr(self.scheduler, "_rebuild_indexes"):
+                self.scheduler._rebuild_indexes()
+        self._persistently_docked_pallet_ids.discard(pallet_id)
+        self._log(
+            f"idle_recovery_undock robot={robot.id} pallet_id={pallet_id} cell=({undock_x},{undock_y}) "
+            f"last_t={robot.last_t}"
+        )
+        return True
 
     def _plan_idle_parking_move(self, robot: RobotState) -> bool:
         if robot.docks:
