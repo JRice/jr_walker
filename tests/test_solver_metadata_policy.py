@@ -225,6 +225,69 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertTrue(all(x == 10 for x, _ in cells))
         self.assertTrue(all(y <= 5 for _, y in cells))
 
+    def test_setup_pair_target_for_top_hotspot(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+        top_job = SetupJob(
+            sku=1,
+            hotspot=(20, 0),
+            source_pallet_id=7,
+            source_xy=(3, 3),
+            target_xy=(22, 0),
+        )
+        inner_job = SetupJob(
+            sku=2,
+            hotspot=(20, 0),
+            source_pallet_id=8,
+            source_xy=(4, 4),
+            target_xy=(22, 2),
+        )
+
+        self.assertEqual(solver._setup_pair_target_for_job(top_job), (22, 2))
+        self.assertEqual(solver._setup_pair_target_for_job(inner_job), (22, 0))
+
+    def test_pending_setup_pair_job_finds_partner_in_same_hotspot(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+        solver._completed_setup_pallet_ids = set()
+        solver._dropped_setup_pallet_ids = set()
+        primary = SetupJob(
+            sku=1,
+            hotspot=(20, 0),
+            source_pallet_id=71,
+            source_xy=(3, 3),
+            target_xy=(24, 0),
+        )
+        partner = SetupJob(
+            sku=2,
+            hotspot=(20, 0),
+            source_pallet_id=72,
+            source_xy=(4, 4),
+            target_xy=(24, 2),
+        )
+        other = SetupJob(
+            sku=3,
+            hotspot=(0, 15),
+            source_pallet_id=73,
+            source_xy=(5, 5),
+            target_xy=(0, 15),
+        )
+        solver._setup_jobs_by_hotspot = {
+            (20, 0): [primary, partner],
+            (0, 15): [other],
+        }
+
+        pair = solver._pending_setup_pair_job(primary)
+        self.assertIs(pair, partner)
+
+    def test_setup_pair_geometry_returns_center_and_opposite_offsets(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+        geometry = solver._setup_pair_geometry((30, 0), (30, 2))
+        self.assertEqual(geometry, ((30, 1), (0, -1), (0, 1)))
+
+        self.assertIsNone(solver._setup_pair_geometry((30, 0), (31, 2)))
+
     def test_nearest_unreserved_setup_source_prefers_local_owner(self) -> None:
         solver = self._new_solver_shell()
         solver.scheduler = SimpleNamespace(
@@ -902,6 +965,36 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         blocked = solver._forbidden_cells_for_robot(robot)
         self.assertIn((22, 0), blocked)
         self.assertNotIn((10, 0), blocked)
+
+    def test_non_hotspot_astar_forbidden_cells_excludes_center_row_for_top_hotspot(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=30, height=20)
+        hotspot = (10, 0)
+        jobs = (
+            [SimpleNamespace(target_xy=(x, 0)) for x in range(10, 20)]
+            + [SimpleNamespace(target_xy=(x, 2)) for x in range(10, 20)]
+        )
+        solver._setup_jobs_by_hotspot = {hotspot: jobs}
+        solver._nearest_edge_anchor = lambda cell: cell
+
+        by_hotspot = solver._build_hotspot_astar_forbidden_cells_by_hotspot()
+        cells = by_hotspot[(10, 0)]
+        self.assertIn((10, 0), cells)
+        self.assertIn((10, 2), cells)
+        self.assertNotIn((10, 1), cells)
+
+    def test_forbidden_cells_for_unassigned_robot_uses_astar_specific_mask(self) -> None:
+        solver = self._new_solver_shell()
+        solver._robot_hotspot_by_id = {}
+        solver._hotspot_astar_forbidden_cells_by_hotspot = {(10, 0): {(10, 0), (10, 2)}}
+        solver._non_hotspot_astar_forbidden_cells = {(10, 0), (10, 2)}
+        solver._non_hotspot_forbidden_cells = {(10, 0), (10, 1), (10, 2)}
+        robot = SimpleNamespace(id=4, x=5, y=5)
+
+        blocked = solver._forbidden_cells_for_robot(robot)
+        self.assertIn((10, 0), blocked)
+        self.assertIn((10, 2), blocked)
+        self.assertNotIn((10, 1), blocked)
 
     def test_safe_plan_path_blocks_forbidden_target_for_unassigned_robot(self) -> None:
         solver = self._new_solver_shell()

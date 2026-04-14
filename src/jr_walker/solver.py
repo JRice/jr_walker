@@ -147,6 +147,7 @@ class SolverConfig:
     enable_relocation_suggestions: bool = False
     setup_hotspots: List[Tuple[int, int]] = field(default_factory=list)
     setup_mini_box_radius: int = 2
+    enable_setup_dual_relocation: bool = False
     suggestion_retry_limit: int = 12
     suggestion_backoff_base_cycles: int = 2
     suggestion_backoff_max_cycles: int = 128
@@ -363,7 +364,9 @@ class WarehouseSolver:
         self._setup_robot_ids: set[int] = set(self._setup_robot_by_hotspot.values())
         self._robot_hotspot_by_id: Dict[int, Tuple[int, int]] = self._assign_persistent_robot_hotspots()
         self._hotspot_protected_cells_by_hotspot: Dict[Tuple[int, int], set[Tuple[int, int]]] = {}
+        self._hotspot_astar_forbidden_cells_by_hotspot: Dict[Tuple[int, int], set[Tuple[int, int]]] = {}
         self._non_hotspot_forbidden_cells: set[Tuple[int, int]] = set()
+        self._non_hotspot_astar_forbidden_cells: set[Tuple[int, int]] = set()
         self._persistently_docked_pallet_ids: set[int] = set()
         self._completed_setup_pallet_ids: set[int] = set()
         self._dropped_setup_pallet_ids: set[int] = set()
@@ -376,6 +379,10 @@ class WarehouseSolver:
             self._setup_jobs_by_hotspot[hs].append(job)
         self._hotspot_protected_cells_by_hotspot = self._build_hotspot_protected_cells_by_hotspot()
         self._non_hotspot_forbidden_cells = self._build_non_hotspot_forbidden_cells()
+        self._hotspot_astar_forbidden_cells_by_hotspot = (
+            self._build_hotspot_astar_forbidden_cells_by_hotspot()
+        )
+        self._non_hotspot_astar_forbidden_cells = self._build_non_hotspot_astar_forbidden_cells()
         (
             self._setup_slot_index_by_source_pallet_id,
             self._setup_hotspot_frontier_pallet_ids,
@@ -539,15 +546,120 @@ class WarehouseSolver:
             forbidden.update(cells)
         return forbidden
 
+    def _build_hotspot_astar_forbidden_cells_by_hotspot(
+        self,
+    ) -> Dict[Tuple[int, int], set[Tuple[int, int]]]:
+        """
+        Path-mask cells for non-hotspot robots.
+        Keep this narrower than setup-protection cells: only the two setup rows
+        (outer "base" rows), not the center row between them.
+        """
+        by_hotspot: Dict[Tuple[int, int], set[Tuple[int, int]]] = {}
+        width = self.state.width
+        height = self.state.height
+
+        for hotspot, jobs in self._setup_jobs_by_hotspot.items():
+            if not jobs:
+                continue
+
+            hx, hy = self._nearest_edge_anchor(hotspot)
+            target_cells = {(int(j.target_xy[0]), int(j.target_xy[1])) for j in jobs}
+            xs = [x for x, _ in target_cells]
+            ys = [y for _, y in target_cells]
+            min_x = min(xs) if xs else hx
+            max_x = max(xs) if xs else hx
+            min_y = min(ys) if ys else hy
+            max_y = max(ys) if ys else hy
+            cells: set[Tuple[int, int]] = set()
+
+            def add(cell_x: int, cell_y: int) -> None:
+                if 0 <= cell_x < width and 0 <= cell_y < height:
+                    cells.add((int(cell_x), int(cell_y)))
+
+            if hy == 0:
+                for x in range(min_x, max_x + 1):
+                    add(x, 0)
+                    if 2 < height:
+                        add(x, 2)
+                add(min_x - 1, 0)
+                add(max_x + 1, 0)
+                if 2 < height:
+                    add(min_x - 1, 2)
+                    add(max_x + 1, 2)
+                by_hotspot[(int(hx), int(hy))] = cells
+                continue
+
+            if hy == height - 1:
+                for x in range(min_x, max_x + 1):
+                    add(x, height - 1)
+                    if height - 3 >= 0:
+                        add(x, height - 3)
+                add(min_x - 1, height - 1)
+                add(max_x + 1, height - 1)
+                if height - 3 >= 0:
+                    add(min_x - 1, height - 3)
+                    add(max_x + 1, height - 3)
+                by_hotspot[(int(hx), int(hy))] = cells
+                continue
+
+            if hx == 0:
+                for y in range(min_y, max_y + 1):
+                    add(0, y)
+                    if 2 < width:
+                        add(2, y)
+                add(0, min_y - 1)
+                add(0, max_y + 1)
+                if 2 < width:
+                    add(2, min_y - 1)
+                    add(2, max_y + 1)
+                by_hotspot[(int(hx), int(hy))] = cells
+                continue
+
+            if hx == width - 1:
+                for y in range(min_y, max_y + 1):
+                    add(width - 1, y)
+                    if width - 3 >= 0:
+                        add(width - 3, y)
+                add(width - 1, min_y - 1)
+                add(width - 1, max_y + 1)
+                if width - 3 >= 0:
+                    add(width - 3, min_y - 1)
+                    add(width - 3, max_y + 1)
+                by_hotspot[(int(hx), int(hy))] = cells
+                continue
+
+        return by_hotspot
+
+    def _build_non_hotspot_astar_forbidden_cells(self) -> set[Tuple[int, int]]:
+        forbidden: set[Tuple[int, int]] = set()
+        for cells in getattr(self, "_hotspot_astar_forbidden_cells_by_hotspot", {}).values():
+            forbidden.update(cells)
+        return forbidden
+
     def _forbidden_cells_for_robot(self, robot: RobotState) -> set[Tuple[int, int]]:
-        by_hotspot = getattr(self, "_hotspot_protected_cells_by_hotspot", {})
+        by_hotspot = getattr(self, "_hotspot_astar_forbidden_cells_by_hotspot", {})
+        fallback_by_hotspot = getattr(self, "_hotspot_protected_cells_by_hotspot", {})
         if not by_hotspot:
-            if self._robot_has_persistent_hotspot(robot):
-                return set()
-            return set(getattr(self, "_non_hotspot_forbidden_cells", set()))
+            by_hotspot = fallback_by_hotspot
+            if not by_hotspot:
+                if self._robot_has_persistent_hotspot(robot):
+                    return set()
+                return set(
+                    getattr(
+                        self,
+                        "_non_hotspot_astar_forbidden_cells",
+                        getattr(self, "_non_hotspot_forbidden_cells", set()),
+                    )
+                )
 
         if not self._robot_has_persistent_hotspot(robot):
-            return set(getattr(self, "_non_hotspot_forbidden_cells", set()))
+            return set(
+                getattr(
+                    self,
+                    "_non_hotspot_astar_forbidden_cells",
+                    getattr(self, "_non_hotspot_forbidden_cells", set()),
+                )
+            )
 
         assigned = self._nearest_edge_anchor(self._robot_assigned_hotspot(robot))
         blocked: set[Tuple[int, int]] = set()
@@ -3222,7 +3334,435 @@ class WarehouseSolver:
                 safe.append(cell)
         return safe + penalized, len(penalized), len(foreign_corridors)
 
+    def _setup_pair_target_for_job(self, job: SetupJob) -> Tuple[int, int] | None:
+        hx, hy = self._nearest_edge_anchor((int(job.hotspot[0]), int(job.hotspot[1])))
+        tx, ty = int(job.target_xy[0]), int(job.target_xy[1])
+
+        if hy == 0:
+            if ty == hy:
+                pair = (tx, hy + 2)
+            elif ty == hy + 2:
+                pair = (tx, hy)
+            else:
+                return None
+        elif hy == self.state.height - 1:
+            if ty == hy:
+                pair = (tx, hy - 2)
+            elif ty == hy - 2:
+                pair = (tx, hy)
+            else:
+                return None
+        elif hx == 0:
+            if tx == hx:
+                pair = (hx + 2, ty)
+            elif tx == hx + 2:
+                pair = (hx, ty)
+            else:
+                return None
+        elif hx == self.state.width - 1:
+            if tx == hx:
+                pair = (hx - 2, ty)
+            elif tx == hx - 2:
+                pair = (hx, ty)
+            else:
+                return None
+        else:
+            return None
+
+        px, py = int(pair[0]), int(pair[1])
+        if not (0 <= px < self.state.width and 0 <= py < self.state.height):
+            return None
+        return (px, py)
+
+    def _pending_setup_pair_job(self, job: SetupJob) -> SetupJob | None:
+        pair_target = self._setup_pair_target_for_job(job)
+        if pair_target is None:
+            return None
+
+        hotspot = (int(job.hotspot[0]), int(job.hotspot[1]))
+        for other in self._setup_jobs_by_hotspot.get(hotspot, []):
+            if other is job:
+                continue
+            source_pallet_id = int(other.source_pallet_id)
+            if source_pallet_id in self._completed_setup_pallet_ids:
+                continue
+            if source_pallet_id in self._dropped_setup_pallet_ids:
+                continue
+            if (int(other.target_xy[0]), int(other.target_xy[1])) != pair_target:
+                continue
+            return other
+        return None
+
+    def _setup_pair_geometry(
+        self,
+        primary_target: Tuple[int, int],
+        secondary_target: Tuple[int, int],
+    ) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]] | None:
+        p1 = (int(primary_target[0]), int(primary_target[1]))
+        p2 = (int(secondary_target[0]), int(secondary_target[1]))
+
+        if p1[0] == p2[0] and abs(p1[1] - p2[1]) == 2:
+            center = (p1[0], min(p1[1], p2[1]) + 1)
+        elif p1[1] == p2[1] and abs(p1[0] - p2[0]) == 2:
+            center = (min(p1[0], p2[0]) + 1, p1[1])
+        else:
+            return None
+
+        o1 = (p1[0] - center[0], p1[1] - center[1])
+        o2 = (p2[0] - center[0], p2[1] - center[1])
+        if abs(o1[0]) + abs(o1[1]) != 1:
+            return None
+        if abs(o2[0]) + abs(o2[1]) != 1:
+            return None
+        if o2 != (-o1[0], -o1[1]):
+            return None
+        if not (0 <= center[0] < self.state.width and 0 <= center[1] < self.state.height):
+            return None
+        return center, o1, o2
+
+    def _apply_setup_job_source_selection(
+        self,
+        *,
+        job: SetupJob,
+        selected_source_pallet_id: int,
+        selected_source_xy: Tuple[int, int],
+    ) -> None:
+        selected_source_pallet_id = int(selected_source_pallet_id)
+        selected_source_xy = (int(selected_source_xy[0]), int(selected_source_xy[1]))
+        old_source_pallet_id = int(job.source_pallet_id)
+        if selected_source_pallet_id != old_source_pallet_id:
+            self._log(
+                "setup_source_swap "
+                f"hotspot={job.hotspot} sku={job.sku} "
+                f"old_source_pallet_id={old_source_pallet_id} new_source_pallet_id={selected_source_pallet_id}"
+            )
+            self._setup_job_by_source_pallet_id.pop(old_source_pallet_id, None)
+            self._rebind_setup_source_pallet_id(
+                job=job,
+                old_source_pallet_id=old_source_pallet_id,
+                new_source_pallet_id=selected_source_pallet_id,
+            )
+        job.source_pallet_id = selected_source_pallet_id
+        job.source_xy = selected_source_xy
+        self._setup_job_by_source_pallet_id[selected_source_pallet_id] = job
+
+    def _plan_setup_pair_for_robot(
+        self,
+        *,
+        robot: RobotState,
+        primary_job: SetupJob,
+        secondary_job: SetupJob,
+    ) -> bool:
+        geometry = self._setup_pair_geometry(primary_job.target_xy, secondary_job.target_xy)
+        if geometry is None:
+            return False
+        center_xy, primary_offset, secondary_offset = geometry
+        primary_target = (int(primary_job.target_xy[0]), int(primary_job.target_xy[1]))
+        secondary_target = (int(secondary_job.target_xy[0]), int(secondary_job.target_xy[1]))
+
+        primary_sources = self._setup_source_candidates_for_job(robot, primary_job, limit=4)
+        if not primary_sources:
+            return False
+
+        for primary_source_pallet_id, primary_source_xy in primary_sources:
+            primary_source_xy = (int(primary_source_xy[0]), int(primary_source_xy[1]))
+            stand_cells = self._candidate_relocation_stand_cells(robot, primary_source_xy)
+            stand_cells, _, _ = self._prioritize_setup_stands_away_from_foreign_corridors(
+                stand_cells,
+                primary_job.hotspot,
+            )
+            stand_cells.sort(
+                key=lambda s: (
+                    0
+                    if (
+                        int(primary_source_xy[0]) - int(s[0]),
+                        int(primary_source_xy[1]) - int(s[1]),
+                    )
+                    == primary_offset
+                    else 1,
+                    abs(int(s[0]) - int(robot.x)) + abs(int(s[1]) - int(robot.y)),
+                )
+            )
+            for stand_xy in stand_cells:
+                temp_robot = self._clone_robot_state(robot)
+                pending_actions: List[Tuple[int, int, str, int, int]] = []
+                pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+                pending_footprints: List[Tuple[RobotState, int, int, int]] = []
+
+                path_to_primary_stand = self._safe_plan_path(temp_robot, int(stand_xy[0]), int(stand_xy[1]))
+                if not path_to_primary_stand and (temp_robot.x != int(stand_xy[0]) or temp_robot.y != int(stand_xy[1])):
+                    continue
+                if path_to_primary_stand:
+                    pending_paths.append((self._clone_robot_state(temp_robot), path_to_primary_stand))
+                pending_actions.extend(self._apply_moves_to_robot(temp_robot, path_to_primary_stand))
+
+                primary_dx = int(primary_source_xy[0]) - int(temp_robot.x)
+                primary_dy = int(primary_source_xy[1]) - int(temp_robot.y)
+                current_primary_offset = (primary_dx, primary_dy)
+                if abs(primary_dx) + abs(primary_dy) != 1:
+                    continue
+
+                primary_dock_t = temp_robot.last_t + 1
+                if not self.planner.can_occupy(temp_robot, primary_dock_t, temp_robot.x, temp_robot.y):
+                    continue
+                pending_actions.append(
+                    (
+                        primary_dock_t,
+                        temp_robot.id,
+                        "dock",
+                        int(primary_source_xy[0]),
+                        int(primary_source_xy[1]),
+                    )
+                )
+                pending_footprints.append(
+                    (self._clone_robot_state(temp_robot), primary_dock_t, temp_robot.x, temp_robot.y)
+                )
+                temp_robot.last_t = primary_dock_t
+                temp_robot.docks[current_primary_offset] = int(primary_source_pallet_id)
+
+                if current_primary_offset != primary_offset:
+                    primary_pallet_xy = (
+                        int(temp_robot.x + current_primary_offset[0]),
+                        int(temp_robot.y + current_primary_offset[1]),
+                    )
+                    reorient_ok, new_primary_offset = self._execute_local_pivot_maneuver(
+                        staged_robot=temp_robot,
+                        pallet_id=int(primary_source_pallet_id),
+                        staged_pallet_xy=primary_pallet_xy,
+                        staged_offset=current_primary_offset,
+                        target_offset=primary_offset,
+                        staged_paths=pending_paths,
+                        staged_actions=pending_actions,
+                        staged_footprints=pending_footprints,
+                        note=lambda _reason: None,
+                    )
+                    if not reorient_ok:
+                        continue
+                    current_primary_offset = new_primary_offset
+
+                secondary_sources = self._setup_source_candidates_for_job(temp_robot, secondary_job, limit=6)
+                for secondary_source_pallet_id, secondary_source_xy in secondary_sources:
+                    secondary_source_xy = (int(secondary_source_xy[0]), int(secondary_source_xy[1]))
+                    if int(secondary_source_pallet_id) == int(primary_source_pallet_id):
+                        continue
+
+                    stand2_cells = []
+                    for sx, sy in self._candidate_relocation_stand_cells(temp_robot, secondary_source_xy):
+                        offset = (int(secondary_source_xy[0]) - int(sx), int(secondary_source_xy[1]) - int(sy))
+                        if offset == secondary_offset:
+                            stand2_cells.append((int(sx), int(sy)))
+                    if not stand2_cells:
+                        continue
+
+                    for stand2_xy in stand2_cells:
+                        staged_robot = self._clone_robot_state(temp_robot)
+                        staged_actions = list(pending_actions)
+                        staged_paths = list(pending_paths)
+                        staged_footprints = list(pending_footprints)
+
+                        path_to_secondary_stand = self._safe_plan_path(
+                            staged_robot,
+                            int(stand2_xy[0]),
+                            int(stand2_xy[1]),
+                        )
+                        if not path_to_secondary_stand and (
+                            staged_robot.x != int(stand2_xy[0]) or staged_robot.y != int(stand2_xy[1])
+                        ):
+                            continue
+                        if path_to_secondary_stand:
+                            staged_paths.append((self._clone_robot_state(staged_robot), path_to_secondary_stand))
+                        staged_actions.extend(self._apply_moves_to_robot(staged_robot, path_to_secondary_stand))
+
+                        secondary_dx = int(secondary_source_xy[0]) - int(staged_robot.x)
+                        secondary_dy = int(secondary_source_xy[1]) - int(staged_robot.y)
+                        if (secondary_dx, secondary_dy) != secondary_offset:
+                            continue
+
+                        secondary_dock_t = staged_robot.last_t + 1
+                        if not self.planner.can_occupy(
+                            staged_robot,
+                            secondary_dock_t,
+                            staged_robot.x,
+                            staged_robot.y,
+                        ):
+                            continue
+                        staged_actions.append(
+                            (
+                                secondary_dock_t,
+                                staged_robot.id,
+                                "dock",
+                                int(secondary_source_xy[0]),
+                                int(secondary_source_xy[1]),
+                            )
+                        )
+                        staged_footprints.append(
+                            (
+                                self._clone_robot_state(staged_robot),
+                                secondary_dock_t,
+                                staged_robot.x,
+                                staged_robot.y,
+                            )
+                        )
+                        staged_robot.last_t = secondary_dock_t
+                        staged_robot.docks[secondary_offset] = int(secondary_source_pallet_id)
+
+                        path_to_center = self._safe_plan_path(
+                            staged_robot,
+                            int(center_xy[0]),
+                            int(center_xy[1]),
+                        )
+                        if not path_to_center and (
+                            staged_robot.x != int(center_xy[0]) or staged_robot.y != int(center_xy[1])
+                        ):
+                            continue
+                        if path_to_center:
+                            staged_paths.append((self._clone_robot_state(staged_robot), path_to_center))
+                        staged_actions.extend(self._apply_moves_to_robot(staged_robot, path_to_center))
+
+                        if (int(staged_robot.x), int(staged_robot.y)) != center_xy:
+                            continue
+                        if (
+                            int(staged_robot.x + primary_offset[0]),
+                            int(staged_robot.y + primary_offset[1]),
+                        ) != primary_target:
+                            continue
+                        if (
+                            int(staged_robot.x + secondary_offset[0]),
+                            int(staged_robot.y + secondary_offset[1]),
+                        ) != secondary_target:
+                            continue
+
+                        primary_undock_t = staged_robot.last_t + 1
+                        if not self.planner.can_occupy(
+                            staged_robot,
+                            primary_undock_t,
+                            staged_robot.x,
+                            staged_robot.y,
+                        ):
+                            continue
+                        staged_actions.append(
+                            (
+                                primary_undock_t,
+                                staged_robot.id,
+                                "undock",
+                                int(primary_target[0]),
+                                int(primary_target[1]),
+                            )
+                        )
+                        staged_footprints.append(
+                            (
+                                self._clone_robot_state(staged_robot),
+                                primary_undock_t,
+                                staged_robot.x,
+                                staged_robot.y,
+                            )
+                        )
+                        staged_robot.last_t = primary_undock_t
+                        staged_robot.docks.pop(primary_offset, None)
+
+                        secondary_undock_t = staged_robot.last_t + 1
+                        if not self.planner.can_occupy(
+                            staged_robot,
+                            secondary_undock_t,
+                            staged_robot.x,
+                            staged_robot.y,
+                        ):
+                            continue
+                        staged_actions.append(
+                            (
+                                secondary_undock_t,
+                                staged_robot.id,
+                                "undock",
+                                int(secondary_target[0]),
+                                int(secondary_target[1]),
+                            )
+                        )
+                        staged_footprints.append(
+                            (
+                                self._clone_robot_state(staged_robot),
+                                secondary_undock_t,
+                                staged_robot.x,
+                                staged_robot.y,
+                            )
+                        )
+                        staged_robot.last_t = secondary_undock_t
+                        staged_robot.docks.pop(secondary_offset, None)
+
+                        if not self._can_commit_pending_actions(staged_actions):
+                            continue
+
+                        self._commit_plan(
+                            robot=robot,
+                            temp_robot=staged_robot,
+                            pending_actions=staged_actions,
+                            pending_paths=staged_paths,
+                            pending_footprints=staged_footprints,
+                            pending_static_additions=[
+                                (primary_undock_t + 1, int(primary_target[0]), int(primary_target[1])),
+                                (secondary_undock_t + 1, int(secondary_target[0]), int(secondary_target[1])),
+                            ],
+                        )
+
+                        self._finalize_relocation_pallet_state(
+                            pallet_id=int(primary_source_pallet_id),
+                            old_xy=primary_source_xy,
+                            new_xy=primary_target,
+                            dock_t=primary_dock_t,
+                            undock_t=primary_undock_t,
+                        )
+                        self._finalize_relocation_pallet_state(
+                            pallet_id=int(secondary_source_pallet_id),
+                            old_xy=secondary_source_xy,
+                            new_xy=secondary_target,
+                            dock_t=secondary_dock_t,
+                            undock_t=secondary_undock_t,
+                        )
+
+                        self._apply_setup_job_source_selection(
+                            job=primary_job,
+                            selected_source_pallet_id=int(primary_source_pallet_id),
+                            selected_source_xy=primary_source_xy,
+                        )
+                        primary_job.target_xy = primary_target
+                        self._apply_setup_job_source_selection(
+                            job=secondary_job,
+                            selected_source_pallet_id=int(secondary_source_pallet_id),
+                            selected_source_xy=secondary_source_xy,
+                        )
+                        secondary_job.target_xy = secondary_target
+
+                        secondary_source_id = int(secondary_job.source_pallet_id)
+                        self._completed_setup_pallet_ids.add(secondary_source_id)
+                        self._setup_retry_not_before_timestep.pop(secondary_source_id, None)
+                        self._setup_wait_logged_cycle.pop(secondary_source_id, None)
+                        self._setup_frontier_wait_logged_cycle.pop(secondary_source_id, None)
+                        self._log(
+                            "setup_pair_done "
+                            f"hotspot={primary_job.hotspot} robot={robot.id} "
+                            f"primary_sku={primary_job.sku} primary_source_pallet_id={primary_job.source_pallet_id} "
+                            f"primary_target={primary_target} "
+                            f"secondary_sku={secondary_job.sku} secondary_source_pallet_id={secondary_source_id} "
+                            f"secondary_target={secondary_target}"
+                        )
+                        self._log_setup_hotspot_progress(
+                            primary_job.hotspot,
+                            reason=f"pair_done_pid_{secondary_source_id}",
+                        )
+                        return True
+        return False
+
     def _plan_setup_pallet_for_robot(self, robot: RobotState, job: SetupJob) -> bool:
+        if bool(getattr(self.config, "enable_setup_dual_relocation", False)):
+            pair_job = self._pending_setup_pair_job(job)
+            if pair_job is not None:
+                if self._plan_setup_pair_for_robot(
+                    robot=robot,
+                    primary_job=job,
+                    secondary_job=pair_job,
+                ):
+                    self._consume_setup_reject(robot.id)
+                    return True
+
         source_candidates = self._setup_source_candidates_for_job(robot, job)
         if not source_candidates:
             self._remember_setup_reject(
@@ -3305,23 +3845,12 @@ class WarehouseSolver:
                     dock_t=dock_t,
                     undock_t=undock_t,
                 )
-                old_source_pallet_id = int(job.source_pallet_id)
-                if int(source_pallet_id) != old_source_pallet_id:
-                    self._log(
-                        "setup_source_swap "
-                        f"hotspot={job.hotspot} sku={job.sku} "
-                        f"old_source_pallet_id={old_source_pallet_id} new_source_pallet_id={source_pallet_id}"
-                    )
-                    self._setup_job_by_source_pallet_id.pop(old_source_pallet_id, None)
-                    self._rebind_setup_source_pallet_id(
-                        job=job,
-                        old_source_pallet_id=old_source_pallet_id,
-                        new_source_pallet_id=int(source_pallet_id),
-                    )
-                job.source_pallet_id = int(source_pallet_id)
-                job.source_xy = source_xy
+                self._apply_setup_job_source_selection(
+                    job=job,
+                    selected_source_pallet_id=int(source_pallet_id),
+                    selected_source_xy=source_xy,
+                )
                 job.target_xy = new_xy
-                self._setup_job_by_source_pallet_id[int(source_pallet_id)] = job
                 self._consume_setup_reject(robot.id)
                 return True
 

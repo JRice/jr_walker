@@ -62,6 +62,9 @@ realistic_fail_mode = false
 max_robots_per_suggestion = 3
 # Local mini-box radius used by hierarchical motion maneuvers (2 => 5x5 box).
 setup_mini_box_radius = 2
+# If true, setup planner may relocate paired setup pallets in one dual-carry trip
+# by forming an "I" dock shape (opposite-side docks).
+enable_setup_dual_relocation = true
 # After this many consecutive local planning failures, try parking that robot.
 robot_fail_streak_for_parking = 3
 # Max low-use parking targets scanned per parking attempt.
