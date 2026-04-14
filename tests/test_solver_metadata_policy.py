@@ -246,6 +246,44 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertEqual(solver._setup_pair_target_for_job(top_job), (22, 2))
         self.assertEqual(solver._setup_pair_target_for_job(inner_job), (22, 0))
 
+    def test_setup_pair_target_for_right_and_bottom_hotspots(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+
+        right_outer = SetupJob(
+            sku=1,
+            hotspot=(59, 20),
+            source_pallet_id=1,
+            source_xy=(3, 3),
+            target_xy=(59, 25),
+        )
+        right_inner = SetupJob(
+            sku=2,
+            hotspot=(59, 20),
+            source_pallet_id=2,
+            source_xy=(4, 4),
+            target_xy=(57, 25),
+        )
+        bottom_outer = SetupJob(
+            sku=3,
+            hotspot=(20, 39),
+            source_pallet_id=3,
+            source_xy=(5, 5),
+            target_xy=(24, 39),
+        )
+        bottom_inner = SetupJob(
+            sku=4,
+            hotspot=(20, 39),
+            source_pallet_id=4,
+            source_xy=(6, 6),
+            target_xy=(24, 37),
+        )
+
+        self.assertEqual(solver._setup_pair_target_for_job(right_outer), (57, 25))
+        self.assertEqual(solver._setup_pair_target_for_job(right_inner), (59, 25))
+        self.assertEqual(solver._setup_pair_target_for_job(bottom_outer), (24, 37))
+        self.assertEqual(solver._setup_pair_target_for_job(bottom_inner), (24, 39))
+
     def test_pending_setup_pair_job_finds_partner_in_same_hotspot(self) -> None:
         solver = self._new_solver_shell()
         solver.state = SimpleNamespace(width=60, height=40)

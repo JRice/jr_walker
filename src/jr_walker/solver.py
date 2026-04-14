@@ -3546,11 +3546,22 @@ class WarehouseSolver:
                     if int(secondary_source_pallet_id) == int(primary_source_pallet_id):
                         continue
 
-                    stand2_cells = []
-                    for sx, sy in self._candidate_relocation_stand_cells(temp_robot, secondary_source_xy):
-                        offset = (int(secondary_source_xy[0]) - int(sx), int(secondary_source_xy[1]) - int(sy))
-                        if offset == secondary_offset:
-                            stand2_cells.append((int(sx), int(sy)))
+                    stand2_cells = [
+                        (int(sx), int(sy))
+                        for sx, sy in self._candidate_relocation_stand_cells(temp_robot, secondary_source_xy)
+                    ]
+                    stand2_cells.sort(
+                        key=lambda s: (
+                            0
+                            if (
+                                int(secondary_source_xy[0]) - int(s[0]),
+                                int(secondary_source_xy[1]) - int(s[1]),
+                            )
+                            == secondary_offset
+                            else 1,
+                            abs(int(s[0]) - int(temp_robot.x)) + abs(int(s[1]) - int(temp_robot.y)),
+                        )
+                    )
                     if not stand2_cells:
                         continue
 
@@ -3575,7 +3586,8 @@ class WarehouseSolver:
 
                         secondary_dx = int(secondary_source_xy[0]) - int(staged_robot.x)
                         secondary_dy = int(secondary_source_xy[1]) - int(staged_robot.y)
-                        if (secondary_dx, secondary_dy) != secondary_offset:
+                        current_secondary_offset = (secondary_dx, secondary_dy)
+                        if abs(secondary_dx) + abs(secondary_dy) != 1:
                             continue
 
                         secondary_dock_t = staged_robot.last_t + 1
@@ -3604,7 +3616,27 @@ class WarehouseSolver:
                             )
                         )
                         staged_robot.last_t = secondary_dock_t
-                        staged_robot.docks[secondary_offset] = int(secondary_source_pallet_id)
+                        staged_robot.docks[current_secondary_offset] = int(secondary_source_pallet_id)
+
+                        if current_secondary_offset != secondary_offset:
+                            secondary_pallet_xy = (
+                                int(staged_robot.x + current_secondary_offset[0]),
+                                int(staged_robot.y + current_secondary_offset[1]),
+                            )
+                            reorient_ok, new_secondary_offset = self._execute_local_pivot_maneuver(
+                                staged_robot=staged_robot,
+                                pallet_id=int(secondary_source_pallet_id),
+                                staged_pallet_xy=secondary_pallet_xy,
+                                staged_offset=current_secondary_offset,
+                                target_offset=secondary_offset,
+                                staged_paths=staged_paths,
+                                staged_actions=staged_actions,
+                                staged_footprints=staged_footprints,
+                                note=lambda _reason: None,
+                            )
+                            if not reorient_ok:
+                                continue
+                            current_secondary_offset = new_secondary_offset
 
                         path_to_center = self._safe_plan_path(
                             staged_robot,
@@ -3686,7 +3718,7 @@ class WarehouseSolver:
                             )
                         )
                         staged_robot.last_t = secondary_undock_t
-                        staged_robot.docks.pop(secondary_offset, None)
+                        staged_robot.docks.pop(current_secondary_offset, None)
 
                         if not self._can_commit_pending_actions(staged_actions):
                             continue

@@ -16,3 +16,4 @@ models/
 .env
 output/*.log
 output/test_case_*
+output/partial_*
