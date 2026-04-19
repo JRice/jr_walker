@@ -545,6 +545,15 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
 def _run_pipeline(
     solver: WarehouseSolver, run_config: RunConfig, output_dir: Path
 ) -> tuple[list[tuple[int, int, str, int, int]], Exception | None]:
+    def _is_controlled_limit_stop(exc: Exception) -> bool:
+        if isinstance(exc, TimeoutError):
+            return True
+        if isinstance(exc, RuntimeError):
+            message = str(exc)
+            if message.startswith("Reached max_makespan="):
+                return True
+        return False
+
     solve_error: Exception | None = None
     actions: list[tuple[int, int, str, int, int]] = []
     base_actions: list[tuple[int, int, str, int, int]] = []
@@ -592,13 +601,17 @@ def _run_pipeline(
             pass
     except Exception as exc:
         solve_error = exc
-        print(f"Solver/optimizer failed: {type(exc).__name__}: {exc!r}")
+        if _is_controlled_limit_stop(exc):
+            print(f"Solver stopped by configured limit: {type(exc).__name__}: {exc}")
+        else:
+            print(f"Solver/optimizer failed: {type(exc).__name__}: {exc!r}")
         if hasattr(solver, "active_work_item_summary"):
             try:
                 print(f"Active suggestion at failure: {solver.active_work_item_summary()}")
             except Exception:
                 pass
-        print(traceback.format_exc())
+        if not _is_controlled_limit_stop(exc):
+            print(traceback.format_exc())
         if base_actions:
             print("Reverting to pre-LNS baseline actions...")
             actions = list(base_actions)

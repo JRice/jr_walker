@@ -196,6 +196,13 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertEqual(solver._setup_inward_step((20, 5)), -1)
         self.assertEqual(solver._setup_inward_step((20, 35)), 1)
 
+    def test_setup_preferred_redock_offset_matches_top_bottom_edges(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+
+        self.assertEqual(solver._setup_preferred_redock_offset((35, 0)), (0, -1))
+        self.assertEqual(solver._setup_preferred_redock_offset((20, 39)), (0, 1))
+
     def test_setup_pull_directions_prioritize_larger_axis(self) -> None:
         solver = self._new_solver_shell()
 
@@ -325,6 +332,46 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         self.assertEqual(geometry, ((30, 1), (0, -1), (0, 1)))
 
         self.assertIsNone(solver._setup_pair_geometry((30, 0), (31, 2)))
+
+    def test_setup_pair_clearance_direction_for_north_south_edges(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+
+        self.assertEqual(solver._setup_pair_clearance_direction((20, 0)), (0, 1))
+        self.assertEqual(solver._setup_pair_clearance_direction((20, 39)), (0, -1))
+        self.assertIsNone(solver._setup_pair_clearance_direction((0, 15)))
+
+    def test_setup_pair_source_candidates_prioritize_target_local_sources(self) -> None:
+        solver = self._new_solver_shell()
+        solver.state = SimpleNamespace(width=60, height=40)
+        solver.setup_jobs = []
+        solver._completed_setup_pallet_ids = set()
+        solver._dropped_setup_pallet_ids = set()
+        solver._setup_source_owner_by_pallet_id = {
+            62: (35, 0),
+            87: (35, 0),
+            150: (35, 0),
+        }
+        solver.scheduler = SimpleNamespace(
+            pallets={(45, 13): 8, (39, 9): 8, (17, 13): 8},
+            pallet_cells_for_sku=lambda _sku: [(45, 13), (39, 9), (17, 13)],
+        )
+        solver.pallet_id_by_coord = {
+            (45, 13): 62,
+            (39, 9): 87,
+            (17, 13): 150,
+        }
+        robot = SimpleNamespace(id=4, x=32, y=18, last_t=0)
+        job = SetupJob(
+            sku=8,
+            hotspot=(35, 0),
+            source_pallet_id=62,
+            source_xy=(45, 13),
+            target_xy=(38, 2),
+        )
+
+        ranked = solver._setup_pair_source_candidates_for_job(robot, job, limit=3)
+        self.assertEqual([pid for pid, _ in ranked], [87, 62, 150])
 
     def test_nearest_unreserved_setup_source_prefers_local_owner(self) -> None:
         solver = self._new_solver_shell()
@@ -1161,7 +1208,7 @@ class SolverMetadataPolicyTests(unittest.TestCase):
         solver = self._new_solver_shell()
         solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)
         solver.robots = [
-            SimpleNamespace(id=0, x=0, y=0, last_t=1, docks={(1, 0): 1}),
+            SimpleNamespace(id=0, x=0, y=0, last_t=1, docks={(1, 0): 1}, assigned_hotspot=(0, 10)),
             SimpleNamespace(id=1, x=1, y=1, last_t=2, docks={}),
             SimpleNamespace(id=2, x=2, y=2, last_t=3, docks={}),
         ]
@@ -1172,6 +1219,22 @@ class SolverMetadataPolicyTests(unittest.TestCase):
 
         ranked = solver._candidate_robots_for_suggestion(suggestion)
         self.assertEqual([r.id for r in ranked], [1, 2])
+
+    def test_candidate_robots_for_dock_excludes_hotspot_assigned_robots(self) -> None:
+        solver = self._new_solver_shell()
+        solver.config = SimpleNamespace(max_robots_per_suggestion=3, path_step_limit=50)
+        solver.robots = [
+            SimpleNamespace(id=0, x=0, y=0, last_t=0, docks={}, assigned_hotspot=(0, 10)),
+            SimpleNamespace(id=1, x=1, y=1, last_t=0, docks={}),
+        ]
+        solver._retired_robot_ids = set()
+        solver._has_pending_setup_for_robot = lambda _rid: False
+
+        from jr_walker.logic import DockSuggestion
+
+        suggestion = DockSuggestion(sku=5, plan=[1], gain=1.0, pallet_xy=(0, 0))
+        ranked = solver._candidate_robots_for_suggestion(suggestion)
+        self.assertEqual([r.id for r in ranked], [1])
 
 
 if __name__ == "__main__":

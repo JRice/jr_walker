@@ -1591,6 +1591,10 @@ class WarehouseSolver:
         bottom_dist = self.state.height - 1 - sy
         return -1 if top_dist <= bottom_dist else 1
 
+    def _setup_preferred_redock_offset(self, hotspot: Tuple[int, int]) -> Tuple[int, int]:
+        # Top hotspots should prefer carrying pallet north of robot; bottom hotspots south.
+        return (0, self._setup_inward_step(hotspot))
+
     def _setup_pull_directions(
         self,
         from_xy: Tuple[int, int],
@@ -2569,6 +2573,11 @@ class WarehouseSolver:
             robot_pool = non_setup_robots
 
         if isinstance(suggestion, DockSuggestion):
+            # Keep hotspot-assigned robots focused on their lane/base responsibilities.
+            # Dock suggestions should only be served by free-roaming robots.
+            robot_pool = [r for r in robot_pool if not self._robot_has_persistent_hotspot(r)]
+            if not robot_pool:
+                return []
             dock_free_pool = [r for r in robot_pool if not getattr(r, "docks", {})]
             if dock_free_pool:
                 robot_pool = dock_free_pool
@@ -3282,6 +3291,50 @@ class WarehouseSolver:
         capped = rows[: max(1, int(limit))]
         return [(source_pallet_id, source_xy) for _, _, _, _, source_pallet_id, source_xy in capped]
 
+    def _setup_pair_source_candidates_for_job(
+        self,
+        robot: RobotState,
+        job: SetupJob,
+        *,
+        limit: int = 12,
+    ) -> List[Tuple[int, Tuple[int, int]]]:
+        """
+        Pair-mode source ranking.
+        Prefer hotspot-local, target-near pallets over robot-near pallets so the
+        second half of an "I" build stays local to the setup edge.
+        """
+        raw_limit = max(max(1, int(limit)) * 8, 64)
+        base = self._setup_source_candidates_for_job(robot, job, limit=raw_limit)
+        if not base:
+            return []
+
+        owner_map: Dict[int, Tuple[int, int]] = getattr(self, "_setup_source_owner_by_pallet_id", {})
+        hotspot_key = (int(job.hotspot[0]), int(job.hotspot[1]))
+        target_xy = (int(job.target_xy[0]), int(job.target_xy[1]))
+        rows: List[Tuple[int, int, int, int, int, int, Tuple[int, int]]] = []
+        for source_pallet_id, source_xy in base:
+            sx, sy = int(source_xy[0]), int(source_xy[1])
+            owner_priority = 0 if owner_map.get(int(source_pallet_id)) == hotspot_key else 1
+            target_dist = abs(sx - target_xy[0]) + abs(sy - target_xy[1])
+            hotspot_dist = abs(sx - hotspot_key[0]) + abs(sy - hotspot_key[1])
+            robot_dist = abs(sx - int(robot.x)) + abs(sy - int(robot.y))
+            source_pref = 0 if int(source_pallet_id) == int(job.source_pallet_id) else 1
+            rows.append(
+                (
+                    owner_priority,
+                    target_dist,
+                    hotspot_dist,
+                    robot_dist,
+                    source_pref,
+                    int(source_pallet_id),
+                    (sx, sy),
+                )
+            )
+
+        rows.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4], row[5]))
+        capped = rows[: max(1, int(limit))]
+        return [(source_pallet_id, source_xy) for _, _, _, _, _, source_pallet_id, source_xy in capped]
+
     def _hotspot_has_pending_setup_jobs(self, hotspot: Tuple[int, int]) -> bool:
         hotspot_key = (int(hotspot[0]), int(hotspot[1]))
         jobs = self._setup_jobs_by_hotspot.get(hotspot_key, [])
@@ -3420,6 +3473,52 @@ class WarehouseSolver:
             return None
         return center, o1, o2
 
+    def _setup_pair_clearance_direction(
+        self,
+        hotspot: Tuple[int, int],
+    ) -> Tuple[int, int] | None:
+        hx, hy = self._nearest_edge_anchor((int(hotspot[0]), int(hotspot[1])))
+        if hy == 0:
+            return (0, 1)
+        if hy == self.state.height - 1:
+            return (0, -1)
+        # N/S edges are the primary pain point for in-place reorientation.
+        return None
+
+    def _setup_pair_pull_clearance(
+        self,
+        *,
+        staged_robot: RobotState,
+        hotspot: Tuple[int, int],
+        staged_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]],
+        staged_actions: List[Tuple[int, int, str, int, int]],
+        max_steps: int = 2,
+    ) -> int:
+        direction = self._setup_pair_clearance_direction(hotspot)
+        if direction is None:
+            return 0
+
+        moved_steps = 0
+        step_dx, step_dy = int(direction[0]), int(direction[1])
+        for _ in range(max(0, int(max_steps))):
+            nx = int(staged_robot.x + step_dx)
+            ny = int(staged_robot.y + step_dy)
+            if not (0 <= nx < self.state.width and 0 <= ny < self.state.height):
+                break
+            step_path = self._safe_plan_path_with_step_cap(
+                staged_robot,
+                nx,
+                ny,
+                max_path_steps=1,
+            )
+            if not step_path and (staged_robot.x != nx or staged_robot.y != ny):
+                break
+            if step_path:
+                staged_paths.append((self._clone_robot_state(staged_robot), step_path))
+            staged_actions.extend(self._apply_moves_to_robot(staged_robot, step_path))
+            moved_steps += 1
+        return moved_steps
+
     def _apply_setup_job_source_selection(
         self,
         *,
@@ -3460,7 +3559,7 @@ class WarehouseSolver:
         primary_target = (int(primary_job.target_xy[0]), int(primary_job.target_xy[1]))
         secondary_target = (int(secondary_job.target_xy[0]), int(secondary_job.target_xy[1]))
 
-        primary_sources = self._setup_source_candidates_for_job(robot, primary_job, limit=4)
+        primary_sources = self._setup_pair_source_candidates_for_job(robot, primary_job, limit=8)
         if not primary_sources:
             return False
 
@@ -3521,6 +3620,19 @@ class WarehouseSolver:
                 temp_robot.docks[current_primary_offset] = int(primary_source_pallet_id)
 
                 if current_primary_offset != primary_offset:
+                    pulled_steps = self._setup_pair_pull_clearance(
+                        staged_robot=temp_robot,
+                        hotspot=primary_job.hotspot,
+                        staged_paths=pending_paths,
+                        staged_actions=pending_actions,
+                        max_steps=2,
+                    )
+                    if pulled_steps > 0:
+                        self._log(
+                            "setup_pair_pull_clearance "
+                            f"hotspot={primary_job.hotspot} robot={robot.id} "
+                            f"phase=primary steps={pulled_steps}"
+                        )
                     primary_pallet_xy = (
                         int(temp_robot.x + current_primary_offset[0]),
                         int(temp_robot.y + current_primary_offset[1]),
@@ -3540,7 +3652,7 @@ class WarehouseSolver:
                         continue
                     current_primary_offset = new_primary_offset
 
-                secondary_sources = self._setup_source_candidates_for_job(temp_robot, secondary_job, limit=6)
+                secondary_sources = self._setup_pair_source_candidates_for_job(temp_robot, secondary_job, limit=12)
                 for secondary_source_pallet_id, secondary_source_xy in secondary_sources:
                     secondary_source_xy = (int(secondary_source_xy[0]), int(secondary_source_xy[1]))
                     if int(secondary_source_pallet_id) == int(primary_source_pallet_id):
@@ -3619,6 +3731,19 @@ class WarehouseSolver:
                         staged_robot.docks[current_secondary_offset] = int(secondary_source_pallet_id)
 
                         if current_secondary_offset != secondary_offset:
+                            pulled_steps = self._setup_pair_pull_clearance(
+                                staged_robot=staged_robot,
+                                hotspot=secondary_job.hotspot,
+                                staged_paths=staged_paths,
+                                staged_actions=staged_actions,
+                                max_steps=2,
+                            )
+                            if pulled_steps > 0:
+                                self._log(
+                                    "setup_pair_pull_clearance "
+                                    f"hotspot={secondary_job.hotspot} robot={robot.id} "
+                                    f"phase=secondary steps={pulled_steps}"
+                                )
                             secondary_pallet_xy = (
                                 int(staged_robot.x + current_secondary_offset[0]),
                                 int(staged_robot.y + current_secondary_offset[1]),
@@ -4083,7 +4208,9 @@ class WarehouseSolver:
                         "task_plan_setup_relocation "
                         f"robot={robot.id} source={pallet_xy} target=({tx},{ty}) macros={macro_names}"
                     )
-                preferred_setup_offset = (0, -setup_redock_edge_step)
+                # For top hotspots setup_redock_edge_step is -1 (prefer north side),
+                # for bottom hotspots it is +1 (prefer south side).
+                preferred_setup_offset = (0, setup_redock_edge_step)
 
                 # Retry redock staging by pulling farther toward target before trying edge-side orientation.
                 # This avoids getting stuck when the first reorientation point is blocked.
