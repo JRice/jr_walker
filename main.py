@@ -52,12 +52,17 @@ def main() -> None:
         grid.reserve(0, r.x, r.y)
 
     # --- Assign robots to nests ---
-    assign_robots_to_nests(robots, cfg.nest_x_coords)
-    nest_robots = {nx: [r for r in robots if r.nest_id == nx] for nx in cfg.nest_x_coords}
+    assign_robots_to_nests(robots, cfg.nest_coords)
+    nest_robots = {
+        coord: [r for r in robots if r.nest_id == coord]
+        for coord in cfg.nest_coords
+    }
 
-    # Exclusion rectangles: each nest excludes the other nests' conveyor zones
-    def nest_rect(nx: int) -> tuple:
-        return (nx - 2, 0, nx + 11, 3)
+    # Exclusion rectangles: each nest excludes the other nests' conveyor zones.
+    # For north-edge nests the zone spans (nx-2, 0)..(nx+11, 3).
+    def nest_rect(coord: tuple) -> tuple:
+        nx, ny = coord
+        return (nx - 2, ny, nx + 11, ny + 3)
 
     all_actions: List[ActionEntry] = []
     fulfilled_orders: List[Order] = []
@@ -69,9 +74,10 @@ def main() -> None:
         # ----------------------------------------------------------------
         print("Phase 1: Building nests...")
         nest_finish_ticks = {}
-        for nest_x in cfg.nest_x_coords:
-            nr = nest_robots[nest_x]
-            other_rects = [nest_rect(nx) for nx in cfg.nest_x_coords if nx != nest_x]
+        for coord in cfg.nest_coords:
+            nest_x, _nest_y = coord
+            nr = nest_robots[coord]
+            other_rects = [nest_rect(c) for c in cfg.nest_coords if c != coord]
             finish_tick = plan_nest_construction(
                 nest_x=nest_x,
                 nest_robots=nr,
@@ -82,8 +88,8 @@ def main() -> None:
                 strict_no_swap=cfg.strict_no_swap,
                 total_robot_count=len(robots),
             )
-            nest_finish_ticks[nest_x] = finish_tick
-            print(f"  Nest x={nest_x} complete at tick {finish_tick} "
+            nest_finish_ticks[coord] = finish_tick
+            print(f"  Nest {coord} complete at tick {finish_tick} "
                   f"({len(nr)} robots assigned)")
 
         if time.time() - start_time > max_runtime_seconds:
@@ -96,29 +102,29 @@ def main() -> None:
 
         # Nest pallets for each nest (the 20 pallets placed during setup)
         nest_pallet_map = {}
-        for nest_x in cfg.nest_x_coords:
+        for coord in cfg.nest_coords:
+            nest_x, _nest_y = coord
             row0 = [(nest_x + i, 0) for i in range(10)]
             row2 = [(nest_x + i, 2) for i in range(10)]
             ppos = set(row0 + row2)
-            nest_pallet_map[nest_x] = [p for p in pallets if (p.x, p.y) in ppos]
+            nest_pallet_map[coord] = [p for p in pallets if (p.x, p.y) in ppos]
 
         # Distribute orders across nests proportionally to robot count
-        total_robots = len(robots)
         all_pending = sorted(all_orders, key=lambda o: o.total_picks)
-        nest_orders = {nx: [] for nx in cfg.nest_x_coords}
+        nest_orders = {coord: [] for coord in cfg.nest_coords}
         for i, o in enumerate(all_pending):
-            # Assign order to nest based on robot-count proportion
-            nx = cfg.nest_x_coords[i % len(cfg.nest_x_coords)]
-            nest_orders[nx].append(o)
+            coord = cfg.nest_coords[i % len(cfg.nest_coords)]
+            nest_orders[coord].append(o)
 
-        for nest_x in cfg.nest_x_coords:
-            nr = nest_robots[nest_x]
-            other_rects = [nest_rect(nx) for nx in cfg.nest_x_coords if nx != nest_x]
+        for coord in cfg.nest_coords:
+            nest_x, _nest_y = coord
+            nr = nest_robots[coord]
+            other_rects = [nest_rect(c) for c in cfg.nest_coords if c != coord]
             new_fulfilled = plan_order_phase(
                 nest_x=nest_x,
                 nest_robots=nr,
-                orders=nest_orders[nest_x],
-                nest_pallets=nest_pallet_map[nest_x],
+                orders=nest_orders[coord],
+                nest_pallets=nest_pallet_map[coord],
                 grid=grid,
                 actions=all_actions,
                 other_nest_rects=other_rects,

@@ -20,7 +20,7 @@ def parse_worklist(path: str, stride: int = 1) -> Tuple[List[Robot], List[Pallet
     robots: List[Robot] = []
     for rid in range(num_robots):
         x, y = map(int, lines[idx].split()); idx += 1
-        robots.append(Robot(id=rid, nest_id=-1, x=x, y=y))
+        robots.append(Robot(id=rid, nest_id=None, x=x, y=y))
 
     # --- pallets ---
     num_pallets = int(lines[idx]); idx += 1

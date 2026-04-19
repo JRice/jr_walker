@@ -15,8 +15,8 @@ max_runtime_minutes = 240.0
 stride = 1
 
 [nests]
-# x-coordinates for nest anchors; each nest occupies x..x+9 at y=0 and y=2
-x_coords = [15, 35]
+# [x, y] anchor coordinates for each nest; each must be on a map edge
+coords = [[15, 0], [35, 0]]
 
 [pathfinding]
 # Prevent robots/pallets swapping positions in the same tick (off by default;

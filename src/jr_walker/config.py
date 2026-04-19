@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import tomllib
 
@@ -25,7 +25,7 @@ class Config:
     stride: int
 
     # [nests]
-    nest_x_coords: List[int]
+    nest_coords: List[Tuple[int, int]]
 
     # [pathfinding]
     strict_no_swap: bool
@@ -47,9 +47,23 @@ def load_config(path: str = "config/config.toml") -> Config:
     pf = raw.get("pathfinding", {})
     prog = raw.get("progress", {})
 
+    width = wh.get("width", 60)
+    height = wh.get("height", 40)
+
+    raw_coords = nests.get("coords", [[15, 0], [35, 0]])
+    nest_coords: List[Tuple[int, int]] = []
+    for entry in raw_coords:
+        x, y = int(entry[0]), int(entry[1])
+        if not (x == 0 or x == width - 1 or y == 0 or y == height - 1):
+            raise ValueError(
+                f"Nest anchor ({x}, {y}) is not on a map edge "
+                f"(warehouse is {width}×{height})."
+            )
+        nest_coords.append((x, y))
+
     return Config(
-        width=wh.get("width", 60),
-        height=wh.get("height", 40),
+        width=width,
+        height=height,
         input_path=paths.get("input_path", "config/BIG_ORDER.txt"),
         output_dir=paths.get("output_dir", "output"),
         media_dir=paths.get("media_dir", "media"),
@@ -57,7 +71,7 @@ def load_config(path: str = "config/config.toml") -> Config:
         max_ticks=limits.get("max_ticks", 16000),
         max_runtime_minutes=limits.get("max_runtime_minutes", 240.0),
         stride=limits.get("stride", 1),
-        nest_x_coords=nests.get("x_coords", [15, 35]),
+        nest_coords=nest_coords,
         strict_no_swap=pf.get("strict_no_swap", False),
         max_idle_ticks=pf.get("max_idle_ticks", 24),
         stall_limit=pf.get("stall_limit", 24),

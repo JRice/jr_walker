@@ -32,28 +32,35 @@ from jr_walker.warehouse import SpacetimeGrid
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def assign_robots_to_nests(robots: List[Robot], nest_x_coords: List[int]) -> None:
+def assign_robots_to_nests(
+    robots: List[Robot],
+    nest_coords: List[Tuple[int, int]],
+) -> None:
     """Round-robin: for each nest slot, assign the nearest unassigned robot.
 
     Modifies robot.nest_id in-place. Raises if any nest ends up with no robots.
     """
     unassigned = list(robots)
-    nest_counts: Dict[int, int] = {nx: 0 for nx in nest_x_coords}
+    nest_counts: Dict[Tuple[int, int], int] = {coord: 0 for coord in nest_coords}
 
     while unassigned:
-        for nest_x in nest_x_coords:
+        for coord in nest_coords:
             if not unassigned:
                 break
-            anchor_x = nest_x + 5
-            anchor_y = 3
+            nx, ny = coord
+            # Approach anchor: midpoint of Line A, one step into the outer area.
+            anchor_x = nx + 5
+            anchor_y = ny + 3   # outer-area row for a north-edge nest
             best = min(unassigned, key=lambda r: manhattan(r.x, r.y, anchor_x, anchor_y))
-            best.nest_id = nest_x
-            nest_counts[nest_x] += 1
+            best.nest_id = coord
+            nest_counts[coord] += 1
             unassigned.remove(best)
 
-    for nx, count in nest_counts.items():
+    for coord, count in nest_counts.items():
         if count == 0:
-            raise RuntimeError(f"Nest at x={nx} has no assigned robots — cannot build.")
+            raise RuntimeError(
+                f"Nest at {coord} has no assigned robots — cannot build."
+            )
 
 
 def plan_nest_construction(

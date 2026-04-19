@@ -6,6 +6,21 @@ from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
 
+@dataclass
+class NestConfig:
+    """Describes a single nest's location and pallet layout.
+
+    anchor: (x, y) of the near-end corner of Line A — must be on a map edge.
+    The edge is inferred from the anchor: y==0 → north, y==height-1 → south,
+    x==0 → west, x==width-1 → east.
+
+    Shape fields (line_a_length, pallets_c, etc.) will be added when variable-
+    length nests are implemented.  For now the layout is fixed at 10 pallets
+    per row, two rows deep.
+    """
+    anchor: Tuple[int, int]
+
+
 class JobKind(Enum):
     SETUP = auto()    # Moving a pallet into the nest
     ORDER = auto()    # Fulfilling orders on the conveyor belt
@@ -40,7 +55,7 @@ class Order:
 @dataclass
 class Robot:
     id: int
-    nest_id: int
+    nest_id: Optional[Tuple[int, int]]   # anchor (x, y) of the assigned nest
     x: int
     y: int
     last_tick: int = -1
