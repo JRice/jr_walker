@@ -172,6 +172,8 @@ class RunConfig:
     order_pick_local_manhattan_radius: int = 10
     order_other_hotspot_penalty: float = 0.0
     order_other_hotspot_penalty_radius: int = 6
+    single_nest_conveyor_mode: bool = False
+    conveyor_wait_stall_limit: int = 12
     lns_enabled: bool = True
     lns_iterations: int = 60
     lns_window_actions: int = 28
@@ -435,6 +437,21 @@ def load_run_config(config_path: Path) -> RunConfig:
         "solver.order_other_hotspot_penalty_radius",
         minimum=0,
     )
+    raw_single_nest_conveyor_mode = solver_section.get(
+        "single_nest_conveyor_mode",
+        run_config.single_nest_conveyor_mode,
+    )
+    if not isinstance(raw_single_nest_conveyor_mode, bool):
+        raise ValueError("solver.single_nest_conveyor_mode must be a boolean.")
+    run_config.single_nest_conveyor_mode = raw_single_nest_conveyor_mode
+    run_config.conveyor_wait_stall_limit = _require_int(
+        solver_section.get(
+            "conveyor_wait_stall_limit",
+            run_config.conveyor_wait_stall_limit,
+        ),
+        "solver.conveyor_wait_stall_limit",
+        minimum=1,
+    )
 
     limits_section = _get_table(data, "limits")
     raw_max_makespan = limits_section.get("max_makespan", run_config.max_makespan)
@@ -531,6 +548,8 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             order_pick_local_manhattan_radius=run_config.order_pick_local_manhattan_radius,
             order_other_hotspot_penalty=run_config.order_other_hotspot_penalty,
             order_other_hotspot_penalty_radius=run_config.order_other_hotspot_penalty_radius,
+            single_nest_conveyor_mode=run_config.single_nest_conveyor_mode,
+            conveyor_wait_stall_limit=run_config.conveyor_wait_stall_limit,
             worklist_path=Path(run_config.input_path),
             lns_enabled=run_config.lns_enabled,
             lns_iterations=run_config.lns_iterations,
@@ -785,6 +804,8 @@ def main():
             f"max_robots_per_suggestion={run_config.max_robots_per_suggestion}, "
             f"setup_mini_box_radius={run_config.setup_mini_box_radius}, "
             f"enable_setup_dual_relocation={run_config.enable_setup_dual_relocation}, "
+            f"single_nest_conveyor_mode={run_config.single_nest_conveyor_mode}, "
+            f"conveyor_wait_stall_limit={run_config.conveyor_wait_stall_limit}, "
             f"robot_fail_streak_for_parking={run_config.robot_fail_streak_for_parking}, "
             f"parking_candidate_limit={run_config.parking_candidate_limit}, "
             f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."

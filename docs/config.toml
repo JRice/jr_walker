@@ -80,6 +80,10 @@ order_pick_local_manhattan_radius = 10
 order_other_hotspot_penalty = 0.0
 # Manhattan radius considered "too close" for non-assigned hotspots.
 order_other_hotspot_penalty_radius = 6
+# New mode: build one shared top-edge nest and run conveyor-loop fulfillment.
+single_nest_conveyor_mode = true
+# Fail if a conveyor robot waits >= this many ticks in the same cell.
+conveyor_wait_stall_limit = 16
 
 [lns]
 enabled = true
@@ -99,7 +103,8 @@ relocate_chunk_size = 5
 # FULL: setup_hotspots = [[0, 15], [15, 0], [35,0], [15, 39], [35,39]]
 # FOUR: setup_hotspots = [[0, 15], [15, 0], [35,0], [20, 39]] # 7301 4/13
 # THREE: [[20, 0], [20, 39], [0, 15]] # @ 4/13AM, got 6723
-setup_hotspots = [[0, 15], [15, 0], [35,0], [20, 39]] # 8085 4/13PM (new code)
+# setup_hotspots = [[0, 15], [15, 0], [35,0], [20, 39]] # 8085 4/13PM (new code)
+setup_hotspots = [[15,0]]
 # Optional explicit relocation SKU order. If provided, only these SKUs are
 # used for startup relocation planning (in listed order).
 # skus_to_relocate = [1, 2, 3, 4, 5]
