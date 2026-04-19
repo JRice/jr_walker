@@ -1,52 +1,52 @@
 # jr_walker Summary (Compact AI Handoff)
 
 ## Scope
-- Python warehouse solver for ANE validator format on a 60x40 grid with 5 robots.
-- Pipeline: `find_solution` -> optional LNS -> validator replay -> metadata/report write.
+- Python warehouse solver for ANE format on a 58x13 map with 5 robots.
+- Pipeline: `find_solution` -> optional LNS -> validator replay -> outputs/metadata.
 
 ## Key Files
-- `main.py`: TOML config parse + solver build + run/validate/output.
-- `src/jr_walker/solver.py`: core planning logic (legacy suggestion mode + new conveyor mode).
-- `src/jr_walker/planner.py` + `src/jr_walker/routing.py`: reservation table + space-time A*.
-- `src/jr_walker/validator.py`: action legality and final fulfillment checks.
+- `main.py`: config/load/run/validate/write.
+- `src/jr_walker/solver.py`: all planning modes; conveyor logic is here.
+- `src/jr_walker/planner.py`, `src/jr_walker/routing.py`: reservation + space-time A*.
+- `src/jr_walker/validator.py`: authoritative action legality check.
 
-## Planning Modes
-- Legacy mode (default false toggle): suggestion queue (`setup -> relocate -> dock -> order`), retries/backoff, hotspot masks.
-- New mode (`solver.single_nest_conveyor_mode=true`):
-  - Uses only first configured hotspot, projected to top edge.
-  - Builds one 10x3 nest rectangle with 20 pallets:
-    - odd SKUs on row 0, even SKUs on row 2.
-  - All robots cooperate on setup using nearest source + nearest robot assignment with source fallbacks.
-  - Hard integrity check: fail immediately if expected 20 placements are not present in the nest rectangle.
-  - Post-build barrier sync + robot exit from nest + dedicated staging move to non-blocking queue cells before conveyor loop.
-  - Staging is retry-based (delayed-start retries) and falls back to in-place start if staging move remains invalid.
-  - Post-staging barrier sync aligns all robots before order dispatch.
+## Active Conveyor Design
+- Toggle: `solver.single_nest_conveyor_mode=true`.
+- `1 hotspot`: single nest conveyor.
+- `2+ hotspots`: dual conveyor using first two hotspots.
+  - Grouping is fixed `A=[0,1]`, `B=[2,3,4]`.
+  - Shared `reserved_source_pallet_ids` prevents both hotspots claiming the same source pallet.
+- Nest geometry is `10x3` per hotspot:
+  - row `0`: 10 odd-SKU pallets,
+  - row `2`: 10 even-SKU pallets.
+- Build integrity hard-fails if expected 20 pallets are not in each nest rectangle.
 
-## Conveyor Fulfillment Flow
-- Entry: east side of nest row 1.
-- Picking: nest-only picks, nearest-needed SKU first, west-only movement during pick/exit stage.
-- Wait policy: robot may wait; same-cell wait for `>= conveyor_wait_stall_limit` ticks fails immediately with robot/tick.
-- Inventory policy: after leaving nest, order inventory must be complete; missing SKU counts fail immediately.
-- Assignment policy: orders are dispatched in strict robot-id round-robin to keep all robots active in the conveyor loop.
-- Sticky assignment: each order retains its initially assigned round-robin robot on retries (no cross-robot stealing of failed orders).
-- Entry policy: robots now wait/retry for nest entry before requeueing instead of failing fast on first blocked entry path.
-- Fulfill policy: forced fulfill cell now uses wait/retry when temporarily blocked before failing.
-- Return policy: conveyor return waypoints now use wait/retry and can skip a blocked waypoint after bounded retries (logged), preventing full-run abort on late-loop congestion.
-- Delivery/loop path:
-  - forced `fulfill` cell is `[hotspot_x-1, hotspot_y]`
-  - then loop legs: west 1, south 3, east 12, north 2 (clamped to map bounds)
-- Non-fatal order-planning conflicts requeue the order while preserving round-robin progression; solver fails only on hard invariants or prolonged no-progress.
+## Conveyor Track + Picking Rules
+- Forced fulfill cell: `[hotspot_x - 1, hotspot_y]`.
+- Track loop remains fixed: west, south, east, north, re-enter east side.
+- Directional picking:
+  - moving **west on row 1**: pick from row `0` pallet at same `x`.
+  - moving **east on row 3**: pick from row `2` pallet at same `x`.
+- After `fulfill()`, robot always advances one track cell (no parking on fulfill cell).
+- Orders are planned from the post-fulfill clear cell so each order gets a full loop pass.
+- Wait guard: same-cell waits `>= conveyor_wait_stall_limit` fail fast.
 
-## New Config Fields
-- `solver.single_nest_conveyor_mode` (bool)
-- `solver.conveyor_wait_stall_limit` (int, default 12)
+## Dispatch Policy
+- Orders sorted by `(total picks, sku-count, order_idx)`.
+- Single nest: round-robin across all 5 robots.
+- Dual nest: weighted group pattern `A,B,B,A,B` with round-robin inside each group.
 
-## Validation/Test Status
-- Full unit suite (`unittest discover`) passing after mode addition.
-- Smoke run with conveyor mode on a stride-200 subset completed planning/execution flow; expected partial-run validation mismatch remains when input contains more orders than the stride subset.
+## Analysis/DB Policy
+- Startup no longer reads prior best-solution SQL analysis for planning.
+- High-traffic-cell avoidance bootstrap from DB is removed.
 
-## Risk Concentration
-- `solver.py` complexity is high; fragile areas are now:
-  - shared-nest build sequencing under reservation conflicts (now robot-rotated for fairness),
-  - conveyor wait/state tracking across retries,
-  - strict fail-fast policy interactions with parallel robot timelines.
+## Current Validation Snapshot
+- Unit tests: `tests.test_solver_metadata_policy` passing.
+- Latest full dual run (current behavior) validated:
+  - `output/solution_9023_114.txt`
+  - `1000/1000` orders fulfilled
+  - makespan `9023`.
+
+## Main Fragile Spots
+- `solver.py` remains high-complexity.
+- Highest risk is conveyor timing conflicts around shared fulfill/entry chokepoints.

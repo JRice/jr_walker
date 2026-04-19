@@ -103,7 +103,7 @@ relocate_chunk_size = 5
 # FOUR: setup_hotspots = [[0, 15], [15, 0], [35,0], [20, 39]] # 7301 4/13
 # THREE: [[20, 0], [20, 39], [0, 15]] # @ 4/13AM, got 6723
 # setup_hotspots = [[0, 15], [15, 0], [35,0], [20, 39]] # 8085 4/13PM (new code)
-setup_hotspots = [[15,0]]
+setup_hotspots = [[15, 0], [35,0]]
 # Optional explicit relocation SKU order. If provided, only these SKUs are
 # used for startup relocation planning (in listed order).
 # skus_to_relocate = [1, 2, 3, 4, 5]

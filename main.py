@@ -17,7 +17,7 @@ if str(SRC) not in sys.path:
 
 from jr_walker.validator import SubmissionValidator, ValidationError
 from jr_walker.map_render import render_warehouse_map
-from jr_walker.solver import SolverConfig, WarehouseSolver, PastRunAnalysis, load_best_past_analysis
+from jr_walker.solver import SolverConfig, WarehouseSolver, PastRunAnalysis
 from jr_walker.view import WarehouseState
 from jr_walker.writer import write_actions
 from jr_walker.analysis import build_and_store_solution_metadata
@@ -506,7 +506,7 @@ def load_run_config(config_path: Path) -> RunConfig:
     return run_config
 
 
-def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path: Path, past_analysis: PastRunAnalysis) -> WarehouseSolver:
+def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path: Path) -> WarehouseSolver:
     return WarehouseSolver(
         state,
         SolverConfig(
@@ -557,7 +557,7 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             lns_tail_fraction=run_config.lns_tail_fraction,
             lns_max_shift=run_config.lns_max_shift,
         ),
-        past_analysis=past_analysis
+        past_analysis=PastRunAnalysis(),
     )
 
 
@@ -577,7 +577,7 @@ def _run_pipeline(
     actions: list[tuple[int, int, str, int, int]] = []
     base_actions: list[tuple[int, int, str, int, int]] = []
     try:
-        print("Building a fresh base solution guided by past analysis...")
+        print("Building a fresh base solution...")
         base_actions = solver.find_solution()
         actions = list(base_actions)
 
@@ -815,24 +815,13 @@ def main():
     output_prefix = f"stride_{run_config.every_n_orders}_" if run_config.every_n_orders > 1 else ""
     temp_output_path = output_dir / f"{output_prefix}solution_latest.txt"
 
-    db_path = Path(run_config.metadata_db_path)
     any_success = False
     last_error: Exception | None = None
 
     for iteration in range(1, run_config.max_runs + 1):
         print(f"\n=== Iteration {iteration}/{run_config.max_runs} ===")
-        past_analysis = PastRunAnalysis()
-        if db_path.exists():
-            print("Loading analysis of the best existing solution from SQL database...")
-            past_analysis = load_best_past_analysis(db_path, state.width, state.height, state.pallets)
-            if past_analysis.run_id >= 0:
-                print(
-                    f"Loaded analysis for Run #{past_analysis.run_id}: "
-                    f"found {len(past_analysis.high_use_cells)} high-traffic cells to avoid."
-                )
-
-        print("Generating new Suggestions based on this analysis...")
-        solver = _build_solver(state, run_config, temp_output_path, past_analysis)
+        print("Generating new suggestions...")
+        solver = _build_solver(state, run_config, temp_output_path)
         actions, solve_error = _run_pipeline(solver, run_config, output_dir)
         _save_and_report(
             actions,

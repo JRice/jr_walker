@@ -142,5 +142,5 @@ This will be implemented in Python. We'll use uv for managing packages. You shou
 - Use clear names for variables and methods: "document by code."
 - Prefer to use established patterns and techniques. When implementing such a pattern or strategy (e.g.: "Factory Pattern" or "Large-Neighborhood Search" or "A*"), clearly mark it as such with a comment.
 - Use type-hinting.
-- Be mindful of potential "hyperparameters," the kinds of "dials" we can tweak to improve the algorithm. These should be extracted to the medata config file in `input/config.toml`.
+- Be mindful of potential "hyperparameters," the kinds of "dials" we can tweak to improve the algorithm. These should be extracted to the metadata config file in `input/config.toml`.
 - Tests! I don't want the codebase to have particularly high coverage, but I do want to ensure clear pressure points are covered and that we have a test suite that validates those parts of the code are all functioning; I'd like to ensure no regressions as we progress.

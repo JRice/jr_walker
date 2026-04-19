@@ -201,101 +201,6 @@ def _bucket_for_edge(x: int, y: int, width: int, height: int) -> str:
     return "non_edge"
 
 
-def load_best_past_analysis(db_path: Path, width: int, height: int, pallets: Dict[Tuple[int, int], int]) -> PastRunAnalysis:
-    analysis = PastRunAnalysis()
-    if not db_path.exists():
-        return analysis
-
-    try:
-        conn = sqlite3.connect(db_path)
-        run_id = _select_best_non_test_run_id(conn)
-        if run_id is None:
-            return analysis
-        analysis.run_id = run_id
-
-        use_rows = conn.execute("SELECT x, y, use_score FROM cell_metadata WHERE run_id = ?", (run_id,)).fetchall()
-        for x, y, use_score in use_rows:
-            analysis.use_by_cell[(int(x), int(y))] = int(use_score)
-
-        sku_rows = conn.execute("SELECT x, y, sku, count FROM cell_sku_flow WHERE run_id = ?", (run_id,)).fetchall()
-        for x, y, sku, count in sku_rows:
-            analysis.sku_cells.setdefault(int(sku), []).append((int(x), int(y), int(count)))
-
-        for sku, rows in analysis.sku_cells.items():
-            rows.sort(key=lambda row: (-row[2], analysis.use_by_cell.get((row[0], row[1]), 0), row[1], row[0]))
-
-        dynamic_use_values: List[int] = []
-        for (x, y), use_score in analysis.use_by_cell.items():
-            if use_score <= 0 or (x, y) in pallets:
-                continue
-            dynamic_use_values.append(use_score)
-
-        if dynamic_use_values:
-            dynamic_use_values.sort()
-            idx = int((len(dynamic_use_values) - 1) * 0.85)
-            cutoff = dynamic_use_values[max(0, idx)]
-            for (x, y), use_score in analysis.use_by_cell.items():
-                if use_score >= cutoff and (x, y) not in pallets:
-                    analysis.high_use_cells.add((x, y))
-
-        try:
-            fulfill_rows = conn.execute(
-                """
-                SELECT robot_id, timestep, order_id, x, y, skus_json
-                FROM fulfills
-                WHERE run_id = ?
-                ORDER BY robot_id, timestep ASC
-                """,
-                (run_id,),
-            ).fetchall()
-        except sqlite3.Error:
-            # Backward-compat for older schemas without order_id.
-            legacy_rows = conn.execute(
-                """
-                SELECT robot_id, timestep, x, y, skus_json
-                FROM fulfills
-                WHERE run_id = ?
-                ORDER BY robot_id, timestep ASC
-                """,
-                (run_id,),
-            ).fetchall()
-            fulfill_rows = [(rid, t, None, x, y, skus_json) for rid, t, x, y, skus_json in legacy_rows]
-
-        for _, _, _, x, y, skus_json in fulfill_rows:
-            bucket = _bucket_for_edge(int(x), int(y), width, height)
-            bucket_counter = analysis.bucket_sku_counts.setdefault(bucket, collections.Counter())
-            try:
-                sku_values = json.loads(skus_json)
-            except Exception:
-                sku_values = []
-            if not isinstance(sku_values, list):
-                continue
-            for sku_raw in sku_values:
-                try:
-                    sku = int(sku_raw)
-                except (TypeError, ValueError):
-                    continue
-                bucket_counter[sku] += 1
-                analysis.bucket_items[bucket] = analysis.bucket_items.get(bucket, 0) + 1
-
-        for robot_id, timestep, order_id, _, _, skus_json in fulfill_rows:
-            analysis.fulfills.append(
-                {
-                    "robot_id": robot_id,
-                    "timestep": timestep,
-                    "order_id": order_id,
-                    "skus": json.loads(skus_json),
-                }
-            )
-
-    except sqlite3.Error:
-        pass
-    finally:
-        if 'conn' in locals():
-            conn.close()
-    return analysis
-
-
 class WarehouseSolver:
     def __init__(self, warehouse_state, config: SolverConfig | None = None, past_analysis: PastRunAnalysis | None = None):
         self.state = warehouse_state
@@ -937,6 +842,9 @@ class WarehouseSolver:
         assigning tasks to the next available robot.
         """
         if bool(getattr(self.config, "single_nest_conveyor_mode", False)):
+            raw_hotspots = list(getattr(self.config, "setup_hotspots", []) or [])
+            if len(raw_hotspots) >= 2:
+                return self._find_solution_actions_dual_nest_conveyor()
             return self._find_solution_actions_single_nest_conveyor()
 
         self._plan_started_monotonic = time.monotonic()
@@ -1366,23 +1274,30 @@ class WarehouseSolver:
         self._active_robot_id = None
         return sorted_actions
 
-    def _single_nest_top_hotspot(self) -> Tuple[int, int]:
+    def _single_nest_top_hotspots(self, count: int = 1) -> List[Tuple[int, int]]:
         raw_hotspots = list(getattr(self.config, "setup_hotspots", []) or [])
-        raw_x = 0
-        if raw_hotspots:
-            first = raw_hotspots[0]
-            if isinstance(first, (tuple, list)) and len(first) == 2:
-                try:
-                    raw_x = int(first[0])
-                except (TypeError, ValueError):
-                    raw_x = 0
 
         width = int(self.state.width)
-        # Keep at least one cell west of the nest so robots can exit west.
-        min_start = 1 if width > 10 else 0
-        max_start = max(min_start, width - 10)
-        start_x = min(max(min_start, raw_x), max_start)
-        return (int(start_x), 0)
+        nest_width = 10
+        # Need one cell west for forced fulfill and one cell east for re-entry queue.
+        min_start = 1 if width > nest_width else 0
+        max_start = max(min_start, width - (nest_width + 1))
+        out: List[Tuple[int, int]] = []
+        for idx in range(max(1, int(count))):
+            raw_x = 0
+            if idx < len(raw_hotspots):
+                item = raw_hotspots[idx]
+                if isinstance(item, (tuple, list)) and len(item) == 2:
+                    try:
+                        raw_x = int(item[0])
+                    except (TypeError, ValueError):
+                        raw_x = 0
+            start_x = min(max(min_start, raw_x), max_start)
+            out.append((int(start_x), 0))
+        return out
+
+    def _single_nest_top_hotspot(self) -> Tuple[int, int]:
+        return self._single_nest_top_hotspots(1)[0]
 
     def _single_nest_targets(
         self, hotspot: Tuple[int, int]
@@ -1393,14 +1308,24 @@ class WarehouseSolver:
         nest_bounds = (hx, 0, hx + 9, 2)
         return odd_targets, even_targets, nest_bounds
 
+    def _single_nest_row2_targets(
+        self, hotspot: Tuple[int, int], nest_width: int = 20
+    ) -> Tuple[List[Tuple[int, int]], Tuple[int, int, int, int]]:
+        hx = int(hotspot[0])
+        targets = [(hx + i, 2) for i in range(int(nest_width))]
+        nest_bounds = (hx, 0, hx + int(nest_width) - 1, 2)
+        return targets, nest_bounds
+
     def _available_pallet_candidates_for_sku_to_hotspot(
         self,
         *,
         sku: int,
         hotspot: Tuple[int, int],
+        exclude_pallet_ids: set[int] | None = None,
         limit: int = 12,
     ) -> List[Tuple[Tuple[int, int], int, int]]:
         hx, hy = int(hotspot[0]), int(hotspot[1])
+        excluded = exclude_pallet_ids or set()
         rows: List[Tuple[int, int, int, int]] = []
         for source_xy in self.scheduler.pallet_cells_for_sku(int(sku)):
             source_xy = (int(source_xy[0]), int(source_xy[1]))
@@ -1408,6 +1333,8 @@ class WarehouseSolver:
             if pallet_id is None:
                 continue
             pallet_id = int(pallet_id)
+            if int(pallet_id) in excluded:
+                continue
             if pallet_id in getattr(self, "_persistently_docked_pallet_ids", set()):
                 continue
             dist = abs(source_xy[0] - hx) + abs(source_xy[1] - hy)
@@ -1485,11 +1412,15 @@ class WarehouseSolver:
         phase_name: str,
         phase_jobs: List[Tuple[int, int, Tuple[int, int]]],
         hotspot: Tuple[int, int],
+        robot_pool: List[RobotState] | None = None,
+        reserved_source_pallet_ids: set[int] | None = None,
     ) -> None:
+        reserved = reserved_source_pallet_ids if reserved_source_pallet_ids is not None else set()
         pending_jobs: List[Tuple[int, int, Tuple[int, int]]] = list(phase_jobs)
         seeded_robot_ids: set[int] = set()
-        phase_seed_target = min(len(self.robots), len(pending_jobs))
-        robot_order: List[RobotState] = sorted(self.robots, key=lambda r: int(r.id))
+        robot_scope = list(robot_pool) if robot_pool is not None else list(self.robots)
+        phase_seed_target = min(len(robot_scope), len(pending_jobs))
+        robot_order: List[RobotState] = sorted(robot_scope, key=lambda r: int(r.id))
         robot_cursor = 0
 
         while pending_jobs:
@@ -1507,6 +1438,7 @@ class WarehouseSolver:
                 source_candidates = self._available_pallet_candidates_for_sku_to_hotspot(
                     sku=int(sku),
                     hotspot=hotspot,
+                    exclude_pallet_ids=reserved,
                     limit=10,
                 )
                 if not source_candidates:
@@ -1565,6 +1497,12 @@ class WarehouseSolver:
                         ):
                             pending_jobs.remove((slot_idx, sku, target_xy))
                             seeded_robot_ids.add(robot_id)
+                            reserved.add(int(pallet_id))
+                            self._stage_robot_after_single_nest_build(
+                                robot=robot,
+                                hotspot=hotspot,
+                                label=phase_name,
+                            )
                             self._log(
                                 "single_nest_setup_done "
                                 f"phase={phase_name} slot={slot_idx} sku={sku} "
@@ -1661,6 +1599,140 @@ class WarehouseSolver:
                 f"single_nest_exit_done robot={robot.id} pos=({robot.x},{robot.y}) target_y={target_y}"
             )
 
+    def _stage_robot_subset_for_dual_build(
+        self,
+        *,
+        robots: List[RobotState],
+        side: str,
+        label: str,
+    ) -> None:
+        if not robots:
+            return
+        target_y = max(0, min(self.state.height - 1, 4))
+        direction = 1 if side == "west" else -1
+        start_x = 0 if side == "west" else (self.state.width - 1)
+        used_targets: set[Tuple[int, int]] = set()
+
+        def _pick_target_x() -> int:
+            x = int(start_x)
+            while 0 <= x < self.state.width:
+                candidate = (int(x), int(target_y))
+                if (
+                    candidate not in used_targets
+                    and candidate not in self.scheduler.pallets
+                    and not any((int(r.x), int(r.y)) == candidate for r in self.robots)
+                ):
+                    used_targets.add(candidate)
+                    return int(x)
+                x += int(direction)
+            return int(start_x)
+
+        for robot in sorted(robots, key=lambda r: (int(r.last_t), int(r.id))):
+            tx = _pick_target_x()
+            target = (int(tx), int(target_y))
+            staged = False
+            last_reason = "unknown"
+            for attempt in range(8):
+                temp_robot = self._clone_robot_state(robot)
+                stage_start_t = max((int(r.last_t) for r in self.robots), default=int(temp_robot.last_t)) + attempt
+                if int(temp_robot.last_t) < stage_start_t:
+                    temp_robot.last_t = int(stage_start_t)
+                pending_actions: List[Tuple[int, int, str, int, int]] = []
+                pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+                pending_footprints: List[Tuple[RobotState, int, int, int]] = []
+                path = self._safe_plan_path_conveyor(temp_robot, int(target[0]), int(target[1]))
+                if not path and (int(temp_robot.x), int(temp_robot.y)) != target:
+                    last_reason = "no_path"
+                    continue
+                if path:
+                    pending_paths.append((self._clone_robot_state(temp_robot), path))
+                pending_actions.extend(self._apply_moves_to_robot(temp_robot, path))
+                if not self._can_commit_pending_actions(pending_actions):
+                    last_reason = "candidate_invalid"
+                    continue
+                self._commit_plan(
+                    robot=robot,
+                    temp_robot=temp_robot,
+                    pending_actions=pending_actions,
+                    pending_paths=pending_paths,
+                    pending_footprints=pending_footprints,
+                )
+                self._log(
+                    "dual_nest_build_stage_done "
+                    f"label={label} robot={robot.id} target={target} pos=({robot.x},{robot.y}) attempt={attempt + 1}"
+                )
+                staged = True
+                break
+            if not staged:
+                self._log(
+                    "dual_nest_build_stage_skip "
+                    f"label={label} robot={robot.id} target={target} reason={last_reason}"
+                )
+
+    def _stage_robot_after_single_nest_build(
+        self,
+        *,
+        robot: RobotState,
+        hotspot: Tuple[int, int],
+        label: str,
+    ) -> None:
+        target_y = max(0, min(self.state.height - 1, int(hotspot[1]) + 4))
+        cx = int(robot.x)
+        candidate_xs: List[int] = [cx]
+        for delta in range(1, self.state.width):
+            left = cx - delta
+            right = cx + delta
+            if 0 <= left < self.state.width:
+                candidate_xs.append(int(left))
+            if 0 <= right < self.state.width:
+                candidate_xs.append(int(right))
+
+        target: Tuple[int, int] | None = None
+        for tx in candidate_xs:
+            cell = (int(tx), int(target_y))
+            if cell in self.scheduler.pallets:
+                continue
+            occupied_by_other = any(
+                int(other.id) != int(robot.id) and (int(other.x), int(other.y)) == cell
+                for other in self.robots
+            )
+            if occupied_by_other:
+                continue
+            target = cell
+            break
+
+        if target is None:
+            return
+
+        for attempt in range(6):
+            temp_robot = self._clone_robot_state(robot)
+            stage_start_t = max((int(r.last_t) for r in self.robots), default=int(temp_robot.last_t)) + attempt
+            if int(temp_robot.last_t) < stage_start_t:
+                temp_robot.last_t = int(stage_start_t)
+            pending_actions: List[Tuple[int, int, str, int, int]] = []
+            pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+            pending_footprints: List[Tuple[RobotState, int, int, int]] = []
+            path = self._safe_plan_path_conveyor(temp_robot, int(target[0]), int(target[1]))
+            if not path and (int(temp_robot.x), int(temp_robot.y)) != target:
+                continue
+            if path:
+                pending_paths.append((self._clone_robot_state(temp_robot), path))
+            pending_actions.extend(self._apply_moves_to_robot(temp_robot, path))
+            if not self._can_commit_pending_actions(pending_actions):
+                continue
+            self._commit_plan(
+                robot=robot,
+                temp_robot=temp_robot,
+                pending_actions=pending_actions,
+                pending_paths=pending_paths,
+                pending_footprints=pending_footprints,
+            )
+            self._log(
+                "single_nest_build_stage_done "
+                f"label={label} robot={robot.id} target={target} pos=({robot.x},{robot.y})"
+            )
+            return
+
     def _move_robots_to_conveyor_staging(
         self,
         *,
@@ -1730,6 +1802,139 @@ class WarehouseSolver:
                 self._log(
                     "single_nest_staging_skip "
                     f"robot={robot.id} target={target} reason={last_reason}"
+                )
+        return targets_by_robot
+
+    def _single_nest_conveyor_track_cycle(
+        self,
+        *,
+        nest_bounds: Tuple[int, int, int, int],
+        entry_xy: Tuple[int, int],
+        fulfill_xy: Tuple[int, int],
+        return_waypoints: List[Tuple[int, int]],
+    ) -> List[Tuple[int, int]]:
+        x0, y0, _x1, _y1 = nest_bounds
+        mid_y = int(y0) + 1
+        reentry_xy = (int(entry_xy[0]) + 1, int(entry_xy[1]))
+        cells: List[Tuple[int, int]] = [reentry_xy, (int(entry_xy[0]), int(entry_xy[1]))]
+
+        for x in range(int(entry_xy[0]) - 1, int(x0) - 2, -1):
+            cells.append((int(x), int(mid_y)))
+
+        current = cells[-1]
+        fx, fy = int(fulfill_xy[0]), int(fulfill_xy[1])
+        if current[0] != fx:
+            step_x = 1 if fx > current[0] else -1
+            for x in range(current[0] + step_x, fx + step_x, step_x):
+                cells.append((int(x), int(current[1])))
+        if current[1] != fy:
+            step_y = 1 if fy > current[1] else -1
+            for y in range(current[1] + step_y, fy + step_y, step_y):
+                cells.append((int(fx), int(y)))
+        current = cells[-1]
+
+        for wx, wy in return_waypoints:
+            wx, wy = int(wx), int(wy)
+            if current[0] != wx:
+                step_x = 1 if wx > current[0] else -1
+                for x in range(current[0] + step_x, wx + step_x, step_x):
+                    cells.append((int(x), int(current[1])))
+            current = cells[-1]
+            if current[1] != wy:
+                step_y = 1 if wy > current[1] else -1
+                for y in range(current[1] + step_y, wy + step_y, step_y):
+                    cells.append((int(current[0]), int(y)))
+            current = cells[-1]
+
+        if cells[-1] != reentry_xy:
+            cx, cy = cells[-1]
+            rx, ry = reentry_xy
+            if cx != rx:
+                step_x = 1 if rx > cx else -1
+                for x in range(cx + step_x, rx + step_x, step_x):
+                    cells.append((int(x), int(cy)))
+                cx = rx
+            if cy != ry:
+                step_y = 1 if ry > cy else -1
+                for y in range(cy + step_y, ry + step_y, step_y):
+                    cells.append((int(cx), int(y)))
+
+        if cells[-1] == cells[0]:
+            cells = cells[:-1]
+
+        for idx, (cx, cy) in enumerate(cells):
+            if not (0 <= int(cx) < self.state.width and 0 <= int(cy) < self.state.height):
+                raise RuntimeError(
+                    "single_nest_track_fail "
+                    f"reason=oob idx={idx} cell=({cx},{cy})"
+                )
+            if (int(cx), int(cy)) in self.scheduler.pallets:
+                raise RuntimeError(
+                    "single_nest_track_fail "
+                    f"reason=occupied_by_pallet idx={idx} cell=({cx},{cy})"
+                )
+            nx, ny = cells[(idx + 1) % len(cells)]
+            if abs(int(nx) - int(cx)) + abs(int(ny) - int(cy)) != 1:
+                raise RuntimeError(
+                    "single_nest_track_fail "
+                    f"reason=non_adjacent_edge from=({cx},{cy}) to=({nx},{ny})"
+                )
+        return cells
+
+    def _move_robots_to_conveyor_track_slots(
+        self,
+        *,
+        track_cycle: List[Tuple[int, int]],
+        robot_pool: List[RobotState] | None = None,
+    ) -> List[Tuple[int, int]]:
+        robot_scope = list(robot_pool) if robot_pool is not None else sorted(self.robots, key=lambda r: int(r.id))
+        if not track_cycle:
+            raise RuntimeError("single_nest_track_fail reason=empty_cycle")
+        if len(track_cycle) < len(robot_scope):
+            raise RuntimeError(
+                f"single_nest_track_fail reason=too_short cycle_len={len(track_cycle)} robots={len(robot_scope)}"
+            )
+
+        targets_by_robot: List[Tuple[int, int]] = []
+        cycle_len = len(track_cycle)
+        slot_indices = [(-idx) % cycle_len for idx in range(len(robot_scope))]
+        for idx, robot in enumerate(sorted(robot_scope, key=lambda r: int(r.id))):
+            target = track_cycle[int(slot_indices[idx])]
+            targets_by_robot.append((int(target[0]), int(target[1])))
+            placed = False
+            for attempt in range(8):
+                temp_robot = self._clone_robot_state(robot)
+                place_start_t = max((int(r.last_t) for r in self.robots), default=int(temp_robot.last_t)) + attempt
+                if int(temp_robot.last_t) < place_start_t:
+                    temp_robot.last_t = int(place_start_t)
+                pending_actions: List[Tuple[int, int, str, int, int]] = []
+                pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
+                pending_footprints: List[Tuple[RobotState, int, int, int]] = []
+                path = self._safe_plan_path_conveyor(temp_robot, int(target[0]), int(target[1]))
+                if not path and (int(temp_robot.x), int(temp_robot.y)) != (int(target[0]), int(target[1])):
+                    continue
+                if path:
+                    pending_paths.append((self._clone_robot_state(temp_robot), path))
+                pending_actions.extend(self._apply_moves_to_robot(temp_robot, path))
+                if not self._can_commit_pending_actions(pending_actions):
+                    continue
+                self._commit_plan(
+                    robot=robot,
+                    temp_robot=temp_robot,
+                    pending_actions=pending_actions,
+                    pending_paths=pending_paths,
+                    pending_footprints=pending_footprints,
+                )
+                self._log(
+                    "single_nest_track_slot_done "
+                    f"robot={robot.id} target={target} attempt={attempt + 1}"
+                )
+                placed = True
+                break
+            if not placed:
+                raise RuntimeError(
+                    "single_nest_track_slot_fail "
+                    f"robot={robot.id} target={target} reason=no_valid_placement"
                 )
         return targets_by_robot
 
@@ -1929,6 +2134,60 @@ class WarehouseSolver:
                 rows.append(f"sku={sku} need={req} have={got} missing={req - got}")
         return "; ".join(rows) if rows else "none"
 
+    def _conveyor_step_to_cell(
+        self,
+        *,
+        temp_robot: RobotState,
+        target_xy: Tuple[int, int],
+        pending_actions: List[Tuple[int, int, str, int, int]],
+        pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]],
+        wait_state: Dict[int, Dict[str, object]],
+        wait_limit: int,
+        reason: str,
+    ) -> None:
+        tx, ty = int(target_xy[0]), int(target_xy[1])
+        cx, cy = int(temp_robot.x), int(temp_robot.y)
+        if (cx, cy) == (tx, ty):
+            return
+        if abs(tx - cx) + abs(ty - cy) != 1:
+            raise RuntimeError(
+                "conveyor_track_fail "
+                f"robot={temp_robot.id} from=({cx},{cy}) to=({tx},{ty}) reason=non_adjacent_step"
+            )
+
+        while True:
+            next_t = int(temp_robot.last_t) + 1
+            if self.planner.can_occupy(temp_robot, next_t, tx, ty):
+                self._append_conveyor_path_with_wait_guard(
+                    temp_robot=temp_robot,
+                    path=[(next_t, tx, ty)],
+                    pending_actions=pending_actions,
+                    pending_paths=pending_paths,
+                    wait_state=wait_state,
+                    wait_limit=wait_limit,
+                    enforce_west_only=False,
+                )
+                return
+
+            wait_t = self._wait_until_conveyor_cell_is_free(
+                temp_robot=temp_robot,
+                pending_actions=pending_actions,
+                pending_paths=pending_paths,
+                wait_state=wait_state,
+                wait_limit=wait_limit,
+                enforce_west_only=False,
+                reason=reason,
+            )
+            self._append_conveyor_path_with_wait_guard(
+                temp_robot=temp_robot,
+                path=[(wait_t, int(temp_robot.x), int(temp_robot.y))],
+                pending_actions=pending_actions,
+                pending_paths=pending_paths,
+                wait_state=wait_state,
+                wait_limit=wait_limit,
+                enforce_west_only=False,
+            )
+
     def _plan_single_nest_conveyor_order(
         self,
         *,
@@ -1941,6 +2200,7 @@ class WarehouseSolver:
         wait_limit: int,
         fulfill_xy: Tuple[int, int],
         return_waypoints: List[Tuple[int, int]],
+        track_cycle: List[Tuple[int, int]],
     ) -> bool:
         temp_robot = self._clone_robot_state(robot)
         remaining = collections.Counter(order)
@@ -1948,144 +2208,127 @@ class WarehouseSolver:
         pending_paths: List[Tuple[RobotState, List[Tuple[int, int, int]]]] = []
         pending_footprints: List[Tuple[RobotState, int, int, int]] = []
 
-        # Enter nest on the east side middle row before collecting.
-        entry_retry_limit = max(8, int(wait_limit) * 4)
-        entry_retries = 0
-        while True:
-            path_to_entry = self._safe_plan_path_conveyor(temp_robot, int(entry_xy[0]), int(entry_xy[1]))
-            if path_to_entry or (int(temp_robot.x), int(temp_robot.y)) == (int(entry_xy[0]), int(entry_xy[1])):
-                break
-            entry_t = self._wait_until_conveyor_cell_is_free(
-                temp_robot=temp_robot,
-                pending_actions=pending_actions,
-                pending_paths=pending_paths,
-                wait_state=wait_state,
-                wait_limit=wait_limit,
-                enforce_west_only=False,
-                reason=f"entry_wait_order_{order_idx}",
-            )
-            self._append_conveyor_path_with_wait_guard(
-                temp_robot=temp_robot,
-                path=[(entry_t, int(temp_robot.x), int(temp_robot.y))],
-                pending_actions=pending_actions,
-                pending_paths=pending_paths,
-                wait_state=wait_state,
-                wait_limit=wait_limit,
-                enforce_west_only=False,
-            )
-            entry_retries += 1
-            if entry_retries > entry_retry_limit:
-                raise RuntimeError(
-                    f"conveyor_entry_fail order={order_idx} robot={robot.id} entry={entry_xy} reason=no_path_after_wait"
-                )
-        self._append_conveyor_path_with_wait_guard(
-            temp_robot=temp_robot,
-            path=path_to_entry,
-            pending_actions=pending_actions,
-            pending_paths=pending_paths,
-            wait_state=wait_state,
-            wait_limit=wait_limit,
-            enforce_west_only=False,
-        )
+        x0, y0, x1, y1 = nest_bounds
+        pick_west_row_y = int(y0) + 1
+        pick_east_row_y = int(y1) + 1
+        track_index: Dict[Tuple[int, int], int] = {
+            (int(cx), int(cy)): int(idx) for idx, (cx, cy) in enumerate(track_cycle)
+        }
 
-        while sum(int(v) for v in remaining.values()) > 0:
-            options = self._nest_pick_candidates_for_remaining(
-                remaining=remaining,
-                temp_robot=temp_robot,
-                nest_bounds=nest_bounds,
-            )
-            if not options:
-                missing = self._format_missing_requirements(
-                    required=collections.Counter(order),
-                    have=temp_robot.storage,
-                )
-                raise RuntimeError(
-                    "conveyor_pick_fail "
-                    f"order={order_idx} robot={robot.id} reason=no_nest_candidate missing=[{missing}]"
-                )
-
-            sku, pallet_xy, pick_xy = options[0]
-            path_to_pick = self._safe_plan_path_conveyor(temp_robot, int(pick_xy[0]), int(pick_xy[1]))
-            if not path_to_pick and (int(temp_robot.x), int(temp_robot.y)) != (int(pick_xy[0]), int(pick_xy[1])):
-                raise RuntimeError(
-                    "conveyor_pick_fail "
-                    f"order={order_idx} robot={robot.id} sku={sku} pallet={pallet_xy} pick={pick_xy} reason=no_path"
-                )
-            self._append_conveyor_path_with_wait_guard(
-                temp_robot=temp_robot,
-                path=path_to_pick,
-                pending_actions=pending_actions,
-                pending_paths=pending_paths,
-                wait_state=wait_state,
-                wait_limit=wait_limit,
-                enforce_west_only=True,
-            )
-
-            pick_t = self._wait_until_conveyor_cell_is_free(
-                temp_robot=temp_robot,
-                pending_actions=pending_actions,
-                pending_paths=pending_paths,
-                wait_state=wait_state,
-                wait_limit=wait_limit,
-                enforce_west_only=True,
-                reason=f"pick_order_{order_idx}",
-            )
-            dynamic_waits = 0
-            while not self._is_pick_target_static_at_time((int(pallet_xy[0]), int(pallet_xy[1])), pick_t):
-                dynamic_waits += 1
-                wait_path = [(pick_t, int(temp_robot.x), int(temp_robot.y))]
-                self._append_conveyor_path_with_wait_guard(
-                    temp_robot=temp_robot,
-                    path=wait_path,
-                    pending_actions=pending_actions,
-                    pending_paths=pending_paths,
-                    wait_state=wait_state,
-                    wait_limit=wait_limit,
-                    enforce_west_only=True,
-                )
-                if dynamic_waits > 128:
-                    raise RuntimeError(
-                        "conveyor_pick_fail "
-                        f"order={order_idx} robot={robot.id} sku={sku} pallet={pallet_xy} reason=dynamic_target_timeout"
-                    )
-                pick_t = self._wait_until_conveyor_cell_is_free(
-                    temp_robot=temp_robot,
-                    pending_actions=pending_actions,
-                    pending_paths=pending_paths,
-                    wait_state=wait_state,
-                    wait_limit=wait_limit,
-                    enforce_west_only=True,
-                    reason=f"pick_dynamic_wait_order_{order_idx}",
-                )
-
-            pending_actions.append((pick_t, int(temp_robot.id), "pick", int(pallet_xy[0]), int(pallet_xy[1])))
-            pending_footprints.append(
-                (self._clone_robot_state(temp_robot), pick_t, int(temp_robot.x), int(temp_robot.y))
-            )
-            temp_robot.last_t = pick_t
-            temp_robot.storage[int(sku)] += 1
-            remaining[int(sku)] -= 1
-            if int(remaining[int(sku)]) <= 0:
-                del remaining[int(sku)]
-            self._reset_conveyor_wait_state(wait_state, robot_id=int(temp_robot.id))
-
-        # Leave nest to the west before fulfillment.
-        exit_x = int(nest_bounds[0]) - 1
-        exit_y = int(nest_bounds[1]) + 1
-        path_to_exit = self._safe_plan_path_conveyor(temp_robot, exit_x, exit_y)
-        if not path_to_exit and (int(temp_robot.x), int(temp_robot.y)) != (exit_x, exit_y):
+        if (int(temp_robot.x), int(temp_robot.y)) not in track_index:
             raise RuntimeError(
-                f"conveyor_exit_fail order={order_idx} robot={robot.id} exit=({exit_x},{exit_y})"
+                "conveyor_track_fail "
+                f"order={order_idx} robot={robot.id} off_track=({temp_robot.x},{temp_robot.y})"
             )
-        self._append_conveyor_path_with_wait_guard(
-            temp_robot=temp_robot,
-            path=path_to_exit,
-            pending_actions=pending_actions,
-            pending_paths=pending_paths,
-            wait_state=wait_state,
-            wait_limit=wait_limit,
-            enforce_west_only=True,
-        )
+        fulfill_idx = int(track_index[(int(fulfill_xy[0]), int(fulfill_xy[1]))])
+        clear_idx = int((fulfill_idx + 1) % len(track_cycle))
+        current_idx = int(track_index[(int(temp_robot.x), int(temp_robot.y))])
+
+        def _advance_one_step(reason: str) -> Tuple[int, int]:
+            nonlocal current_idx
+            prev_idx = int(current_idx)
+            next_idx = int((current_idx + 1) % len(track_cycle))
+            self._conveyor_step_to_cell(
+                temp_robot=temp_robot,
+                target_xy=track_cycle[next_idx],
+                pending_actions=pending_actions,
+                pending_paths=pending_paths,
+                wait_state=wait_state,
+                wait_limit=wait_limit,
+                reason=reason,
+            )
+            current_idx = next_idx
+            return prev_idx, next_idx
+
+        # Assign orders just after fulfill: anchor planning from the post-fulfill
+        # clear cell (one step after fulfill on the track).
+        bootstrap_steps = 0
+        while current_idx != clear_idx:
+            _advance_one_step(reason=f"bootstrap_track_wait_order_{order_idx}")
+            bootstrap_steps += 1
+            if bootstrap_steps > max(8, len(track_cycle) * 4):
+                raise RuntimeError(
+                    "conveyor_track_fail "
+                    f"order={order_idx} robot={robot.id} reason=could_not_reach_clear_cell"
+                )
+        self._reset_conveyor_wait_state(wait_state, robot_id=int(temp_robot.id))
+
+        loop_steps = 0
+        while True:
+            prev_idx, next_idx = _advance_one_step(reason=f"order_track_wait_{order_idx}")
+            loop_steps += 1
+
+            px, py = track_cycle[int(prev_idx)]
+            cx, cy = track_cycle[int(next_idx)]
+            pallet_xy: Tuple[int, int] | None = None
+            if (
+                int(py) == int(pick_west_row_y)
+                and int(cy) == int(pick_west_row_y)
+                and int(cx) == int(px) - 1
+                and int(x0) <= int(cx) <= int(x1)
+            ):
+                # West through row 1: pick from row 0.
+                pallet_xy = (int(cx), int(y0))
+            elif (
+                int(py) == int(pick_east_row_y)
+                and int(cy) == int(pick_east_row_y)
+                and int(cx) == int(px) + 1
+                and int(x0) <= int(cx) <= int(x1)
+            ):
+                # East through row 3: pick from row 2.
+                pallet_xy = (int(cx), int(y1))
+
+            if pallet_xy is not None:
+                sku = self.scheduler.pallets.get(pallet_xy)
+                if sku is not None:
+                    need = int(remaining.get(int(sku), 0))
+                    while need > 0:
+                        pick_t = self._wait_until_conveyor_cell_is_free(
+                            temp_robot=temp_robot,
+                            pending_actions=pending_actions,
+                            pending_paths=pending_paths,
+                            wait_state=wait_state,
+                            wait_limit=wait_limit,
+                            enforce_west_only=False,
+                            reason=f"pick_wait_order_{order_idx}",
+                        )
+                        while not self._is_pick_target_static_at_time((int(pallet_xy[0]), int(pallet_xy[1])), pick_t):
+                            pick_t = self._wait_until_conveyor_cell_is_free(
+                                temp_robot=temp_robot,
+                                pending_actions=pending_actions,
+                                pending_paths=pending_paths,
+                                wait_state=wait_state,
+                                wait_limit=wait_limit,
+                                enforce_west_only=False,
+                                reason=f"pick_dynamic_wait_order_{order_idx}",
+                            )
+                        pending_actions.append(
+                            (pick_t, int(temp_robot.id), "pick", int(pallet_xy[0]), int(pallet_xy[1]))
+                        )
+                        pending_footprints.append(
+                            (self._clone_robot_state(temp_robot), pick_t, int(temp_robot.x), int(temp_robot.y))
+                        )
+                        temp_robot.last_t = int(pick_t)
+                        temp_robot.storage[int(sku)] += 1
+                        remaining[int(sku)] -= 1
+                        if int(remaining[int(sku)]) <= 0:
+                            remaining.pop(int(sku), None)
+                        need = int(remaining.get(int(sku), 0))
+                        self._reset_conveyor_wait_state(wait_state, robot_id=int(temp_robot.id))
+
+            if current_idx == fulfill_idx and loop_steps > 0:
+                break
+            if loop_steps > max(8, len(track_cycle) * 4):
+                raise RuntimeError(
+                    "conveyor_track_fail "
+                    f"order={order_idx} robot={robot.id} reason=loop_overrun"
+                )
+
+        if (int(temp_robot.x), int(temp_robot.y)) != (int(fulfill_xy[0]), int(fulfill_xy[1])):
+            raise RuntimeError(
+                "conveyor_fulfill_fail "
+                f"order={order_idx} robot={robot.id} fulfill={fulfill_xy} reason=off_track_before_fulfill"
+            )
 
         missing_txt = self._format_missing_requirements(
             required=collections.Counter(order),
@@ -2097,48 +2340,12 @@ class WarehouseSolver:
                 f"order={order_idx} robot={robot.id} missing=[{missing_txt}]"
             )
 
-        # Move to edge, fulfill, then execute fixed counter-clockwise return path.
-        fulfill_retry_limit = max(8, int(wait_limit) * 4)
-        fulfill_retries = 0
-        while True:
-            path_to_fulfill = self._safe_plan_path_conveyor(temp_robot, int(fulfill_xy[0]), int(fulfill_xy[1]))
-            if path_to_fulfill or (
-                int(temp_robot.x),
-                int(temp_robot.y),
-            ) == (int(fulfill_xy[0]), int(fulfill_xy[1])):
-                break
-            if fulfill_retries >= fulfill_retry_limit:
-                raise RuntimeError(
-                    f"conveyor_fulfill_fail order={order_idx} robot={robot.id} fulfill={fulfill_xy} reason=no_path"
-                )
-            fulfill_wait_t = self._wait_until_conveyor_cell_is_free(
-                temp_robot=temp_robot,
-                pending_actions=pending_actions,
-                pending_paths=pending_paths,
-                wait_state=wait_state,
-                wait_limit=wait_limit,
-                enforce_west_only=False,
-                reason=f"fulfill_wait_order_{order_idx}",
+        # Fulfill at the forced edge cell.
+        if (int(temp_robot.x), int(temp_robot.y)) != (int(fulfill_xy[0]), int(fulfill_xy[1])):
+            raise RuntimeError(
+                "conveyor_fulfill_fail "
+                f"order={order_idx} robot={robot.id} fulfill={fulfill_xy} reason=off_track_before_fulfill"
             )
-            self._append_conveyor_path_with_wait_guard(
-                temp_robot=temp_robot,
-                path=[(fulfill_wait_t, int(temp_robot.x), int(temp_robot.y))],
-                pending_actions=pending_actions,
-                pending_paths=pending_paths,
-                wait_state=wait_state,
-                wait_limit=wait_limit,
-                enforce_west_only=False,
-            )
-            fulfill_retries += 1
-        self._append_conveyor_path_with_wait_guard(
-            temp_robot=temp_robot,
-            path=path_to_fulfill,
-            pending_actions=pending_actions,
-            pending_paths=pending_paths,
-            wait_state=wait_state,
-            wait_limit=wait_limit,
-            enforce_west_only=False,
-        )
 
         fulfill_t = self._wait_until_conveyor_cell_is_free(
             temp_robot=temp_robot,
@@ -2155,56 +2362,20 @@ class WarehouseSolver:
         )
         temp_robot.last_t = fulfill_t
         temp_robot.storage.clear()
+        self._reset_conveyor_wait_state(wait_state, robot_id=int(temp_robot.id))
 
-        return_retry_limit = max(1, int(wait_limit) - 1)
-        for waypoint in return_waypoints:
-            wx, wy = int(waypoint[0]), int(waypoint[1])
-            return_retries = 0
-            while True:
-                waypoint_path = self._safe_plan_path_conveyor(temp_robot, wx, wy)
-                if waypoint_path or (int(temp_robot.x), int(temp_robot.y)) == (wx, wy):
-                    break
-                if return_retries >= return_retry_limit:
-                    self._log(
-                        "conveyor_return_skip "
-                        f"order={order_idx} robot={robot.id} waypoint=({wx},{wy})"
-                    )
-                    break
-                wait_t = self._wait_until_conveyor_cell_is_free(
-                    temp_robot=temp_robot,
-                    pending_actions=pending_actions,
-                    pending_paths=pending_paths,
-                    wait_state=wait_state,
-                    wait_limit=wait_limit,
-                    enforce_west_only=False,
-                    reason=f"return_wait_order_{order_idx}",
-                )
-                self._append_conveyor_path_with_wait_guard(
-                    temp_robot=temp_robot,
-                    path=[(wait_t, int(temp_robot.x), int(temp_robot.y))],
-                    pending_actions=pending_actions,
-                    pending_paths=pending_paths,
-                    wait_state=wait_state,
-                    wait_limit=wait_limit,
-                    enforce_west_only=False,
-                )
-                return_retries += 1
-            if not waypoint_path and (int(temp_robot.x), int(temp_robot.y)) != (wx, wy):
-                break
-            self._append_conveyor_path_with_wait_guard(
-                temp_robot=temp_robot,
-                path=waypoint_path,
-                pending_actions=pending_actions,
-                pending_paths=pending_paths,
-                wait_state=wait_state,
-                wait_limit=wait_limit,
-                enforce_west_only=False,
-            )
-
-        if not self._can_commit_pending_actions(pending_actions):
-            raise RuntimeError(
-                f"conveyor_commit_fail order={order_idx} robot={robot.id} reason=candidate_invalid"
-            )
+        # Never park on the shared fulfill cell; take the next track cell immediately.
+        next_idx = int((current_idx + 1) % len(track_cycle))
+        self._conveyor_step_to_cell(
+            temp_robot=temp_robot,
+            target_xy=track_cycle[next_idx],
+            pending_actions=pending_actions,
+            pending_paths=pending_paths,
+            wait_state=wait_state,
+            wait_limit=wait_limit,
+            reason=f"post_fulfill_clear_order_{order_idx}",
+        )
+        current_idx = next_idx
 
         self._commit_plan(
             robot=robot,
@@ -2215,6 +2386,282 @@ class WarehouseSolver:
         )
         return True
 
+    def _find_solution_actions_dual_nest_conveyor(self) -> List[Tuple[int, int, str, int, int]]:
+        self._plan_started_monotonic = time.monotonic()
+        total_orders = len(self.orders)
+        self._completed_order_indices = set()
+        self._log(f"solve_start total_orders={total_orders} mode=dual_nest_conveyor")
+
+        if self.state.height < 4:
+            raise RuntimeError("dual_nest_conveyor requires height >= 4")
+        if self.state.width < 24:
+            raise RuntimeError("dual_nest_conveyor requires width >= 24")
+        if len(self.robots) != 5:
+            raise RuntimeError(
+                f"dual_nest_conveyor requires exactly 5 robots (found={len(self.robots)})"
+            )
+
+        hotspots = self._single_nest_top_hotspots(2)
+        raw_ax = int(hotspots[0][0])
+        raw_bx = int(hotspots[1][0])
+        hotspot_a_x = min(raw_ax, raw_bx)
+        hotspot_b_x = max(raw_ax, raw_bx)
+        min_gap_starts = 11  # 10-cell nest plus one free column for the left loop's east leg.
+        max_start = max(1, int(self.state.width) - 11)
+        if hotspot_b_x < (hotspot_a_x + min_gap_starts):
+            hotspot_b_x = min(max_start, hotspot_a_x + min_gap_starts)
+        if hotspot_b_x < (hotspot_a_x + min_gap_starts):
+            hotspot_a_x = max(1, hotspot_b_x - min_gap_starts)
+        if hotspot_b_x < (hotspot_a_x + min_gap_starts):
+            raise RuntimeError(
+                "dual_nest_conveyor requires enough horizontal room for two separated 10-wide nests "
+                f"width={self.state.width} hotspot_a_x={hotspot_a_x} hotspot_b_x={hotspot_b_x}"
+            )
+        hotspot_a, hotspot_b = (int(hotspot_a_x), 0), (int(hotspot_b_x), 0)
+        odd_targets_a, even_targets_a, nest_bounds_a = self._single_nest_targets(hotspot_a)
+        odd_targets_b, even_targets_b, nest_bounds_b = self._single_nest_targets(hotspot_b)
+        ax0, ay0, ax1, ay1 = nest_bounds_a
+        bx0, by0, bx1, by1 = nest_bounds_b
+        if not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0):
+            raise RuntimeError(
+                "dual_nest_conveyor requires non-overlapping nests "
+                f"nest_a={nest_bounds_a} nest_b={nest_bounds_b}"
+            )
+
+        all_skus = sorted({int(sku) for sku in self.scheduler.pallets.values()})
+        if len(all_skus) < 20:
+            raise RuntimeError(
+                "dual_nest_conveyor requires at least 20 distinct SKUs "
+                f"(found={len(all_skus)})"
+            )
+        odd_skus = [int(sku) for sku in all_skus if int(sku) % 2 == 1][:10]
+        even_skus = [int(sku) for sku in all_skus if int(sku) % 2 == 0][:10]
+        if len(odd_skus) < 10 or len(even_skus) < 10:
+            raise RuntimeError(
+                "dual_nest_conveyor requires at least ten odd and ten even SKUs "
+                f"(odd={len(odd_skus)} even={len(even_skus)})"
+            )
+        odd_jobs_a = [(idx, int(sku), odd_targets_a[idx]) for idx, sku in enumerate(odd_skus)]
+        even_jobs_a = [(idx, int(sku), even_targets_a[idx]) for idx, sku in enumerate(even_skus)]
+        expected_jobs_a = odd_jobs_a + even_jobs_a
+        odd_jobs_b = [(idx, int(sku), odd_targets_b[idx]) for idx, sku in enumerate(odd_skus)]
+        even_jobs_b = [(idx, int(sku), even_targets_b[idx]) for idx, sku in enumerate(even_skus)]
+        expected_jobs_b = odd_jobs_b + even_jobs_b
+
+        self._setup_robot_by_hotspot = {}
+        self._setup_robot_ids = set()
+        self._robot_hotspot_by_id = {}
+        self._hotspot_protected_cells_by_hotspot = {}
+        self._hotspot_astar_forbidden_cells_by_hotspot = {}
+        self._non_hotspot_forbidden_cells = set()
+        self._non_hotspot_astar_forbidden_cells = set()
+        for robot in self.robots:
+            if hasattr(robot, "assigned_hotspot"):
+                delattr(robot, "assigned_hotspot")
+
+        robots_sorted = sorted(self.robots, key=lambda r: int(r.id))
+        group_a = list(robots_sorted[:2])
+        group_b = list(robots_sorted[2:])
+        reserved_source_pallet_ids: set[int] = set()
+
+        self._log(
+            "dual_nest_plan "
+            f"hotspot_a={hotspot_a} hotspot_b={hotspot_b} "
+            f"nest_a={nest_bounds_a} nest_b={nest_bounds_b} "
+            f"group_a={[int(r.id) for r in group_a]} group_b={[int(r.id) for r in group_b]}"
+        )
+
+        # Keep the non-active build group out of the top-row relocation lanes.
+        self._stage_robot_subset_for_dual_build(
+            robots=group_b,
+            side="east",
+            label="before_a_build",
+        )
+        for phase_name, phase_jobs, hotspot, robot_pool in (
+            ("a_odd_row0", odd_jobs_a, hotspot_a, group_a),
+            ("a_even_row2", even_jobs_a, hotspot_a, group_a),
+            ("b_odd_row0", odd_jobs_b, hotspot_b, group_b),
+            ("b_even_row2", even_jobs_b, hotspot_b, group_b),
+        ):
+            if phase_name.startswith("b_"):
+                self._stage_robot_subset_for_dual_build(
+                    robots=group_a,
+                    side="west",
+                    label="before_b_build",
+                )
+            self._execute_single_nest_build_phase(
+                phase_name=phase_name,
+                phase_jobs=phase_jobs,
+                hotspot=hotspot,
+                robot_pool=list(robot_pool),
+                reserved_source_pallet_ids=reserved_source_pallet_ids,
+            )
+
+        self._verify_single_nest_layout_or_raise(
+            expected_jobs=expected_jobs_a,
+            nest_bounds=nest_bounds_a,
+        )
+        self._verify_single_nest_layout_or_raise(
+            expected_jobs=expected_jobs_b,
+            nest_bounds=nest_bounds_b,
+        )
+        self._log(
+            "dual_nest_integrity_ok "
+            f"reserved_sources={len(reserved_source_pallet_ids)}"
+        )
+
+        self._move_robots_out_of_single_nest(nest_bounds=nest_bounds_a)
+        self._move_robots_out_of_single_nest(nest_bounds=nest_bounds_b)
+        barrier_t = max((int(r.last_t) for r in self.robots), default=-1)
+        for robot in self.robots:
+            if int(robot.last_t) < barrier_t:
+                robot.last_t = int(barrier_t)
+        self._log(f"dual_nest_barrier synchronized_last_t={barrier_t}")
+
+        plans: List[Dict[str, object]] = []
+        for hotspot, nest_bounds, robot_pool in (
+            (hotspot_a, nest_bounds_a, group_a),
+            (hotspot_b, nest_bounds_b, group_b),
+        ):
+            entry_xy = (int(nest_bounds[2]), int(nest_bounds[1]) + 1)
+            fulfill_xy = (int(hotspot[0]) - 1, int(hotspot[1]))
+            if not (0 <= int(fulfill_xy[0]) < self.state.width and 0 <= int(fulfill_xy[1]) < self.state.height):
+                raise RuntimeError(
+                    "dual_nest_fulfill_lane_fail forced_cell_oob "
+                    f"forced={fulfill_xy} hotspot={hotspot}"
+                )
+            if (int(fulfill_xy[0]), int(fulfill_xy[1])) in self.scheduler.pallets:
+                raise RuntimeError(
+                    "dual_nest_fulfill_lane_fail forced_cell_occupied "
+                    f"forced={fulfill_xy}"
+                )
+            west_leg_x = max(0, int(fulfill_xy[0] - 1))
+            south_leg_y = min(self.state.height - 1, int(fulfill_xy[1] + 3))
+            east_leg_x = min(self.state.width - 1, int(nest_bounds[2]) + 1)
+            north_leg_y = max(0, int(south_leg_y - 2))
+            return_waypoints = [
+                (west_leg_x, int(fulfill_xy[1])),
+                (west_leg_x, south_leg_y),
+                (east_leg_x, south_leg_y),
+                (east_leg_x, north_leg_y),
+            ]
+            track_cycle = self._single_nest_conveyor_track_cycle(
+                nest_bounds=nest_bounds,
+                entry_xy=entry_xy,
+                fulfill_xy=fulfill_xy,
+                return_waypoints=return_waypoints,
+            )
+            plans.append(
+                {
+                    "hotspot": hotspot,
+                    "nest_bounds": nest_bounds,
+                    "entry_xy": entry_xy,
+                    "fulfill_xy": fulfill_xy,
+                    "return_waypoints": return_waypoints,
+                    "track_cycle": track_cycle,
+                    "robots": list(robot_pool),
+                }
+            )
+
+        track_a = set(plans[0]["track_cycle"])  # type: ignore[arg-type]
+        track_b = set(plans[1]["track_cycle"])  # type: ignore[arg-type]
+        overlap = track_a.intersection(track_b)
+        if overlap:
+            sample = sorted(list(overlap))[:10]
+            raise RuntimeError(
+                f"dual_nest_track_fail overlapping_tracks count={len(overlap)} sample={sample}"
+            )
+
+        for plan in plans:
+            slots = self._move_robots_to_conveyor_track_slots(
+                track_cycle=list(plan["track_cycle"]),  # type: ignore[arg-type]
+                robot_pool=list(plan["robots"]),  # type: ignore[arg-type]
+            )
+            self._log(
+                "dual_nest_track_slots "
+                f"hotspot={plan['hotspot']} slots={slots}"
+            )
+
+        track_barrier_t = max((int(r.last_t) for r in self.robots), default=-1)
+        for robot in self.robots:
+            if int(robot.last_t) < track_barrier_t:
+                robot.last_t = int(track_barrier_t)
+        self._log(f"dual_nest_track_barrier synchronized_last_t={track_barrier_t}")
+
+        wait_limit = max(1, int(getattr(self.config, "conveyor_wait_stall_limit", 12)))
+        wait_state: Dict[int, Dict[str, object]] = {
+            int(robot.id): {"cell": None, "ticks": 0} for robot in self.robots
+        }
+
+        completed_orders: set[int] = set()
+        self._completed_order_indices = completed_orders
+        ordered_order_indexes = sorted(
+            range(total_orders),
+            key=lambda idx: (
+                int(sum(self.orders[idx].items.values())),
+                int(len(self.orders[idx].items)),
+                int(idx),
+            ),
+        )
+        group_pattern = [0, 1, 1, 0, 1]
+        group_cursors = [0, 0]
+
+        for dispatch_idx, order_idx in enumerate(ordered_order_indexes):
+            order_idx = int(order_idx)
+            self._check_global_limits_or_raise(
+                collections.deque(
+                    [idx for idx in range(total_orders) if idx not in completed_orders]
+                )
+            )
+            group_idx = int(group_pattern[dispatch_idx % len(group_pattern)])
+            plan = plans[group_idx]
+            plan_robots: List[RobotState] = list(plan["robots"])  # type: ignore[assignment]
+            designated = plan_robots[group_cursors[group_idx] % len(plan_robots)]
+            group_cursors[group_idx] += 1
+            order_counter = collections.Counter(self.orders[order_idx].items)
+            pick_count = int(sum(order_counter.values()))
+
+            self._log(
+                "dual_nest_order_start "
+                f"order={order_idx} picks={pick_count} hotspot={plan['hotspot']} robot={designated.id} "
+                f"robot_xy=({designated.x},{designated.y})"
+            )
+
+            self._plan_single_nest_conveyor_order(
+                order_idx=order_idx,
+                order=order_counter,
+                robot=designated,
+                nest_bounds=tuple(plan["nest_bounds"]),  # type: ignore[arg-type]
+                entry_xy=tuple(plan["entry_xy"]),  # type: ignore[arg-type]
+                wait_state=wait_state,
+                wait_limit=wait_limit,
+                fulfill_xy=tuple(plan["fulfill_xy"]),  # type: ignore[arg-type]
+                return_waypoints=list(plan["return_waypoints"]),  # type: ignore[arg-type]
+                track_cycle=list(plan["track_cycle"]),  # type: ignore[arg-type]
+            )
+
+            completed_orders.add(order_idx)
+            self._maybe_log_progress(
+                completed=len(completed_orders),
+                total_orders=total_orders,
+                dispatch_count=len(completed_orders),
+            )
+
+        sorted_actions = self.actions.sorted_actions()
+        repaired_actions = self._repair_idle_wait_conflicts(sorted_actions)
+        if repaired_actions != sorted_actions and not self._validate_candidate_actions(
+            repaired_actions, log_on_error=True
+        ):
+            self._log("repair_idle_wait_conflicts produced invalid actions; reverting to unrepaired actions")
+        else:
+            sorted_actions = repaired_actions
+
+        makespan = max((t for t, _, _, _, _ in sorted_actions), default=-1)
+        self._log(
+            f"find_solution_end actions={len(sorted_actions)} makespan={makespan} mode=dual_nest_conveyor"
+        )
+        return sorted_actions
+
     def _find_solution_actions_single_nest_conveyor(self) -> List[Tuple[int, int, str, int, int]]:
         self._plan_started_monotonic = time.monotonic()
         total_orders = len(self.orders)
@@ -2223,22 +2670,24 @@ class WarehouseSolver:
 
         if self.state.height < 4:
             raise RuntimeError("single_nest_conveyor requires height >= 4")
-        if self.state.width < 13:
-            raise RuntimeError("single_nest_conveyor requires width >= 13")
+        if self.state.width < 12:
+            raise RuntimeError("single_nest_conveyor requires width >= 12")
 
         hotspot = self._single_nest_top_hotspot()
         odd_targets, even_targets, nest_bounds = self._single_nest_targets(hotspot)
         all_skus = sorted({int(sku) for sku in self.scheduler.pallets.values()})
-        odd_skus = [sku for sku in all_skus if sku % 2 == 1]
-        even_skus = [sku for sku in all_skus if sku % 2 == 0]
+        if len(all_skus) < 20:
+            raise RuntimeError(
+                "single_nest_conveyor requires at least 20 distinct SKUs "
+                f"(found={len(all_skus)})"
+            )
+        odd_skus = [int(sku) for sku in all_skus if int(sku) % 2 == 1][:10]
+        even_skus = [int(sku) for sku in all_skus if int(sku) % 2 == 0][:10]
         if len(odd_skus) < 10 or len(even_skus) < 10:
             raise RuntimeError(
-                "single_nest_conveyor requires at least 10 odd and 10 even SKUs "
+                "single_nest_conveyor requires at least ten odd and ten even SKUs "
                 f"(odd={len(odd_skus)} even={len(even_skus)})"
             )
-        odd_skus = odd_skus[:10]
-        even_skus = even_skus[:10]
-
         odd_jobs = [(idx, int(sku), odd_targets[idx]) for idx, sku in enumerate(odd_skus)]
         even_jobs = [(idx, int(sku), even_targets[idx]) for idx, sku in enumerate(even_skus)]
         expected_jobs = odd_jobs + even_jobs
@@ -2283,16 +2732,6 @@ class WarehouseSolver:
             if int(robot.last_t) < barrier_t:
                 robot.last_t = int(barrier_t)
         self._log(f"single_nest_barrier synchronized_last_t={barrier_t}")
-        staging_targets = self._move_robots_to_conveyor_staging(
-            hotspot=hotspot,
-            nest_bounds=nest_bounds,
-        )
-        self._log(f"single_nest_staging_targets {staging_targets}")
-        staging_barrier_t = max((int(r.last_t) for r in self.robots), default=-1)
-        for robot in self.robots:
-            if int(robot.last_t) < staging_barrier_t:
-                robot.last_t = int(staging_barrier_t)
-        self._log(f"single_nest_staging_barrier synchronized_last_t={staging_barrier_t}")
 
         entry_xy = (int(nest_bounds[2]), int(nest_bounds[1]) + 1)
         forced_fulfill_x = int(hotspot[0]) - 1
@@ -2310,7 +2749,7 @@ class WarehouseSolver:
         fulfill_xy = (forced_fulfill_x, forced_fulfill_y)
         west_leg_x = max(0, int(fulfill_xy[0] - 1))
         south_leg_y = min(self.state.height - 1, int(fulfill_xy[1] + 3))
-        east_leg_x = min(self.state.width - 1, int(west_leg_x + 12))
+        east_leg_x = min(self.state.width - 1, int(nest_bounds[2]) + 1)
         north_leg_y = max(0, int(south_leg_y - 2))
         return_waypoints = [
             (west_leg_x, int(fulfill_xy[1])),
@@ -2318,6 +2757,20 @@ class WarehouseSolver:
             (east_leg_x, south_leg_y),
             (east_leg_x, north_leg_y),
         ]
+        track_cycle = self._single_nest_conveyor_track_cycle(
+            nest_bounds=nest_bounds,
+            entry_xy=entry_xy,
+            fulfill_xy=fulfill_xy,
+            return_waypoints=return_waypoints,
+        )
+        track_slots = self._move_robots_to_conveyor_track_slots(track_cycle=track_cycle)
+        self._log(f"single_nest_track_slots {track_slots}")
+        track_barrier_t = max((int(r.last_t) for r in self.robots), default=-1)
+        for robot in self.robots:
+            if int(robot.last_t) < track_barrier_t:
+                robot.last_t = int(track_barrier_t)
+        self._log(f"single_nest_track_barrier synchronized_last_t={track_barrier_t}")
+
         wait_limit = max(1, int(getattr(self.config, "conveyor_wait_stall_limit", 12)))
         wait_state: Dict[int, Dict[str, object]] = {
             int(robot.id): {"cell": None, "ticks": 0} for robot in self.robots
@@ -2328,103 +2781,48 @@ class WarehouseSolver:
         robot_cycle: List[RobotState] = sorted(self.robots, key=lambda r: int(r.id))
         if not robot_cycle:
             raise RuntimeError("single_nest_order_fail no_robots_available")
-        robot_by_id: Dict[int, RobotState] = {int(r.id): r for r in robot_cycle}
-        remaining_order_indexes: collections.deque[Tuple[int, int]] = collections.deque(
-            (int(order_idx), int(robot_cycle[order_idx % len(robot_cycle)].id))
-            for order_idx in range(total_orders)
-        )
-        robot_completed_orders: Dict[int, int] = {int(r.id): 0 for r in robot_cycle}
-        consecutive_soft_fails = 0
-        soft_fail_cap = max(100, total_orders * max(1, len(robot_cycle)) * 20)
-        robot_soft_fail_streak: Dict[int, int] = {int(r.id): 0 for r in robot_cycle}
-        per_robot_soft_fail_cap = max(20, total_orders * 4)
 
-        while remaining_order_indexes:
-            order_idx, designated_id = remaining_order_indexes.popleft()
+        ordered_order_indexes = sorted(
+            range(total_orders),
+            key=lambda idx: (
+                int(sum(self.orders[idx].items.values())),
+                int(len(self.orders[idx].items)),
+                int(idx),
+            ),
+        )
+
+        for dispatch_idx, order_idx in enumerate(ordered_order_indexes):
             order_idx = int(order_idx)
-            designated_id = int(designated_id)
             self._check_global_limits_or_raise(
                 collections.deque(
                     [idx for idx in range(total_orders) if idx not in completed_orders]
                 )
             )
+            designated = robot_cycle[dispatch_idx % len(robot_cycle)]
             order_counter = collections.Counter(self.orders[order_idx].items)
-            designated = robot_by_id[designated_id]
-            hard_fail_markers = (
-                "conveyor_wait_stall",
-                "conveyor_wait_fail",
-                "conveyor_order_inventory_fail",
-                "reason=no_nest_candidate",
-                "dynamic_target_timeout",
-                "single_nest_fulfill_lane_fail",
-            )
-            trial_wait_state = {
-                int(rid): {
-                    "cell": state.get("cell"),
-                    "ticks": int(state.get("ticks", 0)),
-                }
-                for rid, state in wait_state.items()
-            }
+            pick_count = int(sum(order_counter.values()))
+
             self._log(
                 "single_nest_order_start "
-                f"order={order_idx} robot={designated.id} robot_xy=({designated.x},{designated.y}) "
-                f"entry={entry_xy} fulfill={fulfill_xy}"
+                f"order={order_idx} picks={pick_count} robot={designated.id} "
+                f"robot_xy=({designated.x},{designated.y}) entry={entry_xy} fulfill={fulfill_xy}"
             )
-            try:
-                self._plan_single_nest_conveyor_order(
-                    order_idx=int(order_idx),
-                    order=order_counter,
-                    robot=designated,
-                    nest_bounds=nest_bounds,
-                    entry_xy=entry_xy,
-                    wait_state=trial_wait_state,
-                    wait_limit=wait_limit,
-                    fulfill_xy=fulfill_xy,
-                    return_waypoints=return_waypoints,
-                )
-                wait_state = trial_wait_state
-                robot_completed_orders[int(designated.id)] = (
-                    int(robot_completed_orders.get(int(designated.id), 0)) + 1
-                )
-                consecutive_soft_fails = 0
-                robot_soft_fail_streak[int(designated.id)] = 0
-            except RuntimeError as exc:
-                msg = str(exc)
-                if any(marker in msg for marker in hard_fail_markers):
-                    raise
-                consecutive_soft_fails += 1
-                robot_soft_fail_streak[int(designated.id)] = (
-                    int(robot_soft_fail_streak.get(int(designated.id), 0)) + 1
-                )
-                self._log(
-                    "single_nest_order_requeue "
-                    f"order={order_idx} robot={designated.id} "
-                    f"consecutive_soft_fails={consecutive_soft_fails} "
-                    f"robot_fail_streak={robot_soft_fail_streak[int(designated.id)]} reason={msg!r}"
-                )
-                remaining_order_indexes.append((order_idx, designated_id))
-                if robot_soft_fail_streak[int(designated.id)] >= per_robot_soft_fail_cap:
-                    raise RuntimeError(
-                        "single_nest_order_fail "
-                        f"robot={designated.id} could_not_complete_assigned_orders "
-                        f"robot_fail_streak={robot_soft_fail_streak[int(designated.id)]} "
-                        f"order={order_idx} reason={msg}"
-                    )
-                if consecutive_soft_fails >= soft_fail_cap:
-                    raise RuntimeError(
-                        "single_nest_order_fail progress_stalled "
-                        f"consecutive_soft_fails={consecutive_soft_fails} "
-                        f"order={order_idx} robot={designated.id} reason={msg}"
-                    )
-                continue
 
-            completed_orders.add(int(order_idx))
-            self._maybe_log_progress(
-                completed=len(completed_orders),
-                total_orders=total_orders,
-                dispatch_count=len(completed_orders),
+            self._plan_single_nest_conveyor_order(
+                order_idx=order_idx,
+                order=order_counter,
+                robot=designated,
+                nest_bounds=nest_bounds,
+                entry_xy=entry_xy,
+                wait_state=wait_state,
+                wait_limit=wait_limit,
+                fulfill_xy=fulfill_xy,
+                return_waypoints=return_waypoints,
+                track_cycle=track_cycle,
             )
-            self._maybe_validate_dispatch_progress_or_raise(
+
+            completed_orders.add(order_idx)
+            self._maybe_log_progress(
                 completed=len(completed_orders),
                 total_orders=total_orders,
                 dispatch_count=len(completed_orders),
