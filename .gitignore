@@ -14,5 +14,6 @@ models/
 *.onnx
 *log
 .env
+.claude
 output/*.log
 output/test_case_*

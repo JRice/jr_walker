@@ -18,6 +18,7 @@ from jr_walker.entities import ActionEntry, JobKind, Pallet, Robot
 from jr_walker.pathfinder import (
     find_clearing,
     find_path,
+    iter_clearings,
     manhattan,
     nearest_available_robot,
     nearest_free_adjacent,
@@ -229,15 +230,32 @@ def _reorient_to_north(
     """Move robot+pallet to clear space, undock, go south of pallet, redock."""
     offset = _current_dock_offset(robot, pallet.id)
 
-    clearing = find_clearing(pallet.x, pallet.y, robot.last_tick + 1, 15, grid, search_radius=12)
-    if clearing is None:
-        clearing = (pallet.x, max(1, pallet.y - 3))
+    # Find the nearest clearing that the docked robot can actually reach.
+    # The first candidate (find_clearing) may be unreachable if another robot's
+    # spacetime reservation blocks every path to it — so we probe each candidate
+    # in distance order and commit to the first one with a valid path.
+    navigated = False
+    for cx, cy in iter_clearings(pallet.x, pallet.y, robot.last_tick + 1, 15, grid, search_radius=12):
+        crx, cry = cx - offset[0], cy - offset[1]
+        if (crx, cry) == (robot.x, robot.y):
+            navigated = True
+            break
+        path = find_path(robot.x, robot.y, robot.last_tick, crx, cry, grid,
+                         footprint_offsets=[offset], strict_no_swap=strict_no_swap,
+                         excluded_rects=ex_rects)
+        if path:
+            _apply_path(robot, path, [offset], grid, actions)
+            pallet.x = robot.x + offset[0]
+            pallet.y = robot.y + offset[1]
+            navigated = True
+            break
 
-    if clearing != (pallet.x, pallet.y):
-        clear_robot_x = clearing[0] - offset[0]
-        clear_robot_y = clearing[1] - offset[1]
-        _navigate_robot_docked(robot, pallet, clear_robot_x, clear_robot_y,
-                               grid, actions, ex_rects, strict_no_swap)
+    if not navigated:
+        # Hard fallback: fixed position above pallet, let _navigate_robot_docked raise if stuck.
+        clearing = (pallet.x, max(1, pallet.y - 3))
+        crx, cry = clearing[0] - offset[0], clearing[1] - offset[1]
+        if (crx, cry) != (robot.x, robot.y):
+            _navigate_robot_docked(robot, pallet, crx, cry, grid, actions, ex_rects, strict_no_swap)
 
     cur_offset = _current_dock_offset(robot, pallet.id)
     cur_pallet_x = robot.x + cur_offset[0]

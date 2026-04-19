@@ -208,6 +208,18 @@ def find_clearing(
 
     Searches outward by manhattan distance from center.
     """
+    return next(iter_clearings(center_x, center_y, t_start, ticks_needed, grid, search_radius), None)
+
+
+def iter_clearings(
+    center_x: int,
+    center_y: int,
+    t_start: int,
+    ticks_needed: int,
+    grid: SpacetimeGrid,
+    search_radius: int = 12,
+):
+    """Yield (x, y) positions where the 3x3 patch is clear, in ascending manhattan order."""
     for r in range(search_radius + 1):
         for dx in range(-r, r + 1):
             for dy in range(-r, r + 1):
@@ -215,5 +227,4 @@ def find_clearing(
                     continue
                 cx, cy = center_x + dx, center_y + dy
                 if grid.is_3x3_clear(cx, cy, t_start, ticks_needed):
-                    return cx, cy
-    return None
+                    yield cx, cy
