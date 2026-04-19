@@ -92,9 +92,14 @@ def find_path(
                 continue
             if not state_navigable(nt, nx, ny):
                 continue
-            # Strict swap prevention: target must also be free at current tick
+            # Strict swap prevention: target must also be free at current tick.
+            # Exempt cells that belong to this robot's own footprint — the pallet
+            # moves with the robot, so it is never a foreign blocker.
             if strict_no_swap and (dx, dy) != (0, 0):
-                if not grid.is_free(t, nx, ny):
+                own_footprint = frozenset(
+                    (x + foe_dx, y + foe_dy) for foe_dx, foe_dy in footprint_offsets
+                )
+                if not grid.is_free(t, nx, ny) and (nx, ny) not in own_footprint:
                     continue
 
             state = (nt, nx, ny)
