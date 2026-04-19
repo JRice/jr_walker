@@ -18,17 +18,24 @@
     - odd SKUs on row 0, even SKUs on row 2.
   - All robots cooperate on setup using nearest source + nearest robot assignment with source fallbacks.
   - Hard integrity check: fail immediately if expected 20 placements are not present in the nest rectangle.
-  - Post-build barrier sync + robot exit from nest, then conveyor fulfillment loop.
+  - Post-build barrier sync + robot exit from nest + dedicated staging move to non-blocking queue cells before conveyor loop.
+  - Staging is retry-based (delayed-start retries) and falls back to in-place start if staging move remains invalid.
+  - Post-staging barrier sync aligns all robots before order dispatch.
 
 ## Conveyor Fulfillment Flow
 - Entry: east side of nest row 1.
 - Picking: nest-only picks, nearest-needed SKU first, west-only movement during pick/exit stage.
 - Wait policy: robot may wait; same-cell wait for `>= conveyor_wait_stall_limit` ticks fails immediately with robot/tick.
 - Inventory policy: after leaving nest, order inventory must be complete; missing SKU counts fail immediately.
+- Assignment policy: orders are dispatched in strict robot-id round-robin to keep all robots active in the conveyor loop.
+- Sticky assignment: each order retains its initially assigned round-robin robot on retries (no cross-robot stealing of failed orders).
+- Entry policy: robots now wait/retry for nest entry before requeueing instead of failing fast on first blocked entry path.
+- Fulfill policy: forced fulfill cell now uses wait/retry when temporarily blocked before failing.
+- Return policy: conveyor return waypoints now use wait/retry and can skip a blocked waypoint after bounded retries (logged), preventing full-run abort on late-loop congestion.
 - Delivery/loop path:
-  - move to top-edge fulfill lane and `fulfill`
-  - then fixed loop legs: west 1, south 3, east 12, north 2
-- Order assignment retries across robots for non-fatal path conflicts; hard policy failures abort.
+  - forced `fulfill` cell is `[hotspot_x-1, hotspot_y]`
+  - then loop legs: west 1, south 3, east 12, north 2 (clamped to map bounds)
+- Non-fatal order-planning conflicts requeue the order while preserving round-robin progression; solver fails only on hard invariants or prolonged no-progress.
 
 ## New Config Fields
 - `solver.single_nest_conveyor_mode` (bool)
@@ -40,6 +47,6 @@
 
 ## Risk Concentration
 - `solver.py` complexity is high; fragile areas are now:
-  - shared-nest build sequencing under reservation conflicts,
+  - shared-nest build sequencing under reservation conflicts (now robot-rotated for fairness),
   - conveyor wait/state tracking across retries,
   - strict fail-fast policy interactions with parallel robot timelines.
