@@ -1,0 +1,33 @@
+[paths]
+input_path = "config/BIG_ORDER.txt"
+output_dir = "output"
+media_dir = "media"
+log_path = "output/run.log"
+run_number_path = "config/run_number.txt"
+# output_path = "output/manual_solution.txt"
+
+[limits]
+max_ticks = 16000
+max_runtime_minutes = 240.0
+stride = 1
+
+[solver]
+max_time = 50000
+strict_no_swap = false
+conveyor_wait_stall_limit = 24
+max_idle_ticks = 24
+
+[relocation]
+# Top-edge nest anchors: x coordinates only (y is fixed to 0 in cooperative mode).
+setup_hotspots = [[15, 0], [35, 0]]
+
+[progress]
+order_interval = 100
+tick_interval = 1000
+
+[lns]
+enabled = false
+iterations = 60
+window_actions = 28
+tail_fraction = 0.35
+max_shift = 2
