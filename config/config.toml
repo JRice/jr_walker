@@ -1,0 +1,32 @@
+[warehouse]
+width = 60
+height = 40
+
+[paths]
+input_path = "config/BIG_ORDER.txt"
+output_dir = "output"
+media_dir = "media"
+run_number_path = "config/run_number.txt"
+
+[limits]
+max_ticks = 16000
+max_runtime_minutes = 240.0
+# Process every Nth order; 1 = all orders, 10 = 100 of 1000
+stride = 1
+
+[nests]
+# x-coordinates for nest anchors; each nest occupies x..x+9 at y=0 and y=2
+x_coords = [15, 35]
+
+[pathfinding]
+# Prevent robots/pallets swapping positions in the same tick (off by default;
+# the online validator has a known bug that allows swaps)
+strict_no_swap = false
+# Error if a robot is idle more than this many ticks without a job
+max_idle_ticks = 24
+# Error if a conveyor robot stalls in the same cell this many ticks
+stall_limit = 24
+
+[progress]
+order_interval = 100
+tick_interval = 1000

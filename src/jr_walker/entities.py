@@ -1,51 +1,69 @@
-import collections
-from typing import Dict, List, Tuple
+from __future__ import annotations
 
-import numpy as np
+from collections import Counter
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Dict, List, Optional, Tuple
 
 
+class JobKind(Enum):
+    SETUP = auto()    # Moving a pallet into the nest
+    ORDER = auto()    # Fulfilling orders on the conveyor belt
+    WAITING = auto()  # Idle between jobs
+    DONE = auto()     # All work complete
+
+
+@dataclass
+class Pallet:
+    id: int
+    x: int
+    y: int
+    sku: int
+
+
+@dataclass
+class Order:
+    id: int
+    items: Counter  # sku -> quantity required
+    assigned_tick: Optional[int] = None
+    fulfilled_tick: Optional[int] = None
+
+    @property
+    def is_fulfilled(self) -> bool:
+        return self.fulfilled_tick is not None
+
+    @property
+    def total_picks(self) -> int:
+        return sum(self.items.values())
+
+
+@dataclass
 class Robot:
-    def __init__(self, r_id: int, x: int, y: int):
-        self.id = r_id
-        self.x = x
-        self.y = y
-        self.storage = collections.Counter()  # For picking items
-        
-        # Maps a relative directional offset to a Pallet ID
-        # e.g., {(0, -1): 42} means Pallet 42 is docked to the North
-        self.docks: Dict[Tuple[int, int], int] = {} 
-        
-    def get_footprint(self, target_x: int, target_y: int) -> List[Tuple[int, int]]:
-        """Returns the absolute coordinates this robot will occupy at a given target."""
-        footprint = [(target_x, target_y)] # The robot's main body
-        
-        for (dx, dy) in self.docks.keys():
-            footprint.append((target_x + dx, target_y + dy))
-            
-        return footprint
+    id: int
+    nest_id: int
+    x: int
+    y: int
+    last_tick: int = -1
+    inventory: Counter = field(default_factory=Counter)
+    job: JobKind = JobKind.WAITING
+    # Maps (dx, dy) offset from robot to pallet_id; pallet sits at (robot_x+dx, robot_y+dy)
+    docks: Dict[Tuple[int, int], int] = field(default_factory=dict)
 
-    def can_move(self, dx: int, dy: int, future_t: int, reservation_table: np.ndarray) -> bool:
-        """Validates if the robot and attached pallets can safely exist at future_t."""
-        target_x = self.x + dx
-        target_y = self.y + dy
-        
-        # 1. Horizon Check: Have we exceeded our maximum allocated simulation time?
-        max_t = reservation_table.shape[0]
-        if future_t >= max_t:
-            return False
-            
-        # 2. Get the footprint at the new location
-        future_footprint = self.get_footprint(target_x, target_y)
-        
-        # 3. 3D Collision Detection
-        for (fx, fy) in future_footprint:
-            # Check grid boundaries
-            if not (0 <= fy < reservation_table.shape[1] and 0 <= fx < reservation_table.shape[2]):
-                return False
-                
-            # Check the tensor at the specific future timestep
-            # We assume > 1 means a static pallet or another robot has claimed this space
-            if reservation_table[future_t, fy, fx] > 1:
-                return False 
-                
-        return True
+    def footprint_at(self, x: int, y: int) -> List[Tuple[int, int]]:
+        """Absolute (x, y) cells occupied by the robot and all docked pallets."""
+        cells = [(x, y)]
+        for dx, dy in self.docks:
+            cells.append((x + dx, y + dy))
+        return cells
+
+
+@dataclass
+class ActionEntry:
+    tick: int
+    robot_id: int
+    action: str  # move | pick | dock | undock | fulfill
+    x: int
+    y: int
+
+    def format_line(self) -> str:
+        return f"{self.tick} {self.robot_id} {self.action} {self.x} {self.y}"
