@@ -142,33 +142,15 @@ class RunConfig:
     setup_hotspots: list[tuple[int, int]] = field(default_factory=list)
     setup_mini_box_radius: int = 2
     enable_setup_dual_relocation: bool = False
-    relocation_skus_to_relocate: list[int] | None = None
     max_time: int = 50000
     min_jobs_for_dock: int = 3
     max_makespan: int | None = None
     max_plan_time_seconds: float = 600.0
-    relocation_top_skus: int = 8
-    num_allowed_relocations: int = 10
-    order_suggestion_gain_constant: float = 100.0
-    dock_gain_scale: float = 2.0
-    relocation_gain_scale: float = 1.5
     strict_no_swap: bool = False
     ticks_to_full_validation: int = 500
     astar_slow_ms: float = 40.0
     astar_print_slow: bool = False
     astar_log_blocked: bool = False
-    enable_relocation_suggestions: bool = False
-    suggestion_retry_limit: int = 12
-    suggestion_backoff_base_cycles: int = 2
-    suggestion_backoff_max_cycles: int = 128
-    setup_retry_wait_ticks: int = 0
-    order_stagnation_cycle_limit: int = 256
-    realistic_fail_mode: bool = False
-    max_robots_per_suggestion: int = 3
-    robot_fail_streak_for_parking: int = 3
-    parking_candidate_limit: int = 96
-    enable_order_cluster_discovery: bool = False
-    recalculate_order_suggestions: bool = False
     order_pick_local_manhattan_radius: int = 10
     order_other_hotspot_penalty: float = 0.0
     order_other_hotspot_penalty_radius: int = 6
@@ -266,14 +248,6 @@ def load_run_config(config_path: Path) -> RunConfig:
         parsed_hotspots.append((x, y))
     run_config.setup_hotspots = parsed_hotspots
 
-    raw_reloc_skus = relocation_section.get("skus_to_relocate")
-    if raw_reloc_skus is not None:
-        if not isinstance(raw_reloc_skus, list):
-            raise ValueError("relocation.skus_to_relocate must be a list of integers.")
-        run_config.relocation_skus_to_relocate = [
-            _require_int(v, f"relocation.skus_to_relocate[{i}]", minimum=1)
-            for i, v in enumerate(raw_reloc_skus)
-        ]
     solver_section = _get_table(data, "solver")
     run_config.max_time = _require_int(
         solver_section.get("max_time", run_config.max_time),
@@ -286,31 +260,6 @@ def load_run_config(config_path: Path) -> RunConfig:
         minimum=1,
     )
 
-    run_config.num_allowed_relocations = _require_int(
-        solver_section.get("num_allowed_relocations", run_config.num_allowed_relocations),
-        "solver.num_allowed_relocations",
-        minimum=0,
-    )
-    run_config.relocation_top_skus = _require_int(
-        solver_section.get("relocation_top_skus", run_config.relocation_top_skus),
-        "solver.relocation_top_skus",
-        minimum=1,
-    )
-    run_config.order_suggestion_gain_constant = _require_number(
-        solver_section.get("order_suggestion_gain_constant", run_config.order_suggestion_gain_constant),
-        "solver.order_suggestion_gain_constant",
-        minimum=0.0,
-    )
-    run_config.dock_gain_scale = _require_number(
-        solver_section.get("dock_gain_scale", run_config.dock_gain_scale),
-        "solver.dock_gain_scale",
-        minimum=0.0,
-    )
-    run_config.relocation_gain_scale = _require_number(
-        solver_section.get("relocation_gain_scale", run_config.relocation_gain_scale),
-        "solver.relocation_gain_scale",
-        minimum=0.0,
-    )
     raw_strict_no_swap = solver_section.get("strict_no_swap", run_config.strict_no_swap)
     if not isinstance(raw_strict_no_swap, bool):
         raise ValueError("solver.strict_no_swap must be a boolean.")
@@ -328,55 +277,11 @@ def load_run_config(config_path: Path) -> RunConfig:
     if not isinstance(raw_astar_log_blocked, bool):
         raise ValueError("solver.astar_log_blocked must be a boolean.")
     run_config.astar_log_blocked = raw_astar_log_blocked
-    raw_enable_relocation = solver_section.get(
-        "enable_relocation_suggestions", run_config.enable_relocation_suggestions
-    )
-    if not isinstance(raw_enable_relocation, bool):
-        raise ValueError("solver.enable_relocation_suggestions must be a boolean.")
-    run_config.enable_relocation_suggestions = raw_enable_relocation
     run_config.ticks_to_full_validation = _require_int(
         solver_section.get("ticks_to_full_validation", run_config.ticks_to_full_validation),
         "solver.ticks_to_full_validation",
         minimum=0,
     )
-    run_config.suggestion_retry_limit = _require_int(
-        solver_section.get("suggestion_retry_limit", run_config.suggestion_retry_limit),
-        "solver.suggestion_retry_limit",
-        minimum=1,
-    )
-    run_config.suggestion_backoff_base_cycles = _require_int(
-        solver_section.get("suggestion_backoff_base_cycles", run_config.suggestion_backoff_base_cycles),
-        "solver.suggestion_backoff_base_cycles",
-        minimum=1,
-    )
-    run_config.suggestion_backoff_max_cycles = _require_int(
-        solver_section.get("suggestion_backoff_max_cycles", run_config.suggestion_backoff_max_cycles),
-        "solver.suggestion_backoff_max_cycles",
-        minimum=1,
-    )
-    if run_config.suggestion_backoff_max_cycles < run_config.suggestion_backoff_base_cycles:
-        raise ValueError(
-            "solver.suggestion_backoff_max_cycles must be >= solver.suggestion_backoff_base_cycles."
-        )
-    run_config.setup_retry_wait_ticks = _require_int(
-        solver_section.get("setup_retry_wait_ticks", run_config.setup_retry_wait_ticks),
-        "solver.setup_retry_wait_ticks",
-        minimum=0,
-    )
-    run_config.max_robots_per_suggestion = _require_int(
-        solver_section.get("max_robots_per_suggestion", run_config.max_robots_per_suggestion),
-        "solver.max_robots_per_suggestion",
-        minimum=1,
-    )
-    run_config.order_stagnation_cycle_limit = _require_int(
-        solver_section.get("order_stagnation_cycle_limit", run_config.order_stagnation_cycle_limit),
-        "solver.order_stagnation_cycle_limit",
-        minimum=1,
-    )
-    raw_realistic_fail_mode = solver_section.get("realistic_fail_mode", run_config.realistic_fail_mode)
-    if not isinstance(raw_realistic_fail_mode, bool):
-        raise ValueError("solver.realistic_fail_mode must be a boolean.")
-    run_config.realistic_fail_mode = raw_realistic_fail_mode
     run_config.setup_mini_box_radius = _require_int(
         solver_section.get("setup_mini_box_radius", run_config.setup_mini_box_radius),
         "solver.setup_mini_box_radius",
@@ -389,30 +294,6 @@ def load_run_config(config_path: Path) -> RunConfig:
     if not isinstance(raw_enable_setup_dual_relocation, bool):
         raise ValueError("solver.enable_setup_dual_relocation must be a boolean.")
     run_config.enable_setup_dual_relocation = raw_enable_setup_dual_relocation
-    run_config.robot_fail_streak_for_parking = _require_int(
-        solver_section.get("robot_fail_streak_for_parking", run_config.robot_fail_streak_for_parking),
-        "solver.robot_fail_streak_for_parking",
-        minimum=1,
-    )
-    run_config.parking_candidate_limit = _require_int(
-        solver_section.get("parking_candidate_limit", run_config.parking_candidate_limit),
-        "solver.parking_candidate_limit",
-        minimum=1,
-    )
-    raw_enable_order_cluster_discovery = solver_section.get(
-        "enable_order_cluster_discovery",
-        run_config.enable_order_cluster_discovery,
-    )
-    if not isinstance(raw_enable_order_cluster_discovery, bool):
-        raise ValueError("solver.enable_order_cluster_discovery must be a boolean.")
-    run_config.enable_order_cluster_discovery = raw_enable_order_cluster_discovery
-    raw_recalculate_order_suggestions = solver_section.get(
-        "recalculate_order_suggestions",
-        run_config.recalculate_order_suggestions,
-    )
-    if not isinstance(raw_recalculate_order_suggestions, bool):
-        raise ValueError("solver.recalculate_order_suggestions must be a boolean.")
-    run_config.recalculate_order_suggestions = raw_recalculate_order_suggestions
     run_config.order_pick_local_manhattan_radius = _require_int(
         solver_section.get(
             "order_pick_local_manhattan_radius",
@@ -521,30 +402,13 @@ def _build_solver(state: WarehouseState, run_config: RunConfig, temp_output_path
             relocation_edge_band=run_config.relocation_edge_band,
             relocate_chunk_size=run_config.relocate_chunk_size,
             setup_hotspots=list(run_config.setup_hotspots),
-            relocation_top_skus=run_config.relocation_top_skus,
-            num_allowed_relocations=run_config.num_allowed_relocations,
-            order_suggestion_gain_constant=run_config.order_suggestion_gain_constant,
-            dock_gain_scale=run_config.dock_gain_scale,
-            relocation_gain_scale=run_config.relocation_gain_scale,
             strict_no_swap=run_config.strict_no_swap,
             dispatch_validate_every_makespan=run_config.ticks_to_full_validation,
             astar_slow_ms=run_config.astar_slow_ms,
             astar_print_slow=run_config.astar_print_slow,
             astar_log_blocked=run_config.astar_log_blocked,
-            enable_relocation_suggestions=run_config.enable_relocation_suggestions,
             setup_mini_box_radius=run_config.setup_mini_box_radius,
             enable_setup_dual_relocation=run_config.enable_setup_dual_relocation,
-            suggestion_retry_limit=run_config.suggestion_retry_limit,
-            suggestion_backoff_base_cycles=run_config.suggestion_backoff_base_cycles,
-            suggestion_backoff_max_cycles=run_config.suggestion_backoff_max_cycles,
-            setup_retry_wait_ticks=run_config.setup_retry_wait_ticks,
-            order_stagnation_cycle_limit=run_config.order_stagnation_cycle_limit,
-            realistic_fail_mode=run_config.realistic_fail_mode,
-            max_robots_per_suggestion=run_config.max_robots_per_suggestion,
-            robot_fail_streak_for_parking=run_config.robot_fail_streak_for_parking,
-            parking_candidate_limit=run_config.parking_candidate_limit,
-            enable_order_cluster_discovery=run_config.enable_order_cluster_discovery,
-            recalculate_order_suggestions=run_config.recalculate_order_suggestions,
             order_pick_local_manhattan_radius=run_config.order_pick_local_manhattan_radius,
             order_other_hotspot_penalty=run_config.order_other_hotspot_penalty,
             order_other_hotspot_penalty_radius=run_config.order_other_hotspot_penalty_radius,
@@ -602,7 +466,7 @@ def _run_pipeline(
         print(f"Solver/optimizer failed: {type(solve_error).__name__}: {solve_error!r}")
         if hasattr(solver, "active_work_item_summary"):
             try:
-                print(f"Active suggestion at failure: {solver.active_work_item_summary()}")
+                print(f"Active work item at failure: {solver.active_work_item_summary()}")
             except Exception:
                 pass
         if base_actions:
@@ -626,7 +490,7 @@ def _run_pipeline(
             print(f"Solver/optimizer failed: {type(exc).__name__}: {exc!r}")
         if hasattr(solver, "active_work_item_summary"):
             try:
-                print(f"Active suggestion at failure: {solver.active_work_item_summary()}")
+                print(f"Active work item at failure: {solver.active_work_item_summary()}")
             except Exception:
                 pass
         if not _is_controlled_limit_stop(exc):
@@ -787,28 +651,16 @@ def main():
             f"max_time={run_config.max_time}, "
             f"max_makespan={run_config.max_makespan}, "
             f"max_plan_time={run_config.max_plan_time_seconds:.1f}s, "
-            f"relocation_top_skus={run_config.relocation_top_skus}, "
-            f"num_allowed_relocations={run_config.num_allowed_relocations}, "
-            f"dock_gain_scale={run_config.dock_gain_scale}, "
-            f"relocation_gain_scale={run_config.relocation_gain_scale}, "
             f"strict_no_swap={run_config.strict_no_swap}, "
             f"ticks_to_full_validation={run_config.ticks_to_full_validation}, "
             f"astar_slow_ms={run_config.astar_slow_ms}, "
-            f"enable_relocation_suggestions={run_config.enable_relocation_suggestions}, "
-            f"suggestion_retry_limit={run_config.suggestion_retry_limit}, "
-            f"suggestion_backoff_base_cycles={run_config.suggestion_backoff_base_cycles}, "
-            f"suggestion_backoff_max_cycles={run_config.suggestion_backoff_max_cycles}, "
-            f"setup_retry_wait_ticks={run_config.setup_retry_wait_ticks}, "
-            f"order_stagnation_cycle_limit={run_config.order_stagnation_cycle_limit}, "
-            f"realistic_fail_mode={run_config.realistic_fail_mode}, "
-            f"max_robots_per_suggestion={run_config.max_robots_per_suggestion}, "
             f"setup_mini_box_radius={run_config.setup_mini_box_radius}, "
             f"enable_setup_dual_relocation={run_config.enable_setup_dual_relocation}, "
             f"single_nest_conveyor_mode={run_config.single_nest_conveyor_mode}, "
             f"conveyor_wait_stall_limit={run_config.conveyor_wait_stall_limit}, "
-            f"robot_fail_streak_for_parking={run_config.robot_fail_streak_for_parking}, "
-            f"parking_candidate_limit={run_config.parking_candidate_limit}, "
-            f"forced_reloc_skus={run_config.relocation_skus_to_relocate})."
+            f"order_pick_local_manhattan_radius={run_config.order_pick_local_manhattan_radius}, "
+            f"order_other_hotspot_penalty={run_config.order_other_hotspot_penalty}, "
+            f"order_other_hotspot_penalty_radius={run_config.order_other_hotspot_penalty_radius})."
         )
 
     output_dir = Path(run_config.output_dir)
@@ -820,7 +672,7 @@ def main():
 
     for iteration in range(1, run_config.max_runs + 1):
         print(f"\n=== Iteration {iteration}/{run_config.max_runs} ===")
-        print("Generating new suggestions...")
+        print("Generating conveyor plan...")
         solver = _build_solver(state, run_config, temp_output_path)
         actions, solve_error = _run_pipeline(solver, run_config, output_dir)
         _save_and_report(

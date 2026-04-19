@@ -25,14 +25,6 @@ input_path = "docs/BIG_ORDER.txt"
 [solver]
 # Reservation horizon (space-time planner tensor depth).
 max_time = 50000
-# Number of highest-lift SKU relocation candidates to build.
-relocation_top_skus = 16
-# Max relocation suggestions admitted into the dispatch queue.
-num_allowed_relocations = 18
-# Scales DockSuggestion expected gain (higher => more likely to do strategic docking).
-dock_gain_scale = 2.1
-# Scales normalized relocation gain after order-relative normalization.
-relocation_gain_scale = 3.0
 # If true, disallow two robots swapping positions in one timestep.
 strict_no_swap = false
 # Run full validator replay every N makespan ticks during dispatch.
@@ -44,41 +36,11 @@ astar_slow_ms = 40
 astar_print_slow = false
 # If true, log blocked A* attempts even when they are not slow.
 astar_log_blocked = false
-# Keep relocation code available, but disabled for now.
-enable_relocation_suggestions = false
-# Max retries for a suggestion before dropping it from the queue.
-suggestion_retry_limit = 12
-# Queue-cycle exponential backoff base and cap for failed suggestions.
-suggestion_backoff_base_cycles = 2
-suggestion_backoff_max_cycles = 128
-# SetupSuggestion retries always wait this many makespan ticks before retrying.
-# Suggestions are still dropped once suggestion_retry_limit is reached.
-setup_retry_wait_ticks = 32
-# Hard fail if setup is complete and no additional orders are completed for this many dispatch cycles.
-order_stagnation_cycle_limit = 256
-# If true, livelocked robots retire to nearest corner instead of immediate fail-fast.
-realistic_fail_mode = false
-# Try up to this many robots for a suggestion before requeue/backoff.
-max_robots_per_suggestion = 3
 # Local mini-box radius used by hierarchical motion maneuvers (2 => 5x5 box).
 setup_mini_box_radius = 2
 # If true, setup planner may relocate paired setup pallets in one dual-carry trip
 # by forming an "I" dock shape (opposite-side docks).
 enable_setup_dual_relocation = true
-# After this many consecutive local planning failures, try parking that robot.
-robot_fail_streak_for_parking = 3
-# Max low-use parking targets scanned per parking attempt.
-parking_candidate_limit = 96
-# Legacy cluster discovery for OrderSuggestions (disable for hotspot-sticky dispatch).
-enable_order_cluster_discovery = false
-# If true, rebuild/re-score pending order suggestions during dispatch.
-recalculate_order_suggestions = false
-# Local hotspot-seeded BFS radius; if no candidate within this Manhattan radius, fallback to global.
-order_pick_local_manhattan_radius = 10
-# Penalty weight for picks too close to non-assigned hotspots (0 disables).
-order_other_hotspot_penalty = 0.0
-# Manhattan radius considered "too close" for non-assigned hotspots.
-order_other_hotspot_penalty_radius = 6
 # New mode: build one shared top-edge nest and run conveyor-loop fulfillment.
 single_nest_conveyor_mode = true
 # Fail if a conveyor robot waits >= this many ticks in the same cell.
@@ -98,12 +60,9 @@ edge_band_for_heatmap = 6
 # Group SKU-flow metadata into N x N chunks before selecting anchor cells.
 # Set to 1 to disable chunking (original exact-cell behavior).
 relocate_chunk_size = 5
-# Setup hotspots used by SetupSuggestion initialization phase.
+# Setup hotspots for conveyor nest initialization.
 # FULL: setup_hotspots = [[0, 15], [15, 0], [35,0], [15, 39], [35,39]]
 # FOUR: setup_hotspots = [[0, 15], [15, 0], [35,0], [20, 39]] # 7301 4/13
 # THREE: [[20, 0], [20, 39], [0, 15]] # @ 4/13AM, got 6723
 # setup_hotspots = [[0, 15], [15, 0], [35,0], [20, 39]] # 8085 4/13PM (new code)
 setup_hotspots = [[15, 0], [35,0]]
-# Optional explicit relocation SKU order. If provided, only these SKUs are
-# used for startup relocation planning (in listed order).
-# skus_to_relocate = [1, 2, 3, 4, 5]

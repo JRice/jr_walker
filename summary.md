@@ -3,10 +3,11 @@
 ## Scope
 - Python warehouse solver for ANE format on a 58x13 map with 5 robots.
 - Pipeline: `find_solution` -> optional LNS -> validator replay -> outputs/metadata.
+- Legacy suggestion dispatcher path has been removed; solver is conveyor-only now.
 
 ## Key Files
 - `main.py`: config/load/run/validate/write.
-- `src/jr_walker/solver.py`: all planning modes; conveyor logic is here.
+- `src/jr_walker/solver.py`: conveyor planning + setup relocation primitives.
 - `src/jr_walker/planner.py`, `src/jr_walker/routing.py`: reservation + space-time A*.
 - `src/jr_walker/validator.py`: authoritative action legality check.
 
@@ -20,6 +21,10 @@
   - row `0`: 10 odd-SKU pallets,
   - row `2`: 10 even-SKU pallets.
 - Build integrity hard-fails if expected 20 pallets are not in each nest rectangle.
+
+## Config Simplification
+- Removed suggestion-related TOML knobs from `docs/config.toml` and `main.py` parser/wiring.
+- Kept hotspot config under `[relocation].setup_hotspots` unchanged.
 
 ## Conveyor Track + Picking Rules
 - Forced fulfill cell: `[hotspot_x - 1, hotspot_y]`.
@@ -43,7 +48,7 @@
 ## Current Validation Snapshot
 - Unit tests: `tests.test_solver_metadata_policy` passing.
 - Latest full dual run (current behavior) validated:
-  - `output/solution_9023_114.txt`
+  - `output/solution_9023_116.txt`
   - `1000/1000` orders fulfilled
   - makespan `9023`.
 
