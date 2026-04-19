@@ -9,6 +9,9 @@ class SpacetimeGrid:
     """3D spacetime reservation tensor.
 
     grid[t, y, x] == 1 means some entity (robot or pallet) occupies cell (x, y) at tick t.
+    _holds[t, y, x] == 1 marks a robot's "parked here until further notice" hold.
+    Holds live in a separate layer so they can be selectively released without
+    disturbing other robots' path reservations in grid.
     """
 
     def __init__(self, width: int, height: int, max_ticks: int) -> None:
@@ -16,6 +19,7 @@ class SpacetimeGrid:
         self.height = height
         self.max_ticks = max_ticks
         self.grid: np.ndarray = np.zeros((max_ticks, height, width), dtype=np.int8)
+        self._holds: np.ndarray = np.zeros((max_ticks, height, width), dtype=np.int8)
 
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.width and 0 <= y < self.height
@@ -23,7 +27,28 @@ class SpacetimeGrid:
     def is_free(self, t: int, x: int, y: int) -> bool:
         if not self.in_bounds(x, y) or t < 0 or t >= self.max_ticks:
             return False
-        return self.grid[t, y, x] == 0
+        return self.grid[t, y, x] == 0 and self._holds[t, y, x] == 0
+
+    def hold_for(self, t_from: int, x: int, y: int, duration: int = 100) -> None:
+        """Mark (x, y) as held by a robot for `duration` ticks starting at t_from.
+
+        Finite rather than infinite so that the spacetime A* can route through
+        this cell at later ticks once the robot is expected to have moved on.
+        """
+        if not self.in_bounds(x, y):
+            return
+        t = max(0, t_from)
+        t_end = min(t + duration, self.max_ticks)
+        if t < t_end:
+            self._holds[t:t_end, y, x] = 1
+
+    def release_hold(self, t_from: int, x: int, y: int) -> None:
+        """Release all holds on (x, y) from t_from onward (robot is about to move)."""
+        if not self.in_bounds(x, y):
+            return
+        t = max(0, t_from)
+        if t < self.max_ticks:
+            self._holds[t:, y, x] = 0
 
     def reserve(self, t: int, x: int, y: int) -> None:
         if self.in_bounds(x, y) and 0 <= t < self.max_ticks:

@@ -393,6 +393,8 @@ while orders remain:
     plan job
 ```
 
+When there are no orders left to assign an unassigned robot, have the robot continue along the "orders" route, but not picking or fulfilling: just moving along the "track." (without this, the last few orders become blocked.)
+
 ---
 
 ## 6. Scheduling Constraints

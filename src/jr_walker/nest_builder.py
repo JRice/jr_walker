@@ -118,6 +118,11 @@ def _plan_row(
 ) -> int:
     placement_ticks: List[int] = []
 
+    # Hold all robots at their current positions so that robots planned later in
+    # this row route around them rather than passing through.
+    for r in nest_robots:
+        grid.hold_for(r.last_tick + 1, r.x, r.y)
+
     for dest_x, dest_y in dest_coords:
         pallet = nearest_pallet_for_dest(dest_x, dest_y, pallets, planned_ids, unplanned_skus)
         if pallet is None:
@@ -126,6 +131,9 @@ def _plan_row(
         robot = nearest_available_robot(pallet.x, pallet.y, nest_robots)
         if robot is None:
             raise RuntimeError("No robots available for nest construction")
+
+        # Release the active robot's hold — it is about to plan its own path.
+        grid.release_hold(robot.last_tick + 1, robot.x, robot.y)
 
         finish_tick = _plan_setup_job(
             robot=robot,
@@ -137,6 +145,9 @@ def _plan_row(
             other_nest_rects=other_nest_rects,
             strict_no_swap=strict_no_swap,
         )
+
+        # Re-hold the robot at its new resting position for subsequent iterations.
+        grid.hold_for(robot.last_tick + 1, robot.x, robot.y)
 
         planned_ids.add(pallet.id)
         unplanned_skus.discard(pallet.sku)
@@ -179,7 +190,7 @@ def _plan_setup_job(
 
     Returns the tick at which the undock completes (pallet is in final position).
     """
-    approach_cell = nearest_free_adjacent(pallet.x, pallet.y, robot.last_tick + 1, grid)
+    approach_cell = _pick_approach_cell(pallet, robot, grid)
     if approach_cell is None:
         raise RuntimeError(f"No adjacent free cell for pallet {pallet.id} at ({pallet.x},{pallet.y})")
 
@@ -197,6 +208,10 @@ def _plan_setup_job(
     dock_dy = pallet.y - robot.y
     robot.docks[(dock_dx, dock_dy)] = pallet.id
 
+    # Hold robot + pallet so subsequent robots don't plan through this position.
+    grid.hold_for(dock_tick + 1, robot.x, robot.y)
+    grid.hold_for(dock_tick + 1, pallet.x, pallet.y)
+
     # Reorient so pallet is NORTH of robot (offset (0, -1))
     if (dock_dx, dock_dy) != (0, -1):
         _reorient_to_north(robot, pallet, grid, actions, other_nest_rects, strict_no_swap)
@@ -211,6 +226,9 @@ def _plan_setup_job(
     grid.reserve_permanent(undock_tick, dest_x, dest_y)
     del robot.docks[(0, -1)]
     robot.last_tick = undock_tick
+
+    # Hold robot's resting position until it is assigned another job.
+    grid.hold_for(undock_tick + 1, robot.x, robot.y)
 
     return undock_tick
 
@@ -231,11 +249,24 @@ def _reorient_to_north(
     offset = _current_dock_offset(robot, pallet.id)
 
     # Find the nearest clearing that the docked robot can actually reach.
-    # The first candidate (find_clearing) may be unreachable if another robot's
-    # spacetime reservation blocks every path to it — so we probe each candidate
-    # in distance order and commit to the first one with a valid path.
+    # Release the robot + pallet holds placed after docking so they don't block
+    # the path search (the robot is about to move, so the holds are stale).
+    grid.release_hold(robot.last_tick + 1, robot.x, robot.y)
+    grid.release_hold(robot.last_tick + 1, pallet.x, pallet.y)
+
     navigated = False
     for cx, cy in iter_clearings(pallet.x, pallet.y, robot.last_tick + 1, 15, grid, search_radius=12):
+        # Reorientation requires the robot to reach the cell south of the clearing
+        # center (cx, cy+1) after the intermediate undock.  Skip any clearing
+        # whose south cell is permanently inaccessible (e.g. an original pallet
+        # that was never picked up).
+        south_cand_y = cy + 1
+        t_chk = robot.last_tick + 2
+        if (not grid.in_bounds(cx, south_cand_y)
+                or (t_chk < grid.max_ticks
+                    and bool(grid.grid[t_chk:, south_cand_y, cx].all()))):
+            continue
+
         crx, cry = cx - offset[0], cy - offset[1]
         if (crx, cry) == (robot.x, robot.y):
             navigated = True
@@ -251,11 +282,29 @@ def _reorient_to_north(
             break
 
     if not navigated:
-        # Hard fallback: fixed position above pallet, let _navigate_robot_docked raise if stuck.
-        clearing = (pallet.x, max(1, pallet.y - 3))
-        crx, cry = clearing[0] - offset[0], clearing[1] - offset[1]
-        if (crx, cry) != (robot.x, robot.y):
-            _navigate_robot_docked(robot, pallet, crx, cry, grid, actions, ex_rects, strict_no_swap)
+        # Fallback: try positions progressively further north of the pallet,
+        # verifying south accessibility before committing.
+        for dy_try in range(3, 10):
+            fx, fy = pallet.x, max(1, pallet.y - dy_try)
+            frx, fry = fx - offset[0], fy - offset[1]
+            south_fb_y = fy + 1
+            if not grid.in_bounds(fx, south_fb_y) or not grid.in_bounds(frx, fry):
+                continue
+            t_chk = robot.last_tick + 2
+            if t_chk < grid.max_ticks and bool(grid.grid[t_chk:, south_fb_y, fx].all()):
+                continue  # south permanently blocked
+            if (frx, fry) == (robot.x, robot.y):
+                navigated = True
+                break
+            path = find_path(robot.x, robot.y, robot.last_tick, frx, fry, grid,
+                             footprint_offsets=[offset], strict_no_swap=strict_no_swap,
+                             excluded_rects=ex_rects)
+            if path:
+                _apply_path(robot, path, [offset], grid, actions)
+                pallet.x = robot.x + offset[0]
+                pallet.y = robot.y + offset[1]
+                navigated = True
+                break
 
     cur_offset = _current_dock_offset(robot, pallet.id)
     cur_pallet_x = robot.x + cur_offset[0]
@@ -304,6 +353,7 @@ def _navigate_robot(
 ) -> None:
     if (robot.x, robot.y) == (goal_x, goal_y):
         return
+    grid.release_hold(robot.last_tick + 1, robot.x, robot.y)
     path = find_path(robot.x, robot.y, robot.last_tick, goal_x, goal_y, grid,
                      strict_no_swap=strict_no_swap, excluded_rects=ex_rects,
                      extra_obstacles=extra_obstacles)
@@ -312,6 +362,7 @@ def _navigate_robot(
             f"Robot {robot.id} cannot reach ({goal_x},{goal_y}) from ({robot.x},{robot.y}) "
             f"at t={robot.last_tick}")
     _apply_path(robot, path, [], grid, actions)
+    grid.hold_for(robot.last_tick + 1, robot.x, robot.y)
 
 
 def _navigate_robot_docked(
@@ -327,6 +378,8 @@ def _navigate_robot_docked(
     if (robot.x, robot.y) == (goal_x, goal_y):
         return
     offset = _current_dock_offset(robot, pallet.id)
+    grid.release_hold(robot.last_tick + 1, robot.x, robot.y)
+    grid.release_hold(robot.last_tick + 1, pallet.x, pallet.y)
     path = find_path(robot.x, robot.y, robot.last_tick, goal_x, goal_y, grid,
                      footprint_offsets=[offset], strict_no_swap=strict_no_swap,
                      excluded_rects=ex_rects)
@@ -337,6 +390,8 @@ def _navigate_robot_docked(
     _apply_path(robot, path, [offset], grid, actions)
     pallet.x = robot.x + offset[0]
     pallet.y = robot.y + offset[1]
+    grid.hold_for(robot.last_tick + 1, robot.x, robot.y)
+    grid.hold_for(robot.last_tick + 1, pallet.x, pallet.y)
 
 
 def _push_to_dest(
@@ -363,7 +418,9 @@ def _apply_path(
     for i, (t, x, y) in enumerate(path):
         if i == 0:
             continue
-        actions.append(ActionEntry(t, robot.id, "move", x, y))
+        _, px, py = path[i - 1]
+        if x != px or y != py:  # skip wait-in-place steps (same cell = no-op move)
+            actions.append(ActionEntry(t, robot.id, "move", x, y))
         grid.reserve(t, x, y)
         for dx, dy in footprint_offsets:
             grid.reserve(t, x + dx, y + dy)
@@ -384,3 +441,39 @@ def _emit_wait(
         if grid.is_free(t, robot.x, robot.y):
             grid.reserve(t, robot.x, robot.y)
     robot.last_tick = until_tick
+
+
+def _pick_approach_cell(
+    pallet: Pallet,
+    robot: Robot,
+    grid: SpacetimeGrid,
+    headroom: int = 10,
+) -> Optional[Tuple[int, int]]:
+    """Choose an adjacent cell to the pallet that will still be free for `headroom`
+    ticks after the robot's estimated arrival.  Picks the first candidate with
+    temporal headroom; falls back to any cell free at robot.last_tick + 1.
+
+    Estimating arrival time as manhattan distance avoids choosing a cell that
+    another robot will shortly occupy, which would leave our robot trapped after
+    docking with no space to manoeuvre.
+    """
+    # south preferred first (natural push-north direction), then west, east, north
+    candidates = [
+        (pallet.x, pallet.y + 1),
+        (pallet.x - 1, pallet.y),
+        (pallet.x + 1, pallet.y),
+        (pallet.x, pallet.y - 1),
+    ]
+    t_now = robot.last_tick + 1
+    # Pass 1: cell free for [est_arrival .. est_arrival + headroom)
+    for cx, cy in candidates:
+        if not grid.in_bounds(cx, cy):
+            continue
+        est = t_now + manhattan(robot.x, robot.y, cx, cy)
+        if all(grid.is_free(est + dt, cx, cy) for dt in range(headroom)):
+            return cx, cy
+    # Pass 2: any cell free right now (original behaviour)
+    for cx, cy in candidates:
+        if grid.in_bounds(cx, cy) and grid.is_free(t_now, cx, cy):
+            return cx, cy
+    return None

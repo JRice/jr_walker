@@ -100,13 +100,33 @@ def plan_order_phase(
 
     sorted_robots = sorted(nest_robots, key=lambda r: manhattan(r.x, r.y, nest_x, 3))
 
-    for robot in sorted_robots:
-        if (robot.x, robot.y) != (nest_x, 3):
-            _navigate_to_entry(robot, nest_x, grid, actions, other_nest_rects, strict_no_swap)
+    # Spread robots evenly around the circular track so they don't all converge
+    # on (nest_x, 3) at once and collide.  Robot[i] starts at track[i * spread].
+    num_robots = len(sorted_robots)
+    track_size = len(track)
+    spread = track_size // max(num_robots, 1)
+
+    # Hold all robots while we plan their individual navigation paths.
+    for r in sorted_robots:
+        grid.hold_for(r.last_tick + 1, r.x, r.y)
+
+    robot_start_idx: Dict[int, int] = {}
+    for i, robot in enumerate(sorted_robots):
+        start_idx = (i * spread) % track_size
+        robot_start_idx[robot.id] = start_idx
+        tx, ty = track[start_idx]
+        grid.release_hold(robot.last_tick + 1, robot.x, robot.y)
+        if (robot.x, robot.y) != (tx, ty):
+            _navigate_to_position(robot, tx, ty, grid, actions, other_nest_rects, strict_no_swap)
+        grid.hold_for(robot.last_tick + 1, robot.x, robot.y)
+
+    # Holds are only needed during navigation planning; release them all now.
+    for r in sorted_robots:
+        grid.release_hold(r.last_tick + 1, r.x, r.y)
 
     order_idx = 0
     robot_order_map: Dict[int, Optional[Order]] = {r.id: None for r in sorted_robots}
-    robot_track_idx: Dict[int, int] = {r.id: 0 for r in sorted_robots}
+    robot_track_idx: Dict[int, int] = {r.id: robot_start_idx[r.id] for r in sorted_robots}
 
     for robot in sorted_robots:
         if order_idx < len(pending_orders):
@@ -116,37 +136,54 @@ def plan_order_phase(
             order_idx += 1
 
     tick = max(r.last_tick for r in sorted_robots)
-    active_robots = list(sorted_robots)
     last_progress_tick = 0
     last_progress_orders = 0
 
-    while active_robots:
+    while True:
+        # All orders fulfilled once every robot has no remaining work
+        if all(robot_order_map.get(r.id) is None for r in sorted_robots):
+            for r in sorted_robots:
+                r.job = JobKind.DONE
+            break
+
         tick += 1
         if tick >= max_ticks:
             raise RuntimeError(f"Exceeded max_ticks={max_ticks} during order phase")
         if time.time() - start_time > max_runtime_seconds:
             raise RuntimeError("Exceeded max_runtime during order phase")
 
-        robot_positions: Dict[int, Tuple[int, int]] = {r.id: (r.x, r.y) for r in active_robots}
+        # Include ALL robots (active and done) so done robots stay visible to
+        # collision checks and never become phantom obstacles on the track.
+        robot_positions: Dict[int, Tuple[int, int]] = {r.id: (r.x, r.y) for r in sorted_robots}
 
-        for robot in list(active_robots):
-            order = robot_order_map.get(robot.id)
-            if order is None:
-                active_robots.remove(robot)
-                robot.job = JobKind.DONE
-                continue
-
+        for robot in sorted_robots:
             if robot.last_tick >= tick:
                 continue
 
+            order = robot_order_map.get(robot.id)
             track_pos = robot_track_idx[robot.id]
             cur_x, cur_y = track[track_pos % len(track)]
             next_idx = (track_pos + 1) % len(track)
             next_x, next_y = track[next_idx]
 
+            if order is None:
+                # Done robot: keep orbiting so it doesn't block the track for others.
+                collision = any(
+                    rid != robot.id and pos == (next_x, next_y)
+                    for rid, pos in robot_positions.items()
+                )
+                if grid.is_free(tick, next_x, next_y) and not collision:
+                    actions.append(ActionEntry(tick, robot.id, "move", next_x, next_y))
+                    grid.reserve(tick, next_x, next_y)
+                    robot.x, robot.y = next_x, next_y
+                    robot.last_tick = tick
+                    robot_track_idx[robot.id] = next_idx
+                    robot_positions[robot.id] = (next_x, next_y)
+                continue
+
             # Pick from adjacent pallet if needed
             pallet_pos = pallet_to_pick_from(cur_x, cur_y, nest_x)
-            if pallet_pos is not None and order is not None:
+            if pallet_pos is not None:
                 pallet_sku = next(
                     (sku for sku, pos in sku_to_pos.items() if pos == pallet_pos), None
                 )
@@ -161,8 +198,14 @@ def plan_order_phase(
                         robot.last_tick = tick - 1
                         continue
 
-            # Fulfill at (nest_x-1, 0)
-            if (cur_x, cur_y) == (nest_x - 1, 0):
+            # Fulfill at (nest_x-1, 0) — only if inventory is complete.
+            # If incomplete (robot started mid-track and hasn't orbited all pallets yet),
+            # skip and continue orbiting to pick the remaining items.
+            inventory_complete = not any(
+                order.items.get(s, 0) > robot.inventory.get(s, 0)
+                for s in order.items
+            )
+            if (cur_x, cur_y) == (nest_x - 1, 0) and inventory_complete:
                 _verify_inventory(robot, order)
                 actions.append(ActionEntry(tick, robot.id, "fulfill", cur_x, cur_y))
                 order.fulfilled_tick = tick
@@ -189,8 +232,8 @@ def plan_order_phase(
 
             # Attempt to move to next track position
             collision = any(
-                r2.id != robot.id and robot_positions.get(r2.id) == (next_x, next_y)
-                for r2 in active_robots
+                rid != robot.id and pos == (next_x, next_y)
+                for rid, pos in robot_positions.items()
             )
             if grid.is_free(tick, next_x, next_y) and not collision:
                 actions.append(ActionEntry(tick, robot.id, "move", next_x, next_y))
@@ -209,28 +252,32 @@ def plan_order_phase(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _navigate_to_entry(
+def _navigate_to_position(
     robot: Robot,
-    nest_x: int,
+    goal_x: int,
+    goal_y: int,
     grid: SpacetimeGrid,
     actions: List[ActionEntry],
     ex_rects: List[Tuple[int, int, int, int]],
     strict_no_swap: bool,
 ) -> None:
-    path = find_path(robot.x, robot.y, robot.last_tick, nest_x, 3, grid,
+    path = find_path(robot.x, robot.y, robot.last_tick, goal_x, goal_y, grid,
                      excluded_rects=ex_rects, strict_no_swap=strict_no_swap)
     if not path:
         raise RuntimeError(
-            f"Robot {robot.id} cannot reach conveyor entry ({nest_x},3) "
+            f"Robot {robot.id} cannot reach track position ({goal_x},{goal_y}) "
             f"from ({robot.x},{robot.y}) at t={robot.last_tick}")
     for i, (t, x, y) in enumerate(path):
         if i == 0:
             continue
-        actions.append(ActionEntry(t, robot.id, "move", x, y))
+        _, px, py = path[i - 1]
+        if x != px or y != py:
+            actions.append(ActionEntry(t, robot.id, "move", x, y))
         grid.reserve(t, x, y)
     if path:
         _, lx, ly = path[-1]
         robot.x, robot.y = lx, ly
+        robot.last_tick = path[-1][0]
         robot.last_tick = path[-1][0]
 
 
