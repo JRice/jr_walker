@@ -10,15 +10,39 @@ from typing import Dict, List, Optional, Tuple
 class NestConfig:
     """Describes a single nest's location and pallet layout.
 
-    anchor: (x, y) of the near-end corner of Line A — must be on a map edge.
-    The edge is inferred from the anchor: y==0 → north, y==height-1 → south,
-    x==0 → west, x==width-1 → east.
+    anchor: (x, y) of the near/hotspot corner of Line A — must be on a map edge.
+    line_c_pallets: per-position SKU list for Line C (0 = gap).  Its length
+                    determines the number of positions in both Line A and Line C.
 
-    Shape fields (line_a_length, pallets_c, etc.) will be added when variable-
-    length nests are implemented.  For now the layout is fixed at 10 pallets
-    per row, two rows deep.
+    Line A SKUs are derived automatically: all integers 1..total that are *not*
+    listed in line_c_pallets, sorted ascending (lowest = hotspot end).
     """
     anchor: Tuple[int, int]
+    line_c_pallets: List[int]   # 0 = gap; non-zero = SKU at that position
+
+    @property
+    def n_positions(self) -> int:
+        return len(self.line_c_pallets)
+
+    @property
+    def line_a_skus(self) -> List[int]:
+        """Fills Line A with the missing SKUs from 1..total, lowest first."""
+        line_c_set = {sku for sku in self.line_c_pallets if sku != 0}
+        n, k = self.n_positions, len(line_c_set)
+        universe = set(range(1, n + k + 1))
+        return sorted(universe - line_c_set)
+
+    @property
+    def fulfill_near(self) -> Tuple[int, int]:
+        """Fulfill point at the hotspot (anchor) end of Line A."""
+        nx, ny = self.anchor
+        return (nx - 1, ny)
+
+    @property
+    def fulfill_far(self) -> Tuple[int, int]:
+        """Fulfill point at the far end of Line A."""
+        nx, ny = self.anchor
+        return (nx + self.n_positions, ny)
 
 
 class JobKind(Enum):

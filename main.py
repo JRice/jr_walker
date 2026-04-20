@@ -19,7 +19,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from jr_walker.config import Config, load_config, read_run_id
-from jr_walker.conveyor import build_conveyor_track, plan_order_phase
+from jr_walker.conveyor import plan_order_phase
 from jr_walker.entities import ActionEntry, Order
 from jr_walker.nest_builder import assign_robots_to_nests, plan_nest_construction
 from jr_walker.output import last_tick_used, write_fulfillment_graph, write_solution
@@ -52,17 +52,16 @@ def main() -> None:
         grid.reserve(0, r.x, r.y)
 
     # --- Assign robots to nests ---
-    assign_robots_to_nests(robots, cfg.nest_coords)
+    assign_robots_to_nests(robots, cfg.nest_configs)
     nest_robots = {
-        coord: [r for r in robots if r.nest_id == coord]
-        for coord in cfg.nest_coords
+        nc.anchor: [r for r in robots if r.nest_id == nc.anchor]
+        for nc in cfg.nest_configs
     }
 
     # Exclusion rectangles: each nest excludes the other nests' conveyor zones.
-    # For north-edge nests the zone spans (nx-2, 0)..(nx+11, 3).
-    def nest_rect(coord: tuple) -> tuple:
-        nx, ny = coord
-        return (nx - 2, ny, nx + 11, ny + 3)
+    def nest_rect(nc) -> tuple:
+        nx, ny = nc.anchor
+        return (nx - 2, ny, nx + nc.n_positions + 1, ny + 3)
 
     all_actions: List[ActionEntry] = []
     fulfilled_orders: List[Order] = []
@@ -74,12 +73,12 @@ def main() -> None:
         # ----------------------------------------------------------------
         print("Phase 1: Building nests...")
         nest_finish_ticks = {}
-        for coord in cfg.nest_coords:
-            nest_x, _nest_y = coord
-            nr = nest_robots[coord]
-            other_rects = [nest_rect(c) for c in cfg.nest_coords if c != coord]
+        global_planned_ids: set = set()
+        for nc in cfg.nest_configs:
+            nr = nest_robots[nc.anchor]
+            other_rects = [nest_rect(c) for c in cfg.nest_configs if c is not nc]
             finish_tick = plan_nest_construction(
-                nest_x=nest_x,
+                nest_config=nc,
                 nest_robots=nr,
                 pallets=pallets,
                 grid=grid,
@@ -87,9 +86,10 @@ def main() -> None:
                 other_nest_rects=other_rects,
                 strict_no_swap=cfg.strict_no_swap,
                 total_robot_count=len(robots),
+                planned_ids=global_planned_ids,
             )
-            nest_finish_ticks[coord] = finish_tick
-            print(f"  Nest {coord} complete at tick {finish_tick} "
+            nest_finish_ticks[nc.anchor] = finish_tick
+            print(f"  Nest {nc.anchor} complete at tick {finish_tick} "
                   f"({len(nr)} robots assigned)")
 
         if time.time() - start_time > max_runtime_seconds:
@@ -100,31 +100,19 @@ def main() -> None:
         # ----------------------------------------------------------------
         print("Phase 2: Fulfilling orders...")
 
-        # Nest pallets for each nest (the 20 pallets placed during setup)
-        nest_pallet_map = {}
-        for coord in cfg.nest_coords:
-            nest_x, _nest_y = coord
-            row0 = [(nest_x + i, 0) for i in range(10)]
-            row2 = [(nest_x + i, 2) for i in range(10)]
-            ppos = set(row0 + row2)
-            nest_pallet_map[coord] = [p for p in pallets if (p.x, p.y) in ppos]
-
-        # Distribute orders across nests proportionally to robot count
         all_pending = sorted(all_orders, key=lambda o: o.total_picks)
-        nest_orders = {coord: [] for coord in cfg.nest_coords}
+        nest_orders = {nc.anchor: [] for nc in cfg.nest_configs}
         for i, o in enumerate(all_pending):
-            coord = cfg.nest_coords[i % len(cfg.nest_coords)]
-            nest_orders[coord].append(o)
+            anchor = cfg.nest_configs[i % len(cfg.nest_configs)].anchor
+            nest_orders[anchor].append(o)
 
-        for coord in cfg.nest_coords:
-            nest_x, _nest_y = coord
-            nr = nest_robots[coord]
-            other_rects = [nest_rect(c) for c in cfg.nest_coords if c != coord]
+        for nc in cfg.nest_configs:
+            nr = nest_robots[nc.anchor]
+            other_rects = [nest_rect(c) for c in cfg.nest_configs if c is not nc]
             new_fulfilled = plan_order_phase(
-                nest_x=nest_x,
+                nest_config=nc,
                 nest_robots=nr,
-                orders=nest_orders[coord],
-                nest_pallets=nest_pallet_map[coord],
+                orders=nest_orders[nc.anchor],
                 grid=grid,
                 actions=all_actions,
                 other_nest_rects=other_rects,

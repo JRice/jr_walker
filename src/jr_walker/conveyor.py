@@ -22,7 +22,7 @@ import datetime
 import time
 from typing import Dict, List, Optional, Tuple
 
-from jr_walker.entities import ActionEntry, JobKind, Order, Robot
+from jr_walker.entities import ActionEntry, JobKind, NestConfig, Order, Robot
 from jr_walker.pathfinder import find_path, manhattan
 from jr_walker.warehouse import SpacetimeGrid
 
@@ -31,39 +31,56 @@ from jr_walker.warehouse import SpacetimeGrid
 # Track builder
 # ---------------------------------------------------------------------------
 
-def build_conveyor_track(nest_x: int) -> List[Tuple[int, int]]:
+def build_conveyor_track(nest_config: NestConfig) -> List[Tuple[int, int]]:
     """Ordered (x, y) positions of the full conveyor cycle."""
+    nx, ny = nest_config.anchor
+    n = nest_config.n_positions
     track: List[Tuple[int, int]] = []
 
-    # Segment A: east from nest_x to nest_x+11 (12 positions, 11 moves)
-    for x in range(nest_x, nest_x + 12):
-        track.append((x, 3))
+    # Outer pass: east along y=ny+3 (picks from Line C at y=ny+2)
+    for x in range(nx, nx + n + 2):
+        track.append((x, ny + 3))
 
-    # Segment B: north from y=3 to y=1 (2 moves)
-    track.append((nest_x + 11, 2))
-    track.append((nest_x + 11, 1))
+    # Corner: step inward from ny+3 to ny+1
+    track.append((nx + n + 1, ny + 2))
+    track.append((nx + n + 1, ny + 1))
 
-    # Segment C: west from nest_x+10 to nest_x-1 (12 positions, 12 moves)
-    for x in range(nest_x + 10, nest_x - 2, -1):
-        track.append((x, 1))
+    # Line B: west along y=ny+1 (picks from Line A at y=ny)
+    for x in range(nx + n, nx - 2, -1):
+        track.append((x, ny + 1))
 
-    # Return path: north, fulfill, west, south x3, east x2
-    track.append((nest_x - 1, 0))   # fulfill here (perimeter y=0)
-    track.append((nest_x - 2, 0))
-    track.append((nest_x - 2, 1))
-    track.append((nest_x - 2, 2))
-    track.append((nest_x - 2, 3))
-    track.append((nest_x - 1, 3))   # one step east before looping back to (nest_x,3)
+    # Fulfill at near end
+    track.append((nx - 1, ny))
+
+    # Return path
+    track.append((nx - 2, ny))
+    track.append((nx - 2, ny + 1))
+    track.append((nx - 2, ny + 2))
+    track.append((nx - 2, ny + 3))
+    track.append((nx - 1, ny + 3))
 
     return track
 
 
-def pallet_to_pick_from(track_x: int, track_y: int, nest_x: int) -> Optional[Tuple[int, int]]:
-    """Return the nest pallet position adjacent-north of this track cell, if any."""
-    if track_y == 3 and nest_x <= track_x <= nest_x + 9:
-        return track_x, 2
-    if track_y == 1 and nest_x <= track_x <= nest_x + 9:
-        return track_x, 0
+def pallet_to_pick_from(
+    track_x: int,
+    track_y: int,
+    nest_config: NestConfig,
+) -> Optional[Tuple[int, int]]:
+    """Return the nest pallet cell to pick from when at this track position, if any."""
+    nx, ny = nest_config.anchor
+    n = nest_config.n_positions
+    pos_idx = track_x - nx
+
+    # Outer pass (y=ny+3): pick from Line C (y=ny+2) — but only non-gap positions
+    if track_y == ny + 3 and 0 <= pos_idx < n:
+        if nest_config.line_c_pallets[pos_idx] != 0:
+            return (track_x, ny + 2)
+
+    # Line B (y=ny+1): pick from Line A (y=ny)
+    if track_y == ny + 1 and 0 <= pos_idx < n:
+        return (track_x, ny)
+
     return None
 
 
@@ -72,10 +89,9 @@ def pallet_to_pick_from(track_x: int, track_y: int, nest_x: int) -> Optional[Tup
 # ---------------------------------------------------------------------------
 
 def plan_order_phase(
-    nest_x: int,
+    nest_config: NestConfig,
     nest_robots: List[Robot],
     orders: List[Order],
-    nest_pallets: List,
     grid: SpacetimeGrid,
     actions: List[ActionEntry],
     other_nest_rects: List[Tuple[int, int, int, int]],
@@ -89,8 +105,16 @@ def plan_order_phase(
     progress_tick_interval: int,
 ) -> List[Order]:
     """Assign and plan all orders for this nest's robots. Returns the fulfilled orders."""
-    track = build_conveyor_track(nest_x)
-    sku_to_pos: Dict[int, Tuple[int, int]] = {p.sku: (p.x, p.y) for p in nest_pallets}
+    nx, ny = nest_config.anchor
+    track = build_conveyor_track(nest_config)
+
+    # Build SKU→position map from config (source of truth for what was placed where)
+    sku_to_pos: Dict[int, Tuple[int, int]] = {}
+    for i, sku in enumerate(nest_config.line_a_skus):
+        sku_to_pos[sku] = (nx + i, ny)
+    for i, sku in enumerate(nest_config.line_c_pallets):
+        if sku != 0:
+            sku_to_pos[sku] = (nx + i, ny + 2)
 
     pending_orders = sorted(
         [o for o in orders if not o.is_fulfilled],
@@ -98,7 +122,7 @@ def plan_order_phase(
     )
     fulfilled: List[Order] = []
 
-    sorted_robots = sorted(nest_robots, key=lambda r: manhattan(r.x, r.y, nest_x, 3))
+    sorted_robots = sorted(nest_robots, key=lambda r: manhattan(r.x, r.y, nx, ny + 3))
 
     # Spread robots evenly around the circular track so they don't all converge
     # on (nest_x, 3) at once and collide.  Robot[i] starts at track[i * spread].
@@ -182,7 +206,7 @@ def plan_order_phase(
                 continue
 
             # Pick from adjacent pallet if needed
-            pallet_pos = pallet_to_pick_from(cur_x, cur_y, nest_x)
+            pallet_pos = pallet_to_pick_from(cur_x, cur_y, nest_config)
             if pallet_pos is not None:
                 pallet_sku = next(
                     (sku for sku, pos in sku_to_pos.items() if pos == pallet_pos), None
@@ -205,7 +229,7 @@ def plan_order_phase(
                 order.items.get(s, 0) > robot.inventory.get(s, 0)
                 for s in order.items
             )
-            if (cur_x, cur_y) == (nest_x - 1, 0) and inventory_complete:
+            if (cur_x, cur_y) == nest_config.fulfill_near and inventory_complete:
                 _verify_inventory(robot, order)
                 actions.append(ActionEntry(tick, robot.id, "fulfill", cur_x, cur_y))
                 order.fulfilled_tick = tick

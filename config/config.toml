@@ -14,9 +14,16 @@ max_runtime_minutes = 240.0
 # Process every Nth order; 1 = all orders, 10 = 100 of 1000
 stride = 1
 
-[nests]
-# [x, y] anchor coordinates for each nest; each must be on a map edge
-coords = [[15, 0], [35, 0]]
+[[nests]]
+# [x, y] anchor = hotspot corner of Line A; must be on a map edge.
+# line_c_pallets: per-position SKUs for Line C; 0 = gap.
+# Line A is filled automatically with the missing SKUs (lowest first).
+coords = [15, 0]
+line_c_pallets = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+
+[[nests]]
+coords = [35, 0]
+line_c_pallets = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
 
 [pathfinding]
 # Prevent robots/pallets swapping positions in the same tick (off by default;

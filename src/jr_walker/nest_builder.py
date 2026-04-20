@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
-from jr_walker.entities import ActionEntry, JobKind, Pallet, Robot
+from jr_walker.entities import ActionEntry, JobKind, NestConfig, Pallet, Robot
 from jr_walker.pathfinder import (
     find_clearing,
     find_path,
@@ -22,7 +22,6 @@ from jr_walker.pathfinder import (
     manhattan,
     nearest_available_robot,
     nearest_free_adjacent,
-    nearest_pallet_for_dest,
     reserve_path,
 )
 from jr_walker.warehouse import SpacetimeGrid
@@ -34,37 +33,33 @@ from jr_walker.warehouse import SpacetimeGrid
 
 def assign_robots_to_nests(
     robots: List[Robot],
-    nest_coords: List[Tuple[int, int]],
+    nest_configs: List[NestConfig],
 ) -> None:
-    """Round-robin: for each nest slot, assign the nearest unassigned robot.
-
-    Modifies robot.nest_id in-place. Raises if any nest ends up with no robots.
-    """
+    """Round-robin: for each nest slot, assign the nearest unassigned robot."""
     unassigned = list(robots)
-    nest_counts: Dict[Tuple[int, int], int] = {coord: 0 for coord in nest_coords}
+    nest_counts: Dict[Tuple[int, int], int] = {nc.anchor: 0 for nc in nest_configs}
 
     while unassigned:
-        for coord in nest_coords:
+        for nc in nest_configs:
             if not unassigned:
                 break
-            nx, ny = coord
-            # Approach anchor: midpoint of Line A, one step into the outer area.
-            anchor_x = nx + 5
-            anchor_y = ny + 3   # outer-area row for a north-edge nest
+            nx, ny = nc.anchor
+            anchor_x = nx + nc.n_positions // 2
+            anchor_y = ny + 3
             best = min(unassigned, key=lambda r: manhattan(r.x, r.y, anchor_x, anchor_y))
-            best.nest_id = coord
-            nest_counts[coord] += 1
+            best.nest_id = nc.anchor
+            nest_counts[nc.anchor] += 1
             unassigned.remove(best)
 
-    for coord, count in nest_counts.items():
+    for anchor, count in nest_counts.items():
         if count == 0:
             raise RuntimeError(
-                f"Nest at {coord} has no assigned robots — cannot build."
+                f"Nest at {anchor} has no assigned robots — cannot build."
             )
 
 
 def plan_nest_construction(
-    nest_x: int,
+    nest_config: NestConfig,
     nest_robots: List[Robot],
     pallets: List[Pallet],
     grid: SpacetimeGrid,
@@ -72,22 +67,36 @@ def plan_nest_construction(
     other_nest_rects: List[Tuple[int, int, int, int]],
     strict_no_swap: bool,
     total_robot_count: int,
+    planned_ids: Optional[Set[int]] = None,
 ) -> int:
     """Plan all pallet-placement jobs for one nest. Returns tick when last pallet lands."""
-    planned_ids: Set[int] = set()
-    unplanned_skus: Set[int] = set(range(1, 21))
+    nx, ny = nest_config.anchor
+    n = nest_config.n_positions
 
-    row0_coords = [(nest_x + i, 0) for i in range(10)]
-    row2_coords = [(nest_x + i, 2) for i in range(10)]
+    # Line A: contiguous, on the edge — placed first so robots can pass through Line C area
+    line_a_coords = [(nx + i, ny) for i in range(n)]
+    line_a_dest_skus = nest_config.line_a_skus
+
+    # Line C: may have gaps — placed second
+    line_c_items = [
+        (nx + i, ny + 2, sku)
+        for i, sku in enumerate(nest_config.line_c_pallets)
+        if sku != 0
+    ]
+    line_c_coords = [(x, y) for x, y, _ in line_c_items]
+    line_c_dest_skus = [sku for _, _, sku in line_c_items]
+
+    if planned_ids is None:
+        planned_ids = set()
 
     _plan_row(
-        dest_coords=row0_coords,
+        dest_coords=line_a_coords,
+        dest_skus=line_a_dest_skus,
         nest_robots=nest_robots,
         pallets=pallets,
         grid=grid,
         actions=actions,
         planned_ids=planned_ids,
-        unplanned_skus=unplanned_skus,
         other_nest_rects=other_nest_rects,
         strict_no_swap=strict_no_swap,
         total_robot_count=total_robot_count,
@@ -95,13 +104,13 @@ def plan_nest_construction(
     )
 
     last_tick = _plan_row(
-        dest_coords=row2_coords,
+        dest_coords=line_c_coords,
+        dest_skus=line_c_dest_skus,
         nest_robots=nest_robots,
         pallets=pallets,
         grid=grid,
         actions=actions,
         planned_ids=planned_ids,
-        unplanned_skus=unplanned_skus,
         other_nest_rects=other_nest_rects,
         strict_no_swap=strict_no_swap,
         total_robot_count=total_robot_count,
@@ -110,14 +119,34 @@ def plan_nest_construction(
     return last_tick
 
 
+def _nearest_pallet_with_sku(
+    dest_x: int,
+    dest_y: int,
+    pallets: List[Pallet],
+    planned_ids: Set[int],
+    target_sku: int,
+) -> Optional[Pallet]:
+    """Nearest unplanned pallet that carries exactly target_sku."""
+    best: Optional[Pallet] = None
+    best_dist = 10**9
+    for p in pallets:
+        if p.id in planned_ids or p.sku != target_sku:
+            continue
+        d = manhattan(p.x, p.y, dest_x, dest_y)
+        if d < best_dist:
+            best_dist = d
+            best = p
+    return best
+
+
 def _plan_row(
     dest_coords: List[Tuple[int, int]],
+    dest_skus: List[int],
     nest_robots: List[Robot],
     pallets: List[Pallet],
     grid: SpacetimeGrid,
     actions: List[ActionEntry],
     planned_ids: Set[int],
-    unplanned_skus: Set[int],
     other_nest_rects: List[Tuple[int, int, int, int]],
     strict_no_swap: bool,
     total_robot_count: int,
@@ -130,10 +159,12 @@ def _plan_row(
     for r in nest_robots:
         grid.hold_for(r.last_tick + 1, r.x, r.y)
 
-    for dest_x, dest_y in dest_coords:
-        pallet = nearest_pallet_for_dest(dest_x, dest_y, pallets, planned_ids, unplanned_skus)
+    for (dest_x, dest_y), target_sku in zip(dest_coords, dest_skus):
+        pallet = _nearest_pallet_with_sku(dest_x, dest_y, pallets, planned_ids, target_sku)
         if pallet is None:
-            raise RuntimeError(f"No pallet available for nest dest ({dest_x},{dest_y})")
+            raise RuntimeError(
+                f"No pallet with SKU {target_sku} available for nest dest ({dest_x},{dest_y})"
+            )
 
         robot = nearest_available_robot(pallet.x, pallet.y, nest_robots)
         if robot is None:
@@ -157,7 +188,7 @@ def _plan_row(
         grid.hold_for(robot.last_tick + 1, robot.x, robot.y)
 
         planned_ids.add(pallet.id)
-        unplanned_skus.discard(pallet.sku)
+        # no unplanned_skus to update — each position has its own required SKU
         placement_ticks.append(finish_tick)
 
     if is_last_row and placement_ticks:
