@@ -40,6 +40,11 @@ def main() -> None:
     robots, pallets, orders = parse_worklist(cfg.input_path, stride=cfg.stride)
     print(f"Loaded: {len(robots)} robots, {len(pallets)} pallets, {len(orders)} orders")
 
+    # Give each NestConfig the full warehouse SKU set so Line A can be derived correctly
+    all_skus = {p.sku for p in pallets}
+    for nc in cfg.nest_configs:
+        nc.set_warehouse_skus(all_skus)
+
     # --- Spacetime reservation grid ---
     grid = SpacetimeGrid(cfg.width, cfg.height, cfg.max_ticks)
 

@@ -73,9 +73,14 @@ def plan_nest_construction(
     nx, ny = nest_config.anchor
     n = nest_config.n_positions
 
-    # Line A: contiguous, on the edge — placed first so robots can pass through Line C area
-    line_a_coords = [(nx + i, ny) for i in range(n)]
-    line_a_dest_skus = nest_config.line_a_skus
+    # Line A: non-gap positions only (gaps mirror Line C gap positions)
+    line_a_items = [
+        (nx + i, ny, sku)
+        for i, sku in enumerate(nest_config.line_a_pallets)
+        if sku != 0
+    ]
+    line_a_coords = [(x, y) for x, y, _ in line_a_items]
+    line_a_dest_skus = [sku for _, _, sku in line_a_items]
 
     # Line C: may have gaps — placed second
     line_c_items = [

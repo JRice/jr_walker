@@ -1,20 +1,16 @@
 """Conveyor-belt order fulfillment phase.
 
-Each robot orbits its assigned nest counter-clockwise on a fixed track, picking
-exactly the SKUs it needs for the current order as it passes each nest pallet,
-then fulfilling at the north perimeter before looping back.
+Each robot orbits its assigned nest, picking SKUs it needs for the current order,
+then fulfilling at the near end before looping back.
 
-Track for nest_x (robot starts and ends at (nest_x, 3)):
+Full track (far-corner entry):
+  Outer pass east → far corner → Line B west → fulfill → return path
 
-  Segment A — east  11 steps  (nest_x,3) -> (nest_x+11,3)
-                               picks from y=2 pallets (x = nest_x..nest_x+9)
-  Segment B — north  2 steps  -> (nest_x+11,1)
-  Segment C — west  12 steps  -> (nest_x-1,1)
-                               picks from y=0 pallets (x = nest_x..nest_x+9)
-  Fulfill              step   north 1 -> (nest_x-1,0); fulfill(); west 1; south 3; east 2
-                               -> back at (nest_x,3)
+Gap-shortcut tracks:
+  Outer pass east up to gap → drop through gap → Line B west → fulfill → return path
 
-The robot stops and picks as many times as needed at each pallet cell before moving.
+On each new order the robot chooses the leftmost gap whose position is strictly
+beyond the rightmost item it still needs, skipping unnecessary travel.
 """
 from __future__ import annotations
 
@@ -32,7 +28,7 @@ from jr_walker.warehouse import SpacetimeGrid
 # ---------------------------------------------------------------------------
 
 def build_conveyor_track(nest_config: NestConfig) -> List[Tuple[int, int]]:
-    """Ordered (x, y) positions of the full conveyor cycle."""
+    """Full-orbit track: outer pass → far corner → Line B → fulfill → return."""
     nx, ny = nest_config.anchor
     n = nest_config.n_positions
     track: List[Tuple[int, int]] = []
@@ -62,6 +58,62 @@ def build_conveyor_track(nest_config: NestConfig) -> List[Tuple[int, int]]:
     return track
 
 
+def _build_gap_track(nest_config: NestConfig, gap_idx: int) -> List[Tuple[int, int]]:
+    """Shortcut track: outer pass to gap → drop through gap → Line B → fulfill → return."""
+    nx, ny = nest_config.anchor
+    track: List[Tuple[int, int]] = []
+
+    # Outer pass east up to and including the gap position
+    for x in range(nx, nx + gap_idx + 1):
+        track.append((x, ny + 3))
+
+    # Drop through the gap (empty Line C slot at ny+2, then into Line B at ny+1)
+    track.append((nx + gap_idx, ny + 2))
+    track.append((nx + gap_idx, ny + 1))
+
+    # Line B west from (gap_idx - 1) down to fulfill_near
+    for x in range(nx + gap_idx - 1, nx - 2, -1):
+        track.append((x, ny + 1))
+
+    # Fulfill at near end
+    track.append((nx - 1, ny))
+
+    # Return path (identical to full track)
+    track.append((nx - 2, ny))
+    track.append((nx - 2, ny + 1))
+    track.append((nx - 2, ny + 2))
+    track.append((nx - 2, ny + 3))
+    track.append((nx - 1, ny + 3))
+
+    return track
+
+
+def _choose_entrance_gap(order: Order, nest_config: NestConfig) -> Optional[int]:
+    """Return the leftmost gap index that still covers all items the order needs.
+
+    A gap at index g is valid when every needed item (Line A or Line C) is at an
+    index strictly less than g, so the outer pass visits all needed Line C items
+    and the Line B descent from g visits all needed Line A items.
+    Returns None if no gap saves travel (must use the full far-corner track).
+    """
+    line_a = nest_config.line_a_pallets
+    line_c = nest_config.line_c_pallets
+
+    max_needed_idx = -1
+    for i, sku in enumerate(line_a):
+        if sku != 0 and order.items.get(sku, 0) > 0:
+            max_needed_idx = max(max_needed_idx, i)
+    for i, sku in enumerate(line_c):
+        if sku != 0 and order.items.get(sku, 0) > 0:
+            max_needed_idx = max(max_needed_idx, i)
+
+    # Pick leftmost gap strictly beyond the last needed position
+    for i, sku in enumerate(line_c):
+        if sku == 0 and i > max_needed_idx:
+            return i
+    return None
+
+
 def pallet_to_pick_from(
     track_x: int,
     track_y: int,
@@ -77,9 +129,10 @@ def pallet_to_pick_from(
         if nest_config.line_c_pallets[pos_idx] != 0:
             return (track_x, ny + 2)
 
-    # Line B (y=ny+1): pick from Line A (y=ny)
+    # Line B (y=ny+1): pick from Line A (y=ny) — only filled positions
     if track_y == ny + 1 and 0 <= pos_idx < n:
-        return (track_x, ny)
+        if nest_config.line_a_pallets[pos_idx] != 0:
+            return (track_x, ny)
 
     return None
 
@@ -106,12 +159,28 @@ def plan_order_phase(
 ) -> List[Order]:
     """Assign and plan all orders for this nest's robots. Returns the fulfilled orders."""
     nx, ny = nest_config.anchor
-    track = build_conveyor_track(nest_config)
+    full_track = build_conveyor_track(nest_config)
+
+    # Pre-build a shortcut track for every gap in Line C
+    gap_tracks: Dict[int, List[Tuple[int, int]]] = {
+        i: _build_gap_track(nest_config, i)
+        for i, sku in enumerate(nest_config.line_c_pallets)
+        if sku == 0
+    }
+    fulfill_near = nest_config.fulfill_near
+
+    def _track_for_order(order: Order) -> List[Tuple[int, int]]:
+        gap = _choose_entrance_gap(order, nest_config)
+        return gap_tracks[gap] if gap is not None else full_track
+
+    def _fulfill_idx_in_track(t: List[Tuple[int, int]]) -> int:
+        return next(i for i, p in enumerate(t) if p == fulfill_near)
 
     # Build SKU→position map from config (source of truth for what was placed where)
     sku_to_pos: Dict[int, Tuple[int, int]] = {}
-    for i, sku in enumerate(nest_config.line_a_skus):
-        sku_to_pos[sku] = (nx + i, ny)
+    for i, sku in enumerate(nest_config.line_a_pallets):
+        if sku != 0:
+            sku_to_pos[sku] = (nx + i, ny)
     for i, sku in enumerate(nest_config.line_c_pallets):
         if sku != 0:
             sku_to_pos[sku] = (nx + i, ny + 2)
@@ -124,32 +193,30 @@ def plan_order_phase(
 
     sorted_robots = sorted(nest_robots, key=lambda r: manhattan(r.x, r.y, nx, ny + 3))
 
-    # Spread robots evenly around the circular track so they don't all converge
-    # on (nest_x, 3) at once and collide.  Robot[i] starts at track[i * spread].
+    # Spread robots evenly around the full track for initial positioning.
     num_robots = len(sorted_robots)
-    track_size = len(track)
-    spread = track_size // max(num_robots, 1)
+    spread = len(full_track) // max(num_robots, 1)
 
-    # Hold all robots while we plan their individual navigation paths.
     for r in sorted_robots:
         grid.hold_for(r.last_tick + 1, r.x, r.y)
 
     robot_start_idx: Dict[int, int] = {}
     for i, robot in enumerate(sorted_robots):
-        start_idx = (i * spread) % track_size
+        start_idx = (i * spread) % len(full_track)
         robot_start_idx[robot.id] = start_idx
-        tx, ty = track[start_idx]
+        tx, ty = full_track[start_idx]
         grid.release_hold(robot.last_tick + 1, robot.x, robot.y)
         if (robot.x, robot.y) != (tx, ty):
             _navigate_to_position(robot, tx, ty, grid, actions, other_nest_rects, strict_no_swap)
         grid.hold_for(robot.last_tick + 1, robot.x, robot.y)
 
-    # Holds are only needed during navigation planning; release them all now.
     for r in sorted_robots:
         grid.release_hold(r.last_tick + 1, r.x, r.y)
 
     order_idx = 0
     robot_order_map: Dict[int, Optional[Order]] = {r.id: None for r in sorted_robots}
+    # Each robot has its own current track (optimized per order) and index into it
+    robot_cur_track: Dict[int, List[Tuple[int, int]]] = {r.id: full_track for r in sorted_robots}
     robot_track_idx: Dict[int, int] = {r.id: robot_start_idx[r.id] for r in sorted_robots}
 
     for robot in sorted_robots:
@@ -164,7 +231,6 @@ def plan_order_phase(
     last_progress_orders = 0
 
     while True:
-        # All orders fulfilled once every robot has no remaining work
         if all(robot_order_map.get(r.id) is None for r in sorted_robots):
             for r in sorted_robots:
                 r.job = JobKind.DONE
@@ -176,8 +242,6 @@ def plan_order_phase(
         if time.time() - start_time > max_runtime_seconds:
             raise RuntimeError("Exceeded max_runtime during order phase")
 
-        # Include ALL robots (active and done) so done robots stay visible to
-        # collision checks and never become phantom obstacles on the track.
         robot_positions: Dict[int, Tuple[int, int]] = {r.id: (r.x, r.y) for r in sorted_robots}
 
         for robot in sorted_robots:
@@ -185,10 +249,11 @@ def plan_order_phase(
                 continue
 
             order = robot_order_map.get(robot.id)
+            cur_track = robot_cur_track[robot.id]
             track_pos = robot_track_idx[robot.id]
-            cur_x, cur_y = track[track_pos % len(track)]
-            next_idx = (track_pos + 1) % len(track)
-            next_x, next_y = track[next_idx]
+            cur_x, cur_y = cur_track[track_pos % len(cur_track)]
+            next_idx = (track_pos + 1) % len(cur_track)
+            next_x, next_y = cur_track[next_idx]
 
             if order is None:
                 # Done robot: keep orbiting so it doesn't block the track for others.
@@ -222,14 +287,11 @@ def plan_order_phase(
                         robot.last_tick = tick - 1
                         continue
 
-            # Fulfill at (nest_x-1, 0) — only if inventory is complete.
-            # If incomplete (robot started mid-track and hasn't orbited all pallets yet),
-            # skip and continue orbiting to pick the remaining items.
             inventory_complete = not any(
                 order.items.get(s, 0) > robot.inventory.get(s, 0)
                 for s in order.items
             )
-            if (cur_x, cur_y) == nest_config.fulfill_near and inventory_complete:
+            if (cur_x, cur_y) == fulfill_near and inventory_complete:
                 _verify_inventory(robot, order)
                 actions.append(ActionEntry(tick, robot.id, "fulfill", cur_x, cur_y))
                 order.fulfilled_tick = tick
@@ -243,6 +305,10 @@ def plan_order_phase(
                     next_order.assigned_tick = tick
                     robot_order_map[robot.id] = next_order
                     order_idx += 1
+                    # Switch to the optimal track for the new order
+                    new_track = _track_for_order(next_order)
+                    robot_cur_track[robot.id] = new_track
+                    robot_track_idx[robot.id] = _fulfill_idx_in_track(new_track)
                 else:
                     robot_order_map[robot.id] = None
 
@@ -254,7 +320,7 @@ def plan_order_phase(
                     last_progress_tick = tick
                 continue
 
-            # Attempt to move to next track position
+            # Move to next track position
             collision = any(
                 rid != robot.id and pos == (next_x, next_y)
                 for rid, pos in robot_positions.items()
